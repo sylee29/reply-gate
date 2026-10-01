@@ -87,7 +87,7 @@ from reply_gate.pipeline import (
     build_pipeline,
     new_inquiry_id,
 )
-from reply_gate.policy_index import PolicyIndexProvenanceError
+from reply_gate.policy_index import PolicyIndexEmptyError, PolicyIndexProvenanceError
 from reply_gate.records import load_inquiry, save_inquiry
 
 __all__ = [
@@ -352,7 +352,7 @@ class HealthResponse(BaseModel):
 
 
 class InquiryService:
-    """요청 1건의 수명 동안 살아 있는 조립품 — 파이프라인 + 커넥션 2개.
+    """요청 수명의 앱 커넥션 + 처리 시점에 여는 read-only 커넥션과 파이프라인.
 
     문의 ID 는 **근거 수집 전에** 확정한다: SQL 근거 ID 가 그 값을 품고, DB CHECK 가
     둘의 일치를 강제하기 때문이다.
@@ -370,20 +370,21 @@ class InquiryService:
         *,
         open_pipeline: Callable[[], InquiryPipeline],
         app_conn: psycopg.Connection[DictRow],
-        readonly_conn: psycopg.Connection[DictRow],
+        open_readonly: Callable[[], AbstractContextManager[psycopg.Connection[DictRow]]],
     ) -> None:
         self._open_pipeline = open_pipeline
         self._app_conn = app_conn
-        self._readonly_conn = readonly_conn
+        self._open_readonly = open_readonly
 
     def process(self, *, content: str, order_no: str | None) -> ProcessedInquiry:
-        processed = self._open_pipeline().run(
-            inquiry_id=new_inquiry_id(),
-            content=content,
-            order_no=order_no,
-            app_conn=self._app_conn,
-            readonly_conn=self._readonly_conn,
-        )
+        with self._open_readonly() as readonly_conn:
+            processed = self._open_pipeline().run(
+                inquiry_id=new_inquiry_id(),
+                content=content,
+                order_no=order_no,
+                app_conn=self._app_conn,
+                readonly_conn=readonly_conn,
+            )
         save_inquiry(conn=self._app_conn, processed=processed)
         return processed
 
@@ -491,9 +492,13 @@ def get_service() -> ServiceOpener:
 
     @contextmanager
     def _open() -> Iterator[InquiryService]:
-        """요청마다 커넥션 2개를 열고 닫는다 (text-to-SQL 은 반드시 read-only 계정으로)."""
-        with connect(settings=settings) as app_conn, readonly_connect(settings=settings) as ro:
-            yield InquiryService(open_pipeline=_pipeline, app_conn=app_conn, readonly_conn=ro)
+        """앱 연결은 요청마다, RO 연결은 process 안에서 열고 닫는다."""
+        with connect(settings=settings) as app_conn:
+            yield InquiryService(
+                open_pipeline=_pipeline,
+                app_conn=app_conn,
+                open_readonly=lambda: readonly_connect(settings=settings),
+            )
 
     return _open
 
@@ -527,9 +532,10 @@ def missing_credentials_handler(request: Request, exc: Exception) -> JSONRespons
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
+@app.exception_handler(PolicyIndexEmptyError)
 @app.exception_handler(PolicyIndexProvenanceError)
 def stale_policy_index_handler(request: Request, exc: Exception) -> JSONResponse:
-    """낡은 정책 인덱스도 **설정 오류(503)** 다 — 자격 증명 부재와 같은 계열이다.
+    """미적재·낡은 정책 인덱스는 **설정 오류(503)** 다 — 자격 증명 부재와 같은 계열이다.
 
     `no_evidence` 인계로 바꾸면 "검색이 못 찾았다"로 집계되어, 재색인을 빠뜨린 운영 실수가
     검색 품질 지표로 위장한다. 처리 기록은 커넥션 롤백으로 남지 않는다.

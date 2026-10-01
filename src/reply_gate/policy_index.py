@@ -36,6 +36,7 @@ __all__ = [
     "PlantedKind",
     "PolicyChunk",
     "PolicyDocument",
+    "PolicyIndexEmptyError",
     "PolicyIndexProvenanceError",
     "PolicySearchHit",
     "index_policy_documents",
@@ -53,6 +54,10 @@ POLICY_INDEX_STAGE = "policy_index"
 _FRONT_MATTER = re.compile(r"\A---\n(?P<body>.*?)\n---\n", re.DOTALL)
 _PLANTED = re.compile(r"<!--\s*planted:\s*(?P<kind>[a-z_]+)\s*(?:;\s*note:\s*(?P<note>.*?))?-->")
 _HEADING = re.compile(r"^##\s+(?P<article>\S+)\s+(?P<title>.+?)\s*$")
+
+
+class PolicyIndexEmptyError(RuntimeError):
+    """정책 미적재는 검색 품질이 아니라 설정 오류다 — 처리 기록으로 집계하지 않는다."""
 
 
 class PolicyIndexProvenanceError(RuntimeError):
@@ -312,10 +317,13 @@ def _assert_index_provenance(
     **오류처럼 보이지 않는다.** 실측에서 다른 모델의 질의는 전 조항이 임계값 아래로 떨어져
     `no_evidence` 로 끝났다 — 낡은 인덱스가 "검색이 못 찾았다"로 위장한 것이다.
 
-    적재 전(행 0개)은 불일치가 아니다. 검색할 것이 없으면 빈 결과와 같다.
+    적재 전(행 0개)은 별도의 설정 오류다. NULL 벡터 행도 적재된 행으로 센다.
     """
     if not rows:
-        return
+        raise PolicyIndexEmptyError(
+            "정책 인덱스가 비어 있다. "
+            "`uv run python -m scripts.index_policies` 로 정책을 적재해야 한다."
+        )
     if len(rows) == 1 and (
         rows[0]["embedding_model"] == embedding_model
         and int(rows[0]["embedding_dimensions"]) == embedding_dimensions

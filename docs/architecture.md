@@ -12,7 +12,7 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
         │  POST /inquiries          │  GET /inquiries/{id}
         ▼                           ▼
   ┌──────────────────── api.py (FastAPI) ────────────────────┐
-  │  커넥션 2개(앱 계정 · RO 계정)를 열어 아래로 넘긴다        │
+  │  앱 연결은 요청마다, RO 연결은 POST 처리에서만 연다        │
   └───────┬──────────────────────────────────┬───────────────┘
           ▼                                  ▼
     pipeline.py ── 루프 제어             records.py ── 처리 기록 저장/복원
@@ -51,7 +51,7 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 | 모듈 | 역할 | 의존 |
 |---|---|---|
-| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙, **커넥션 2개 개방** | config, contracts, db, llm, pipeline, policy_index, records |
+| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙, **앱 연결 개방·POST 처리에서 RO 연결 개방** | config, contracts, db, llm, pipeline, policy_index, records |
 | `pipeline.py` | 접수 검증 → 근거 수집 → 초안 → L1 → L2 → 종결. **재생성 상한과 층 결합을 강제하는 곳** | config, contracts, draft, evidence, gate, judge, llm, order_ref, retrieval_strategies |
 | `evidence.py` | 의도 분류(LLM) · 질의 재작성 조율 · 정책 검색 · **근거 채택(기권 게이트 → 절대 하한)** · 주문 존재성 선검사 · text-to-SQL 조율 | config, contracts, gate, llm, order_ref, policy_index, query_rewrite, retrieval_strategies, sql_guard |
 | `sql_guard.py` | 생성된 SQL 을 실행 전에 파싱·검증. 화이트리스트·주문 범위·함수·잠금절·**형변환 대상 타입 허용 목록**·**PII allowlist 출력 유래 판정**(패턴 집합은 `gate.pii_shaped` 를 부르기만 한다) | gate, order_ref |

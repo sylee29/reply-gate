@@ -106,7 +106,11 @@ uv run python -m scripts.index_policies
 
 `data/policies/` 의 문서 4개를 조항 단위로 쪼개 임베딩하고 `policy_chunks` 에 적재한다(26건).
 재실행하면 중복 없이 갱신되고, 문서에서 사라진 조항은 삭제된다.
-**이 단계를 건너뛰면 정책 근거 검색이 항상 0건이라 모든 문의가 `no_evidence` 로 인계된다.**
+**정책 테이블이 0행이면 실제 정책 검색(`policy`·`both`)이 503 설정 오류로 끝난다.**
+응답의 `detail`에 위 인덱싱 명령이 들어 있으며 처리 기록·품질 지표는 남기지 않는다.
+`order`와 저장 기록 GET은 영향을 받지 않는다. 분류·재작성·임베딩 호출이 먼저 발생할 수
+있으므로 빈 인덱스 검사가 과금 전 선검사는 아니다. 정상 인덱스에서 컷·기권으로 근거가
+없어진 경우의 업무 판정은 그대로다.
 
 **라이브 실측 전에는 색인 출처를 확인한다.** DB 는 워크트리 사이에 공유되므로(컨테이너 이름과
 볼륨이 고정) 다른 작업이 같은 `policy_chunks` 를 건드릴 수 있다. 기대와 다르면 이 단계를 다시
@@ -142,10 +146,10 @@ uv run uvicorn reply_gate.api:app --reload
 
 ```bash
 uv run ruff check .            # 0
-uv run ruff format --check .   # 219 files
+uv run ruff format --check .   # 220 files
 uv run mypy                    # strict — 81 files, 0 errors
 uv run pytest                  # DB 를 띄운 실행에서만 건수 대조가 선다
-uv run pytest -m db            # 233 passed, 1,583 deselected · skip 0 이어야 한다
+uv run pytest -m db            # 241 passed, 1,584 deselected · skip 0 이어야 한다
 ```
 
 `pytest` 는 DB 기동을 전제한다. DB 가 없으면 `db` 마커 테스트가 사유를 담아 skip 되므로,
@@ -163,7 +167,7 @@ uv run python -m scripts.check_links        # 문서 51개 · 링크 433개 · �
 
 **그리고 테스트 건수 쪽은 DB 를 띄운 실행에서만 성립한다.** 문서가 인용하는 것은 `N passed`
 인데 세션이 아는 것은 수집 건수이고, 둘은 **skip 이 0 일 때만** 같다. DB 가 없으면 `db` 마커
-233건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
+241건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
 검사 — 은 skip 과 무관해서 계속 대조한다). 이 갈래가 없던 첫 판은 `1,310 passed · 178 skipped`
 인 실행에서도 `1,488 passed` 인용을 초록으로 통과시켰다([findings 37](tracking/findings.md)).
 

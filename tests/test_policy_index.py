@@ -25,6 +25,7 @@ from reply_gate.llm import EmbeddingClient
 from reply_gate.policy_index import (
     DEFAULT_POLICY_DIR,
     PlantedKind,
+    PolicyIndexEmptyError,
     PolicyIndexProvenanceError,
     PolicySearchHit,
     index_policy_documents,
@@ -337,19 +338,18 @@ def test_두_공간이_섞인_인덱스는_어느_질의로도_거부된다(
 
 
 @pytest.mark.db
-def test_적재_전_빈_인덱스는_불일치가_아니다(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_적재_전_빈_인덱스는_설정_오류다(app_conn: psycopg.Connection[DictRow]) -> None:
     """검색할 것이 없는 것과 다른 공간을 비교하는 것은 다르다."""
     app_conn.execute("DELETE FROM policy_chunks")
 
-    hits = search_policy_chunks(
-        conn=app_conn,
-        query_vector=[0.0] * 1536,
-        top_k=5,
-        embedding_model="stub:model-a",
-        embedding_dimensions=1536,
-    )
-
-    assert hits == []
+    with pytest.raises(PolicyIndexEmptyError, match=r"정책 인덱스가 비어.*index_policies"):
+        search_policy_chunks(
+            conn=app_conn,
+            query_vector=[0.0] * 1536,
+            top_k=5,
+            embedding_model="stub:model-a",
+            embedding_dimensions=1536,
+        )
 
 
 # ── 실제 두 연결의 snapshot 경계: 공유 정책 테이블/sequence는 쓰지 않는다 ──
@@ -485,12 +485,16 @@ def test_독립_정책_출처가_다르면_벡터_차원_오류보다_먼저_거
 
 @pytest.mark.db
 @pytest.mark.parametrize("empty", [True, False])
-def test_독립_정책이_비었거나_NULL_벡터뿐이면_빈_후보를_돌려준다(empty: bool) -> None:
+def test_독립_빈_정책은_설정_오류이고_NULL_벡터는_빈_후보다(empty: bool) -> None:
     with _isolated_policy_index() as (reader, writer, table, _events):
         statement = "DELETE FROM {}" if empty else "UPDATE {} SET embedding = NULL"
         writer.execute(sql.SQL(statement).format(table))
         writer.commit()
-        assert _snapshot_search(reader) == []
+        if empty:
+            with pytest.raises(PolicyIndexEmptyError, match=r"정책 인덱스가 비어.*index_policies"):
+                _snapshot_search(reader)
+        else:
+            assert _snapshot_search(reader) == []
 
 
 @pytest.mark.db
@@ -522,5 +526,6 @@ def test_독립_정책의_동점_절단과_혼합_출처_오류를_보존한다(
             _snapshot_search(reader)
 
 
-def test_top_k가_0이면_커넥션을_열지_않고_빈_후보를_돌려준다() -> None:
-    assert _snapshot_search(cast(psycopg.Connection[DictRow], None), top_k=0) == []
+@pytest.mark.parametrize("top_k", [0, -1])
+def test_top_k가_0이하면_커넥션을_열지_않고_빈_후보를_돌려준다(top_k: int) -> None:
+    assert _snapshot_search(cast(psycopg.Connection[DictRow], None), top_k=top_k) == []

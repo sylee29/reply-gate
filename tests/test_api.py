@@ -207,7 +207,11 @@ def service_client(
 
     def _override() -> ServiceOpener:
         return lambda: nullcontext(
-            InquiryService(open_pipeline=lambda: pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+            InquiryService(
+                open_pipeline=lambda: pipeline,
+                app_conn=app_conn,
+                open_readonly=lambda: nullcontext(ro_conn),
+            )
         )
 
     app.dependency_overrides[get_service] = _override
@@ -1191,27 +1195,118 @@ def test_DB_가_진짜_필요한_경로는_그대로_500이다(monkeypatch: pyte
 
 
 @pytest.mark.db
-def test_get_service_가_계정_두_개로_커넥션을_열고_닫는다() -> None:
-    """다른 테스트는 이 의존성을 통째로 override 하므로 배선이 목 뒤에 숨는다.
+@pytest.mark.parametrize("failure", [None, "open", "run", "save"])
+def test_get_service_가_처리에서만_RO를_열고_모든_종료에서_닫는다(
+    monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    """실제 계정과 연결 수명을 검사하며 예외도 자원을 남기지 않는다."""
+    from reply_gate.db import readonly_connect
 
-    text-to-SQL 이 앱 계정 커넥션을 집으면 안전장치 1층이 무의미해지므로,
-    실제로 열리는 커넥션이 각각 어느 계정인지 한 번은 DB 에 물어 확인한다.
-    """
     settings = get_settings()
-    open_service = get_service()
-    with open_service() as service:
-        with service._app_conn.cursor() as cur:
-            cur.execute("SELECT current_user AS who")
-            row = cur.fetchone()
-            assert row is not None
-            assert row["who"] == settings.postgres_app_user
+    connections: list[psycopg.Connection[DictRow]] = []
 
-        with service._readonly_conn.cursor() as cur:
-            cur.execute("SELECT current_user AS who")
-            row = cur.fetchone()
-            assert row is not None
-            assert row["who"] == settings.postgres_ro_user
+    def open_ro(**kwargs: Any) -> psycopg.Connection[DictRow]:
+        if failure == "open":
+            raise RuntimeError("시험 연결 실패")
+        conn = readonly_connect(**kwargs)
+        connections.append(conn)
+        return conn
 
-    # 블록이 끝나면 두 커넥션 모두 닫혀 있어야 한다 — 요청마다 새는 것을 막는다.
+    class Pipeline:
+        def run(self, **kwargs: Any) -> ProcessedInquiry:
+            for key, user in (
+                ("app_conn", settings.postgres_app_user),
+                ("readonly_conn", settings.postgres_ro_user),
+            ):
+                row = kwargs[key].execute("SELECT current_user AS who").fetchone()
+                assert row is not None and row["who"] == user
+            assert kwargs["readonly_conn"] is connections[-1]
+            if failure == "run":
+                raise RuntimeError("시험 처리 실패")
+            return _processed(kwargs["inquiry_id"])
+
+    def save(**kwargs: Any) -> None:
+        if failure == "save":
+            raise RuntimeError("시험 저장 실패")
+
+    monkeypatch.setattr("reply_gate.api.readonly_connect", open_ro)
+    monkeypatch.setattr("reply_gate.api.build_pipeline", lambda **kwargs: Pipeline())
+    monkeypatch.setattr("reply_gate.api.save_inquiry", save)
+    with (
+        pytest.raises(RuntimeError, match="시험") if failure else nullcontext(),
+        get_service()() as service,
+    ):
+        assert connections == []
+        service.process(content=INQUIRY, order_no=None)
+        assert connections[-1].closed
     assert service._app_conn.closed
-    assert service._readonly_conn.closed
+    assert all(conn.closed for conn in connections)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("intent", ["policy", "both", "order"])
+def test_빈_인덱스는_실제_정책_검색에서만_503이다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow], intent: str
+) -> None:
+    """both의 주문번호 누락보다 설정 오류가 먼저이며 order는 검색을 우회한다."""
+    app_conn.execute("DELETE FROM policy_chunks")
+    tables = ("inquiries", "inquiry_evidence", "inquiry_attempts", "inquiry_sql_failures")
+    before = [app_conn.execute(f"SELECT count(*) AS n FROM {table}").fetchone() for table in tables]
+    generation = scripted_client({INTENT_STAGE: [intent_completion(intent)]})
+    with live_client(app_conn=app_conn, ro_conn=ro_conn, generation=generation) as http:
+        response = http.post("/inquiries", json={"content": INQUIRY})
+    if intent == "order":
+        assert response.status_code == 200
+        assert response.json()["escalation_reason"] == "missing_order_ref"
+    else:
+        assert response.status_code == 503
+        assert "정책 인덱스가 비어" in response.json()["detail"]
+        assert "uv run python -m scripts.index_policies" in response.json()["detail"]
+        assert [
+            app_conn.execute(f"SELECT count(*) AS n FROM {table}").fetchone() for table in tables
+        ] == before
+
+
+@pytest.mark.db
+def test_RO_장애여도_실제_서비스의_조회는_가능하고_POST만_실패한다(
+    app_conn: psycopg.Connection[DictRow], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """get_service를 그대로 사용해 쓰지 않는 RO 연결이 조회를 막는 회귀를 잡는다."""
+    stored = _processed(new_inquiry_id())
+    save_inquiry(conn=app_conn, processed=stored)
+    app_conn.execute("DELETE FROM policy_chunks")
+    calls: list[str] = []
+    monkeypatch.setattr("reply_gate.api.connect", lambda **kwargs: nullcontext(app_conn))
+
+    def broken(**kwargs: Any) -> Any:
+        calls.append("ro")
+        raise psycopg.OperationalError("시험 RO 연결 장애")
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("조회에서 AI/파이프라인을 조립했다")
+
+    monkeypatch.setattr("reply_gate.api.readonly_connect", broken)
+    monkeypatch.setattr("reply_gate.api.build_pipeline", forbidden)
+    monkeypatch.setattr("reply_gate.api.build_generation_client", forbidden)
+    monkeypatch.setattr("reply_gate.api.build_embedding_client", forbidden)
+    with TestClient(app, raise_server_exceptions=False) as http:
+        assert http.get(f"/inquiries/{stored.inquiry_id}").status_code == 200
+        assert http.get(f"/inquiries/{new_inquiry_id()}").status_code == 404
+        assert calls == []
+        assert http.post("/inquiries", json={"content": INQUIRY}).status_code == 500
+    assert calls == ["ro"]
+
+
+@pytest.mark.db
+def test_빈_인덱스여도_의도_분류_실패는_기존_업무_판정이다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """정책 검색까지 도달하지 않은 문의에 미적재 선검사를 끼워 넣지 않는다."""
+    app_conn.execute("DELETE FROM policy_chunks")
+    generation = scripted_client(
+        {INTENT_STAGE: [LLMCallError(stage=INTENT_STAGE, reason="transport_error", attempts=2)]}
+    )
+    with live_client(app_conn=app_conn, ro_conn=ro_conn, generation=generation) as http:
+        response = http.post("/inquiries", json={"content": INQUIRY})
+    assert response.status_code == 200
+    assert response.json()["escalation_reason"] == "llm_call_failed"
