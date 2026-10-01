@@ -995,3 +995,66 @@ def test_화이트리스트가_실제_orders_컬럼과_일치한다(app_conn: ps
     ).fetchall()
 
     assert {row["column_name"] for row in rows} == set(SCHEMA_WHITELIST[ORDERS_TABLE])
+
+
+_DATABASE_OUTPUT_CASES = [
+    ("coalesce(customer_phone, '미정')", "coalesce"),
+    ("nullif(customer_phone, '')", "nullif"),
+    ("concat(customer_phone, '')", "concat"),
+    ("upper(customer_phone)", "upper"),
+    ("lower(customer_phone)", "lower"),
+    ("length(customer_phone)", "length"),
+    ("replace(customer_phone, '-', '')", "replace"),
+    ("substring(customer_phone FROM 1 FOR 3)", "substring"),
+    ("trim(customer_phone)", "btrim"),
+    ("trim(LEADING '0' FROM customer_phone)", "ltrim"),
+    ("trim(TRAILING '0' FROM customer_phone)", "rtrim"),
+    ("to_char(ordered_at, 'YYYY-MM-DD')", "to_char"),
+    ("date_trunc('day', ordered_at)", "date_trunc"),
+    ("extract(year FROM ordered_at)", "extract"),
+    ("now()", "current_timestamp"),
+    ("current_date", "current_date"),
+    ("quantity + 1", "?column?"),
+    ("customer_phone || ''", "?column?"),
+    ("cast(customer_phone AS text)", "customer_phone"),
+    ("cast(orders.* AS text)", "orders"),
+    ("cast(1 AS int)", "int4"),
+    ("cast(1 AS char)", "bpchar"),
+    ("cast(cast(1 AS int) AS text)", "text"),
+    ("CASE WHEN true THEN customer_phone ELSE customer_email END", "customer_email"),
+    ("CASE WHEN true THEN customer_phone ELSE '미정' END", "case"),
+    ("cast(CASE WHEN true THEN 1 ELSE 2 END AS text)", "text"),
+    ("count(*)", "count"),
+    ("sum(quantity)", "sum"),
+    ("min(quantity)", "min"),
+    ("max(quantity)", "max"),
+    ("avg(quantity)", "avg"),
+    ("sum(quantity) OVER ()", "sum"),
+    ("count(*) FILTER (WHERE quantity > 0)", "count"),
+    ('customer_phone AS "Phone"', "Phone"),
+    ("customer_phone AS ÄPhone", "Äphone"),
+    (f"customer_phone AS {'a' * 64}", "a" * 63),
+    (f'customer_phone AS "{"가" * 20}한글"', "가" * 20 + "한"),
+]
+
+
+@pytest.mark.parametrize(("projection", "expected"), _DATABASE_OUTPUT_CASES)
+def test_기본_출력명도_중복_검사에_포함한다(projection: str, expected: str) -> None:
+    """함수·계산식 이름 누락을 DB 없이도 구속하고 정상 무별칭 계산을 보존한다."""
+    _ok(f"SELECT {projection} FROM orders {SCOPE}")
+    rejection = _reject(f'SELECT customer_phone AS "{expected}", {projection} FROM orders {SCOPE}')
+    assert rejection.rule == "unsupported_projection"
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(("projection", "expected"), _DATABASE_OUTPUT_CASES)
+def test_검증한_출력명이_PostgreSQL_메타데이터와_일치한다(
+    ro_conn: psycopg.Connection[DictRow], projection: str, expected: str
+) -> None:
+    """메타데이터만 비교하며 실제 주문값은 출력하지 않는다."""
+    query = validate_sql(
+        f"SELECT {projection} FROM orders {SCOPE}", order_no=ORDER_NO, max_rows=MAX_ROWS
+    )
+    cursor = ro_conn.execute(query.sql)
+    assert cursor.description is not None
+    assert tuple(column.name for column in cursor.description) == (expected,)

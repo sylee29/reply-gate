@@ -64,7 +64,7 @@ from reply_gate.retrieval_strategies import (
     abstention_statistic,
     truncate_for_gate,
 )
-from reply_gate.testing import LexicalEmbeddingClient
+from reply_gate.testing import LexicalEmbeddingClient, StubEvidenceCollector
 from tests.conftest import declared_settings
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -522,10 +522,10 @@ class _PolicyIntentClient:
 
 
 def _policy_collector(*, gate_enabled: bool) -> EvidenceCollector:
-    return EvidenceCollector(
+    return StubEvidenceCollector(
         generation_client=cast(GenerationClient, _PolicyIntentClient()),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(
+        settings=declared_settings(
             vector_similarity_threshold=0.0,
             query_rewrite_enabled=False,
             abstention_gate_enabled=gate_enabled,

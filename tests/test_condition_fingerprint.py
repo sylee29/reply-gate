@@ -262,6 +262,47 @@ def test_접기_동작이_바뀌면_초안_판정_지문이_움직인다(monkeyp
     assert _draft_rule_version() != before
 
 
+def test_이메일_산문_경계를_빼면_초안_판정_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """공통 접기만으로 되돌리면 정상 에코가 다시 기각되는 동작 변경이다."""
+    before = _draft_rule_version()
+    mutated = tuple(
+        replace(pattern, fold=gate.fold_for_detection) if pattern.name == "email" else pattern
+        for pattern in gate.DEFAULT_PII_PATTERNS
+    )
+    monkeypatch.setattr(evaluation, "DEFAULT_PII_PATTERNS", mutated)
+
+    assert _draft_rule_version() != before
+
+
+def test_이메일_지문_탐침은_산문과_명시_주소를_함께_태운다() -> None:
+    """정상 에코만 태우면 literal 보호가 사라져도 같은 판으로 보일 수 있다."""
+    email = next(pattern for pattern in gate.DEFAULT_PII_PATTERNS if pattern.name == "email")
+    folded = email.fold(evaluation._PII_RULE_PROBE)
+
+    assert "메일은 hong@example.com 입니다." in folded
+    assert "customer_email=hong@example.com입니다" in folded
+    assert "<hong@example.com입니다>" in folded
+    assert "hong@example.com입니다.evil" in folded
+    assert "support@쇼핑몰.한국" in folded
+
+
+def test_이메일을_claim별로_접으면_판정_지문도_바뀐다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """claim 연결 문맥을 잃는 변경을 접기 함수의 이름만으로는 감지할 수 없다."""
+    before = _draft_rule_version()
+    original = gate._has_unsourced_pii
+
+    def without_answer_context(
+        *, draft_texts: Sequence[str], evidence_texts: Sequence[str], answer_text: str | None
+    ) -> bool:
+        return original(draft_texts=draft_texts, evidence_texts=evidence_texts, answer_text=None)
+
+    monkeypatch.setattr(gate, "_has_unsourced_pii", without_answer_context)
+
+    assert _draft_rule_version() != before
+
+
 def test_패턴_집합이_줄면_초안_판정_지문이_움직인다(monkeypatch: pytest.MonkeyPatch) -> None:
     before = _draft_rule_version()
     monkeypatch.setattr(evaluation, "DEFAULT_PII_PATTERNS", gate.DEFAULT_PII_PATTERNS[:-1])
@@ -420,6 +461,26 @@ def test_조회_가드_탐침이_실제로_유래를_가른다() -> None:
     assert any(item.startswith("reject|") for item in outcomes), outcomes
 
 
+def test_조회_출력명_경계의_판정도_지문에_실린다() -> None:
+    """DB 출력명 충돌과 quoted 유래가 바뀌면 같은 조건으로 비교해서는 안 된다."""
+    assert evaluation.sql_guard_probe_outcomes()[-7:] == (
+        "reject|unsupported_projection",
+        "reject|unsupported_projection",
+        "ok|Phone",
+        "ok|coalesce",
+        "ok|" + "a" * 63,
+        "ok|",
+        "reject|unsupported_projection",
+    )
+
+
+def test_식별자_절단을_빼면_조회_지문이_움직인다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """음성 대조: PostgreSQL 이름 절단을 지우는 실제 동작 변경을 탐침이 감지한다."""
+    before = _sql_guard_version()
+    monkeypatch.setattr(sql_guard, "_normalize_identifiers", lambda statement: None)
+    assert _sql_guard_version() != before
+
+
 def test_기권_미정의_처분을_뒤집으면_지문이_움직인다(monkeypatch: pytest.MonkeyPatch) -> None:
     """**미정의 처리를 바꿔도 기존 지문 값은 전혀 움직이지 않는다** — 이 칸이 그 자리다."""
     from reply_gate.evaluation import code_condition_fingerprint
@@ -571,7 +632,7 @@ def test_옛_산출물과의_대조는_미상을_관용한다() -> None:
     comparison = _extended_legacy().compare(_legacy())
 
     assert comparison.comparable is True
-    assert set(comparison.unknown_fields) == set(NEW_FINGERPRINT_FIELDS)
+    assert set(comparison.unknown_fields) == {*NEW_FINGERPRINT_FIELDS, "judge_rule_version"}
 
 
 def test_세트_편입은_미상을_인정하지_않는다() -> None:
@@ -838,3 +899,178 @@ def _stub_report() -> EvaluationReport:
         pipeline=agreement,
         judge_accuracy=SkippedMeasurement(reason="대역 — 판정 미실행"),
     )
+
+
+def test_claim_연결_검사를_되돌리면_초안_판정_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """분리 claim만 검사하던 결함으로 돌아가도 규칙 지문이 그대로면 회귀 조건을 숨긴다."""
+    before = _draft_rule_version()
+    monkeypatch.setattr(
+        gate, "_answer_texts", lambda *, inspection, raw_draft: inspection.answer_texts
+    )
+    assert _draft_rule_version() != before
+
+
+def test_L2_규칙_지문은_프롬프트와_별개인_필수_판정_항목이다() -> None:
+    """같은 프롬프트도 산출 해석 코드가 달라지면 다른 조건이어야 한다."""
+    from reply_gate.regression_guard import JUDGING_FINGERPRINT_FIELDS
+
+    values = _current().values
+    assert "judge_rule_version" in FINGERPRINT_FIELDS
+    assert "judge_rule_version" in JUDGING_FINGERPRINT_FIELDS
+    value = values["judge_rule_version"]
+    assert isinstance(value, str)
+    assert value.startswith("judgerules-")
+
+
+@pytest.mark.parametrize("declaration", ["schema", "format_attempts"])
+def test_L2_규칙_선언이_바뀌면_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch, declaration: str
+) -> None:
+    from copy import deepcopy
+
+    from reply_gate import judge
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    if declaration == "schema":
+        schema = deepcopy(judge.JUDGE_JSON_SCHEMA)
+        schema["required"].remove("contradictions")
+        monkeypatch.setattr(judge, "JUDGE_JSON_SCHEMA", schema)
+    else:
+        monkeypatch.setattr(judge, "JUDGE_MAX_ATTEMPTS", judge.JUDGE_MAX_ATTEMPTS + 1)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_같은_프롬프트라도_L2_parser_수용_규칙이_바뀌면_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from reply_gate import judge
+    from reply_gate.contracts import Draft
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    prompt = judge.JUDGE_SYSTEM_PROMPT
+    original = judge._parse_judge_result
+
+    def allow_uncited(data: object, *, draft: Draft, evidence: Any) -> Any:
+        if isinstance(data, dict) and data.get("contradictions"):
+            pair = data["contradictions"][0]
+            draft = replace(
+                draft,
+                claims=tuple(
+                    replace(claim, citation_ids=(pair["evidence_id_a"],)) for claim in draft.claims
+                ),
+            )
+        return original(data, draft=draft, evidence=evidence)
+
+    monkeypatch.setattr(judge, "_parse_judge_result", allow_uncited)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+    assert prompt == judge.JUDGE_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("admission", ["characters", "finite_numbers"])
+def test_공통_JSON_산출_수용규칙을_되돌리면_L2_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch, admission: str
+) -> None:
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    if admission == "characters":
+        monkeypatch.setattr(llm, "_require_storable_json_strings", lambda data: None)
+    else:
+        monkeypatch.setattr(llm, "_finite_json_float", float)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_L2_parser_진단_문구만_바꾸면_지문은_같다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """판정 동작을 해시하며 오류 문구 다듬기는 판정 규칙 변경이 아니다."""
+    from reply_gate import judge
+    from reply_gate.contracts import Draft
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    original = judge._parse_judge_result
+
+    def reword(data: object, *, draft: Draft, evidence: Any) -> Any:
+        try:
+            return original(data, draft=draft, evidence=evidence)
+        except judge._ParseError as error:
+            raise judge._ParseError("다듬은 오류 설명") from error
+
+    monkeypatch.setattr(judge, "_parse_judge_result", reword)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] == before
+
+
+def test_기존_실측의_L2_규칙은_미상이고_새_세트에는_편입되지_않는다() -> None:
+    old = load_run_summary(_ROOT / "reports" / "evaluation-live-l2-28.json").fingerprint
+    assert old.values["judge_rule_version"] is None
+    values = dict(old.values)
+    values["judge_rule_version"] = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    new = ConditionFingerprint.from_values(values)
+    comparison = new.compare(old)
+    assert comparison.comparable is True
+    assert comparison.unknown_fields == ("judge_rule_version",)
+    assert new.same_condition(old)[0] is False
+    assert old.same_condition(old)[0] is False
+    assert new.same_condition(new) == (True, None)
+
+
+def test_L2_규칙_변경_선언은_대조만_열고_다른_세트를_섞지_않는다() -> None:
+    baseline = _current()
+    values = dict(baseline.values)
+    values["judge_rule_version"] = "judgerules-different"
+    undeclared = ConditionFingerprint.from_values(values)
+    declared = ConditionFingerprint.from_values(values, declared=("judge_rule_version",))
+    assert undeclared.compare(baseline).comparable is False
+    assert declared.compare(baseline).comparable is True
+    assert declared.same_condition(baseline)[0] is False
+
+
+def test_L2_규칙_탐침은_수용과_거부를_모두_실행한다() -> None:
+    """입력 이름만 지문에 적거나 전부 거부하는 탐침으로는 판정 변경을 확인할 수 없다."""
+    outcomes = evaluation._judge_rule_probe_outcomes()
+    assert outcomes["json:normal"] == "accepted"
+    assert outcomes["json:surrogate_pair"] == "accepted"
+    assert outcomes["json:nul_value"] == "rejected"
+    assert outcomes["json:nul_key"] == "rejected"
+    assert outcomes["json:surrogate_high"] == "rejected"
+    for name in (
+        "normal",
+        "cited_rejection",
+        "uncited_record",
+        "explicit_conflict",
+        "duplicate_complete",
+        "unsupported",
+    ):
+        assert outcomes[f"judge:{name}"] != "rejected", name
+    for name in (
+        "uncited_rejection",
+        "duplicate_missing",
+        "invalid_reason",
+        "verdict_without_reason",
+        "unsupported_without_reason",
+        "unknown_evidence",
+        "self_conflict",
+    ):
+        assert outcomes[f"judge:{name}"] == "rejected", name
+
+
+def test_L2_parser가_모든_정상입력도_거부하면_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """양성 입력이 지문에 실제 기여한다는 음성 대조다."""
+    from reply_gate import judge
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+
+    def reject_all(*args: Any, **kwargs: Any) -> Any:
+        raise judge._ParseError("모든 입력을 거부하는 잘못된 parser")
+
+    monkeypatch.setattr(judge, "_parse_judge_result", reject_all)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_L2_규칙_지문은_새_리포트_JSON과_문면에_함께_실린다() -> None:
+    report = _stub_report()
+    value = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    assert (
+        report_to_json(report)["conditions"]["condition_fingerprint"]["judge_rule_version"] == value
+    )
+    assert value in render_markdown(report)

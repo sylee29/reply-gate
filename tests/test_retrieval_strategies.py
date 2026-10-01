@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 
 from reply_gate import retrieval_strategies
-from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError
+from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 from reply_gate.retrieval_strategies import (
     Bm25Hit,
     FusedHit,
@@ -278,6 +278,43 @@ def test_llm_rerank_failure_or_unparseable_output_keeps_previous_order(
     assert result.fell_back
     assert result.fallback_reason is not None
     assert not result.served_from_cache
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMCallError(
+            stage="retrieval_rerank",
+            reason="refusal",
+            attempts=1,
+            input_tokens=17,
+            output_tokens=9,
+        ),
+        LLMFormatError(
+            stage="retrieval_rerank",
+            detail="invalid JSON",
+            input_tokens=17,
+            output_tokens=9,
+        ),
+    ],
+)
+def test_리랭크_실패_예외의_과금_토큰을_폴백에도_보존한다(
+    tmp_path: Path, error: LLMCallError | LLMFormatError
+) -> None:
+    """실패한 호출의 토큰도 실비용이다 — 결정 0009의 리랭크 집계 계약을 지킨다."""
+    outcome = llm_rerank(
+        query="환불 문의",
+        candidates=_fused_candidates(),
+        policy_texts={"policy:a:1": "A 조항", "policy:b:1": "B 조항", "policy:c:1": "C 조항"},
+        client=cast(GenerationClient, _RecordingGenerationClient([error])),
+        model="gpt-cheap",
+        cache_dir=tmp_path,
+    )
+
+    assert outcome.fell_back
+    assert outcome.hits == _fused_candidates()
+    assert (outcome.input_tokens, outcome.output_tokens) == (17, 9)
+    assert not outcome.served_from_cache
 
 
 def test_리랭크_폴백은_캐시에_기록되지_않는다(tmp_path: Path) -> None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
+
 from reply_gate import contracts, gate
 from reply_gate.contracts import (
     COMBINED_REASON_ORDER,
@@ -20,6 +22,22 @@ from reply_gate.contracts import (
     policy_evidence_id,
     sql_evidence_id,
 )
+
+
+@pytest.mark.parametrize(
+    ("text", "unsafe"),
+    [
+        ("", False),
+        ("한글 😀\n\t", False),
+        (r"\u0000", False),
+        ("x\0y", True),
+        ("\ud800", True),
+        ("\udfff", True),
+    ],
+)
+def test_저장_문자_경계는_NUL과_surrogate만_거부한다(text: str, unsafe: bool) -> None:
+    """JSON 구문 허용과 UTF-8/Postgres 저장 허용은 다르며 정상 Unicode는 보존한다."""
+    assert contracts.has_unstorable_characters(text) is unsafe
 
 
 def test_초안_스키마는_citation_최소개수를_강제하지_않는다() -> None:

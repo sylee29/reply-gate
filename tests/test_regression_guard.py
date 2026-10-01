@@ -62,6 +62,7 @@ _BASE_FINGERPRINT: Mapping[str, str] = {
     "judge_effort": "기본값",
     "judge_thinking": "미전송(계열 기본)",
     "judge_prompt_version": "p-aaaa",
+    "judge_rule_version": "judgerules-aaaa",
     "judge_fixture_version": "f-bbbb",
     "judge_prompt_caching": "off",
     "draft_rule_version": "draftrules-aaaa",
@@ -346,23 +347,39 @@ def test_등재된_기준선이_자기가_가리키는_산출물과_맞는다() 
     assert _fingerprint_conflicts(registered, head) == []
 
 
-def test_등재된_참조는_지문_스물다섯_칸을_전부_안다() -> None:
-    """**참조가 지문 항목을 빠뜨리면 여기서 잡는다.**
+def _missing_registered_fields(promotion: PromotedBaseline, expected_fields: set[str]) -> set[str]:
+    return expected_fields - {
+        name for name, value in promotion.fingerprint.values.items() if value is not None
+    }
 
-    지문이 열여덟 칸에서 스물다섯 칸으로 넓어지던 동안, 이 검사는 반대 방향을 들고
-    있었다 — 확장 이전 등재는 새 일곱 칸을 몰라야 정상이라는 것. 재등재가 그 칸을
-    채우면서 방향이 뒤집혔고, 지금 지키는 것은 **참조가 한 칸도 빠뜨리지 않았다**이다.
 
-    빠뜨린 칸은 `None`(미상)으로 읽히고 미상은 **대조를 막지 않으므로**, 오타나 누락이
-    조용히 통과해 구속 줄이 반쪽으로 도는 상태가 된다. 그 조용한 실패를 이 한 줄이 막는다.
-    """
+def test_등재된_참조는_등록당시_칸을_보존하고_새_L2규칙만_모른다() -> None:
+    """역사적 등록을 새 규칙으로 채우지 않되, 원래 알고 있던 칸의 누락은 계속 잡는다."""
     promotion = load_promoted_baseline()
     assert isinstance(promotion, PromotedBaseline)
-    registered = ConditionFingerprint.from_values(promotion.fingerprint.values)
+    for stem in promotion.report_stems:
+        payload = json.loads((_ROOT / "reports" / f"{stem}.json").read_text(encoding="utf-8"))
+        registered_fields = set(payload["conditions"]["condition_fingerprint"])
+        assert registered_fields
+        assert _missing_registered_fields(promotion, registered_fields) == set()
+    unknown = {name for name, value in promotion.fingerprint.values.items() if value is None}
+    assert unknown == {"judge_rule_version"}, sorted(unknown)
 
-    unknown = {name for name, value in registered.values.items() if value is None}
 
-    assert unknown == set(), sorted(unknown)
+@pytest.mark.parametrize("removed", ["judge_prompt_version", "generation_effort"])
+def test_등록당시_칸을_지운_참조는_새필드_미상_예외로_숨지_않는다(
+    tmp_path: Path, removed: str
+) -> None:
+    """음성 대조 — 승격 파일은 건드리지 않고 복사본에서 필수/추가 칸 각각을 지운다."""
+    raw = json.loads(DEFAULT_PROMOTED_BASELINE_PATH.read_text(encoding="utf-8"))
+    expected_fields = set(raw["fingerprint"])
+    assert expected_fields
+    del raw["fingerprint"][removed]
+    path = tmp_path / "reference.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    promotion = load_promoted_baseline(path)
+    assert isinstance(promotion, PromotedBaseline)
+    assert _missing_registered_fields(promotion, expected_fields) == {removed}
 
 
 def test_두_줄이_상반되면_승격_기준선이_판정을_가진다(tmp_path: Path) -> None:
@@ -1454,13 +1471,15 @@ def test_세트_편입은_옛_산출물을_끌어오지_않는다() -> None:
         assert stale not in guard.candidate_stems
     assert "evaluation-live-l2-28" in guard.candidate_stems
 
-    # ② 편입된 것은 **전부** 등재 지문과 같다 — 가드의 필터를 믿지 않고 산출물에서 다시 읽는다.
+    # ② 이 역사적 실행은 새 L2 규칙을 몰라 다른 옛 실행조차 편입하지 못한다.
+    assert guard.candidate_stems == (current.stem,)
+    # 알려진 칸은 등재 지문과 같고, 추가된 판정 규칙 칸만 미상으로 남는다.
     for stem in guard.candidate_stems:
         payload = json.loads((reports / f"{stem}.json").read_text(encoding="utf-8"))
         run = run_summary_from_payload(payload, stem=stem, source=stem)
         assert _fingerprint_conflicts(run.fingerprint, promoted.fingerprint) == [], stem
         unknown = [n for n, v in run.fingerprint.values.items() if v is None]
-        assert unknown == [], (stem, unknown)
+        assert unknown == ["judge_rule_version"], (stem, unknown)
 
     # ③ 제외된 옛 산출물이 **이름으로** 남는다 — 조용히 빠지지 않는다.
     assert any("evaluation-live-l2-2" in item for item in guard.candidate_exclusions)
@@ -1528,3 +1547,21 @@ def test_실행이_적어_보낸_미상_문자열도_미상으로_읽는다() ->
     same, reason = left.same_condition(right)
     assert same is False
     assert reason is not None and "label_version" in reason
+
+
+def test_L2_규칙_변경은_측정3의_선언된_판정층_변화로_설명한다(tmp_path: Path) -> None:
+    """새 규칙 판도 판정층이다. 지문 대조만 열리고 설명에서 빠지면 보고서가 모순된다."""
+    fingerprint = dict(_BASE_FINGERPRINT)
+    fingerprint["judge_rule_version"] = "judgerules-new"
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        candidate_fingerprint=fingerprint,
+        declared=("judge_rule_version",),
+        candidate_kwargs={"measurement3_detection_rate": 0.5},
+    )
+    assert guard.binding.verdict == "통과"
+    assert any(
+        "판정 층 변경을 선언했다" in note and "judge_rule_version" in note
+        for note in guard.binding.notes
+    )

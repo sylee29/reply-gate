@@ -27,6 +27,7 @@ DB 가 필요한 테스트는 `db` 마커가 붙고, 쓰기는 전부 `app_conn`
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
@@ -60,7 +61,7 @@ from reply_gate.contracts import (
     Verdict,
 )
 from reply_gate.draft import DRAFT_STAGE, DraftGenerator
-from reply_gate.evidence import INTENT_STAGE, EvidenceCollector
+from reply_gate.evidence import INTENT_STAGE
 from reply_gate.judge import JUDGE_STAGE, JudgeOutcome
 from reply_gate.llm import GenerationClient, LLMCallError
 from reply_gate.pipeline import (
@@ -71,7 +72,8 @@ from reply_gate.pipeline import (
     new_inquiry_id,
 )
 from reply_gate.records import save_inquiry
-from reply_gate.testing import LexicalEmbeddingClient
+from reply_gate.testing import LexicalEmbeddingClient, StubEvidenceCollector
+from tests.conftest import declared_settings
 from tests.test_pipeline import (
     ScriptedGenerationClient,
     ScriptedJudge,
@@ -243,7 +245,7 @@ def l2_live_pipeline(
     `build_pipeline` 대신 협력자를 직접 조립해 판정 대역을 끼운다 — `build_pipeline` 은
     실제 Anthropic 판정자를 배선하기 때문이다.
     """
-    settings = Settings(
+    settings = declared_settings(
         vector_top_k=5,
         vector_similarity_threshold=threshold,
         sql_max_rows=50,
@@ -251,7 +253,7 @@ def l2_live_pipeline(
     )
     client = cast(GenerationClient, generation)
     return InquiryPipeline(
-        collector=EvidenceCollector(
+        collector=StubEvidenceCollector(
             generation_client=client,
             embedding_client=LexicalEmbeddingClient(dimensions=1536),
             settings=settings,
@@ -438,6 +440,31 @@ def test_웹_폼은_외부_리소스를_불러오지_않는다(client: TestClien
 
     assert "http://" not in html
     assert "https://" not in html
+
+
+def test_고객_인계_안내는_실제_상담_진행이나_후속_연락을_약속하지_않는다(
+    client: TestClient,
+) -> None:
+    """인계 대상 기록만 있는 시연에서 상담원이 확인 중이라고 말하면 안 된다."""
+    html = client.get("/").text
+    안내 = re.search(r'id="escalation-customer"[^>]*>(.*?)</p>', html, re.DOTALL)
+    assert 안내 is not None
+    assert "추가 확인이 필요합니다" in 안내.group(1)
+    assert "상담원이 확인하고 있습니다" not in 안내.group(1)
+    assert "안내드리겠습니다" not in 안내.group(1)
+    assert 'customer ? "답변 준비 중"' not in html
+
+
+def test_초안_호출_실패_안내는_초안_생성에_진입하지_않았다고_단정하지_않는다(
+    client: TestClient,
+) -> None:
+    """초안 전송 실패도 attempts=[]다. 빈 판정 배열은 초안 호출 0회의 증거가 아니다."""
+    html = client.get("/").text
+    사유 = re.search(r'llm_call_failed: "([^"]+)"', html)
+    assert 사유 is not None
+    assert "초안 생성에 진입하지 않았다" not in 사유.group(1)
+    assert "재시도 후에도" not in 사유.group(1)  # 거절 응답은 전송 재시도 없이도 끝난다.
+    assert "`초안 전 인계 — ${why}" not in html
 
 
 # ── 접수 검증 (파이프라인 미실행) ───────────────────────────────────────────
@@ -838,7 +865,7 @@ def test_판정_토큰은_생성_합산에_섞이지_않는다() -> None:
 
 def keyless_pipeline() -> InquiryPipeline:
     """생성 키도 판정 키도 없는 조립 — **스위치는 켜 둔다**(조립이 키를 요구하지 않아야 한다)."""
-    settings = Settings(
+    settings = declared_settings(
         openai_api_key=SecretStr(""),
         anthropic_api_key=SecretStr(""),
         l2_enabled=True,
@@ -927,8 +954,14 @@ def test_인덱스와_다른_모델로_질의하면_503_이고_인계로_기록�
         generation_client=cast(
             GenerationClient, scripted_client({INTENT_STAGE: [intent_completion("policy")]})
         ),
-        embedding_client=LexicalEmbeddingClient(dimensions=1536, model="다른-모델"),
-        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.0, l2_enabled=False),
+        embedding_client=LexicalEmbeddingClient(dimensions=1536, model="stub:다른-모델"),
+        # 여기서는 인덱스 출처 검사를 잰다. τ는 다른 모델에 검증되지 않았으므로 끈다.
+        settings=declared_settings(
+            vector_top_k=5,
+            vector_similarity_threshold=0.0,
+            l2_enabled=False,
+            abstention_gate_enabled=False,
+        ),
     )
 
     with service_client(pipeline=pipeline, app_conn=app_conn, ro_conn=ro_conn) as test_client:
@@ -1069,6 +1102,63 @@ def test_DB_가_없어도_빈_내용은_422다(monkeypatch: pytest.MonkeyPatch) 
         response = test_client.post("/inquiries", json={"content": "   "})
 
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"content": "문의\0"},
+        {"content": "문의\ud800"},
+        {"content": "문의\udfff"},
+        {"content": "문의", "order_no": "\ud800"},
+        {"content": ["\ud800"]},
+        {"content": {"\ud800": "값"}},
+        {"content": float("nan")},
+        {"content": float("inf")},
+        {"content": float("-inf")},
+        {"content": [float("nan")]},
+    ],
+)
+def test_저장_불가_입력은_자원을_열지_않고_표준_JSON_422다(
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """잘못된 값이 validation input에 남아도 오류 응답 직렬화가 500으로 바뀌면 안 된다."""
+    opened = []
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        opened.append(True)
+        raise AssertionError("접수 오류에서 자원을 열었다")
+
+    monkeypatch.setattr("reply_gate.api.connect", forbidden)
+    monkeypatch.setattr("reply_gate.api.readonly_connect", forbidden)
+    monkeypatch.setattr("reply_gate.api._require_judge_credentials", forbidden)
+    with TestClient(app, raise_server_exceptions=False) as http:
+        response = http.post(
+            "/inquiries",
+            content=json.dumps(payload, ensure_ascii=True),
+            headers={"Content-Type": "application/json"},
+        )
+    assert response.status_code == 422
+    assert opened == []
+
+    def reject_constant(value: str) -> Any:
+        raise AssertionError(f"응답에 비표준 JSON 상수가 있다: {value}")
+
+    body = json.loads(response.content, parse_constant=reject_constant)
+    assert set(body) == {"detail"}
+    assert isinstance(body["detail"], list) and body["detail"]
+
+
+def test_422의_정상_Unicode와_유한_숫자_진단값은_그대로다() -> None:
+    """안전 직렬화는 입력 진단의 정상값과 기존 상세 키를 바꾸지 않는다."""
+    with TestClient(app) as http:
+        response = http.post("/inquiries", json={"content": 1.25, "order_no": "주문😀"})
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["input"] == 1.25
+    assert error["loc"] == ["body", "content"]
+    assert error["type"] == "string_type"
 
 
 def test_DB_가_없어도_판정키_부재는_503이다(monkeypatch: pytest.MonkeyPatch) -> None:

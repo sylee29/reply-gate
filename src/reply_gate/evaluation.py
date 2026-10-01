@@ -34,6 +34,7 @@ import json
 import re
 import textwrap
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import reduce
@@ -43,7 +44,8 @@ from typing import Any, Final, Protocol, cast
 import psycopg
 from psycopg.rows import DictRow
 
-from reply_gate import policy_index, retrieval_strategies, sql_guard
+from reply_gate import judge as judge_module
+from reply_gate import llm, policy_index, retrieval_strategies, sql_guard
 from reply_gate.contracts import (
     Claim,
     Draft,
@@ -600,11 +602,12 @@ class GoldenOutcome:
         (`scripts/AGENTS.md` 불변식 5 — 미실행을 0 으로 채우지 않는다).
 
         contracts.md 가 지정한 신호를 그대로 쓴다: 인계 사유 `llm_call_failed` +
-        실패 단계 `l2_judge`.
+        실패 단계 `l2_judge`. 단, 앞선 시도에서 이미 기각했다면 재현은 관측된 것이다.
         """
         return (
             self.escalation_reason is EscalationReason.LLM_CALL_FAILED
             and self.failed_stage == L2_JUDGE_STAGE
+            and not self.rejected_at_least_once
         )
 
 
@@ -1558,6 +1561,8 @@ _PII_RULE_PROBE: Final = (
     "010-9999\u09038888 010-9999\u20e38888 "
     "010\u20139999\u22128888 010\u30fb9999\u30fb8888 "
     "+82-10-1234-5678 0082 2 123 4567 1588-1234 900101-1234567  A_B@Example.COM "
+    "메일은 hong@example.com입니다. customer_email=hong@example.com입니다 "
+    "<hong@example.com입니다> hong@example.com입니다.evil support@쇼핑몰.한국 "
 )
 
 #: 조회 가드 탐침이 쓰는 주문번호. **선검사를 통과한 형식**이어야 한다(아니면 호출 측
@@ -1595,6 +1600,22 @@ _SQL_GUARD_PROBES: Final[tuple[str, ...]] = (
     f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
     f"SELECT pg_sleep(1) AS napped FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
     "SELECT customer_phone FROM orders",
+    "SELECT customer_phone AS concat, concat('010-', '9999-9999') FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    f"SELECT customer_phone AS {'a' * 63}, concat('010-', '9999-9999') AS {'a' * 63}x "
+    f"FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    'WITH scoped AS (SELECT customer_phone AS "Phone" FROM orders '
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}') SELECT \"Phone\" FROM scoped",
+    "SELECT coalesce(customer_phone, '미정') FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    f"SELECT customer_phone AS {'a' * 64} FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    'WITH scoped AS (SELECT customer_phone AS "Phone", '
+    "concat('010-', '9999-9999') AS phone FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}') SELECT phone FROM scoped",
+    "SELECT customer_phone AS customer_email, "
+    "CASE WHEN true THEN customer_phone ELSE customer_email END FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
 )
 
 #: 조회 가드 탐침의 결과 행 수 상한. 판정에 영향을 주지 않는 고정값이다.
@@ -1699,19 +1720,65 @@ def _normalized_probe_matches(pattern: PiiPattern) -> str:
     )
 
 
+def _cross_claim_pii_probe() -> str:
+    """분리된 claim을 연결한 답변 검사와 근거 에코 허용을 함께 지문에 담는다."""
+    evidence_id = "policy:probe:1"
+    draft = {
+        "claims": [
+            {"text": "연락처는 010", "citation_ids": [evidence_id]},
+            {"text": "9999 8888 입니다.", "citation_ids": [evidence_id]},
+        ]
+    }
+    observed: list[str] = []
+    for text in ("연락처 미기재", "연락처는 010-9999-8888 입니다."):
+        evidence = Evidence(
+            id=evidence_id, source=EvidenceSource.POLICY, content=text, evidence_text=text
+        )
+        result = evaluate_draft(raw_draft=draft, evidences=(evidence,))
+        observed.append(
+            result.verdict.value + ":" + ",".join(r.value for r in result.reject_reasons)
+        )
+    return "|".join(observed)
+
+
+def _email_boundary_probe() -> str:
+    """문맥에 의존하는 이메일 접미사와 명시된 주소의 경계를 실제 L1으로 잰다."""
+    evidence_id = "policy:probe:email"
+    observed: list[str] = []
+    for source, texts in (
+        ("customer_email=hong@example.com", ("hong@example.com입니다.",)),
+        ("customer_email=hong@example.com입니다", ("hong@example.com",)),
+        ("customer_email=hong@example.com입니다", ("<주소", "hong@example.com입니다", ">")),
+        ("customer_email=hong@example.com", ("<주소", "hong@example.com입니다", ">")),
+        ("customer_email=hong@example.com", (") (주소 hong@example.com입니다.",)),
+    ):
+        evidence = Evidence(
+            id=evidence_id, source=EvidenceSource.POLICY, content=source, evidence_text=source
+        )
+        raw_draft = {"claims": [{"text": text, "citation_ids": [evidence_id]} for text in texts]}
+        result = evaluate_draft(raw_draft=raw_draft, evidences=(evidence,))
+        observed.append(
+            result.verdict.value + ":" + ",".join(r.value for r in result.reject_reasons)
+        )
+    return "|".join(observed)
+
+
 def _draft_rule_version() -> str:
-    """초안 판정 규칙의 판 — **접기 규칙과 패턴 집합**의 내용 지문.
+    """초안 판정 규칙의 판 — **접기·패턴·claim 연결 검사**의 내용 지문.
 
     읽는 것은 넷이다: 기각 사유의 고정 순서 · 번호 계열이 구분자로 받는 표기 변종 집합 ·
     두 접기(공통·번호)가 고정 탐침에 대해 내는 결과 · 패턴마다의 (이름, 정규식, 플래그,
     접기 결과, **매치별** 정규화 결과). 접기와 정규화는 **이름이 아니라 동작**으로 담는다 —
-    함수 이름만 담으면 본문이 바뀌어도 지문이 안 움직인다.
+    함수 이름만 담으면 본문이 바뀌어도 지문이 안 움직인다. claim 연결 검사도 기각/에코
+    양방향의 동작을 탐침으로 읽는다.
     """
     parts = [
         "reasons=" + ",".join(reason.value for reason in REASON_ORDER),
         "separators=" + ",".join(f"U+{ord(ch):04X}" for ch in sorted(NUMERIC_SEPARATOR_VARIANTS)),
         "fold_common=" + fold_for_detection(_PII_RULE_PROBE),
         "fold_numeric=" + fold_numeric_for_detection(_PII_RULE_PROBE),
+        "cross_claim_pii=" + _cross_claim_pii_probe(),
+        "email_boundary=" + _email_boundary_probe(),
     ]
     parts.extend(
         f"pattern={pattern.name}|regex={pattern.regex.pattern}|flags={pattern.regex.flags}"
@@ -1769,6 +1836,148 @@ def _retrieval_order_rule() -> str:
     return f"db=[{db_clause}] · merge=[{'>'.join(hit.evidence_id for hit in merged)}]"
 
 
+def _judge_rule_probe_outcomes() -> dict[str, str]:
+    """고정 입력의 실제 산출 해석 결과. 측정 3의 픽스처나 정확도 분모가 아니다.
+
+    진단 문면은 기록하지 않는다. 판정·개수·ID를 읽되 예상 못 한 예외는 숨기지 않는다.
+    공통 JSON admission도 L2 형식 재시도 여부를 결정하므로 같은 규칙 판에 포함한다.
+    """
+    json_probes = {
+        "normal": '{"text":"한국어 안내", "values":[0,1.25,1e100]}',
+        "literal_words": '{"text":"NaN Infinity 1e999"}',
+        "surrogate_pair": r'{"text":"\ud83d\ude00"}',
+        "malformed": '{"text":',
+        "nan": '{"value":NaN}',
+        "infinity": '{"value":Infinity}',
+        "negative_infinity": '{"value":-Infinity}',
+        "overflow": '{"value":1e999}',
+        "nul_value": r'{"nested":[{"text":"\u0000"}]}',
+        "nul_key": r'{"\u0000":"value"}',
+        "surrogate_high": r'{"text":"\ud800"}',
+        "surrogate_low": r'{"text":"\udc00"}',
+    }
+    outcomes: dict[str, str] = {}
+    for name, text in json_probes.items():
+        try:
+            llm._parse_json_completion(
+                stage=judge_module.JUDGE_STAGE, text=text, input_tokens=0, output_tokens=0
+            )
+        except LLMFormatError:
+            outcomes[f"json:{name}"] = "rejected"
+        else:
+            outcomes[f"json:{name}"] = "accepted"
+
+    evidence = tuple(
+        Evidence(
+            id=f"policy:judge-probe:{index}",
+            source=EvidenceSource.POLICY,
+            content=text,
+            evidence_text=text,
+        )
+        for index, text in enumerate(
+            ("배송은 3일 걸립니다.", "환불 기간은 7일입니다.", "환불 기간은 30일입니다."), start=1
+        )
+    )
+    normal = Draft(claims=(Claim(text="배송은 3일 걸립니다.", citation_ids=(evidence[0].id,)),))
+    cited = Draft(claims=(Claim(text="환불 기간은 7일입니다.", citation_ids=(evidence[1].id,)),))
+    explicit = Draft(
+        claims=(
+            Claim(
+                text="환불 기간은 조항에 따라 7일과 30일로 서로 다르게 안내됩니다.",
+                citation_ids=(evidence[1].id, evidence[2].id),
+            ),
+        )
+    )
+    duplicate = Draft(claims=(normal.claims[0], normal.claims[0]))
+
+    def payload(draft: Draft) -> dict[str, Any]:
+        return {
+            "claim_judgments": [
+                {"claim_text": claim.text, "verdict": "pass", "explanation": "근거에 있습니다."}
+                for claim in draft.claims
+            ],
+            "contradictions": [],
+            "verdict": "pass",
+            "reject_reasons": [],
+        }
+
+    def conflicting(draft: Draft, *, rejects: bool) -> dict[str, Any]:
+        data = payload(draft)
+        data["contradictions"] = [
+            {
+                "evidence_id_a": evidence[1].id,
+                "evidence_id_b": evidence[2].id,
+                "explanation": "기간이 다릅니다.",
+            }
+        ]
+        if rejects:
+            data.update(verdict="reject", reject_reasons=["contradictory_evidence"])
+        return data
+
+    probes = [
+        ("normal", normal, payload(normal)),
+        ("uncited_rejection", normal, conflicting(normal, rejects=True)),
+        ("cited_rejection", cited, conflicting(cited, rejects=True)),
+        ("uncited_record", normal, conflicting(normal, rejects=False)),
+        ("explicit_conflict", explicit, conflicting(explicit, rejects=False)),
+        ("duplicate_complete", duplicate, payload(duplicate)),
+        ("duplicate_missing", duplicate, payload(normal)),
+    ]
+    unsupported = payload(normal)
+    unsupported["claim_judgments"][0]["verdict"] = "reject"
+    unsupported.update(verdict="reject", reject_reasons=["unsupported_claim"])
+    probes.append(("unsupported", normal, unsupported))
+    invalid_reason = deepcopy(unsupported)
+    invalid_reason["reject_reasons"] = ["not_a_judge_reason"]
+    probes.append(("invalid_reason", normal, invalid_reason))
+    mismatched = payload(normal)
+    mismatched["verdict"] = "reject"
+    probes.append(("verdict_without_reason", normal, mismatched))
+    missing_reason = deepcopy(unsupported)
+    missing_reason.update(verdict="pass", reject_reasons=[])
+    probes.append(("unsupported_without_reason", normal, missing_reason))
+    unknown_id = conflicting(cited, rejects=True)
+    unknown_id["contradictions"][0]["evidence_id_b"] = "policy:judge-probe:missing"
+    probes.append(("unknown_evidence", cited, unknown_id))
+    same_id = conflicting(cited, rejects=True)
+    same_id["contradictions"][0]["evidence_id_b"] = evidence[1].id
+    probes.append(("self_conflict", cited, same_id))
+    for name, draft, data in probes:
+        try:
+            result = judge_module._parse_judge_result(data, draft=draft, evidence=evidence)
+        except judge_module._ParseError:
+            outcomes[f"judge:{name}"] = "rejected"
+        else:
+            outcomes[f"judge:{name}"] = json.dumps(
+                {
+                    "verdict": result.verdict.value,
+                    "reasons": [reason.value for reason in result.reject_reasons],
+                    "claims": [
+                        (item.claim_text, item.verdict.value) for item in result.claim_judgments
+                    ],
+                    "contradictions": [
+                        (item.evidence_id_a, item.evidence_id_b) for item in result.contradictions
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+    return outcomes
+
+
+def _judge_rule_version() -> str:
+    """L2 산출 해석의 선언+행동 지문. 프롬프트·모델·측정 3 정답판은 별도 축이다."""
+    material = {
+        "schema": judge_module.JUDGE_JSON_SCHEMA,
+        "format_attempts": judge_module.JUDGE_MAX_ATTEMPTS,
+        "reasons": [reason.value for reason in judge_module.L2_REJECT_REASONS],
+        "probes": _judge_rule_probe_outcomes(),
+    }
+    return text_digest(
+        json.dumps(material, ensure_ascii=False, sort_keys=True), prefix="judgerules-"
+    )
+
+
 def code_condition_fingerprint() -> dict[str, str]:
     """**코드가 결정하는** 조건 지문 항목. 실행 인자·설정·시각을 보지 않는다.
 
@@ -1777,6 +1986,7 @@ def code_condition_fingerprint() -> dict[str, str]:
     """
     return {
         "judge_thinking": JUDGE_THINKING,
+        "judge_rule_version": _judge_rule_version(),
         "draft_rule_version": _draft_rule_version(),
         "sql_guard_version": _sql_guard_version(),
         "retrieval_order": _retrieval_order_rule(),
@@ -1807,7 +2017,7 @@ class RunConditions:
     #: 실행 경로에 켜진 검색 전략 조합. 예: `vector` · `vector+rewrite`.
     retrieval_strategy: str
     l1_fixture_count: int
-    golden_case_count: int
+    golden_case_count: int | None
     #: 판정 픽스처 수. **로드하지 못했으면 `None`** — 미실행을 0 으로 채우지 않는다.
     judge_fixture_count: int | None
     l1_fixtures_path: str
@@ -2425,7 +2635,7 @@ def render_markdown(report: EvaluationReport) -> str:
         f" · 임베딩 {conditions.embedding_dimensions}차원",
         f"- 유사도 임계값: {conditions.similarity_threshold} / top k: {conditions.top_k}",
         f"- L1 픽스처: {conditions.l1_fixture_count}건 (`{conditions.l1_fixtures_path}`)",
-        f"- 골든셋: {conditions.golden_case_count}건 (`{conditions.golden_set_path}`)",
+        f"- 골든셋: {_count(conditions.golden_case_count)} (`{conditions.golden_set_path}`)",
         f"- 판정 픽스처: {_count(conditions.judge_fixture_count)} "
         f"(`{conditions.judge_fixtures_path}`)",
         f"- OPENAI_API_KEY 설정 여부: {'설정됨' if conditions.api_key_present else '없음'}",
@@ -3375,10 +3585,23 @@ def write_report(
     out_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = out_dir / f"{stem}.md"
     json_path = out_dir / f"{stem}.json"
-    markdown_path.write_text(render_markdown(report), encoding="utf-8")
-    json_path.write_text(
-        json.dumps(report_to_json(report), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    markdown = render_markdown(report)
+    payload = json.dumps(report_to_json(report), ensure_ascii=False, indent=2) + "\n"
+    if stem.casefold().startswith(LIVE_REPORT_STEM):
+        # 이름 선검사 뒤 다른 실행이 먼저 끝날 수 있다. 두 파일 모두 독점 생성한 뒤에만
+        # 쓴다. 두 번째 파일이 이미 있으면 우리가 만든 빈 첫 파일만 치우고 거부한다.
+        with markdown_path.open("x", encoding="utf-8") as markdown_file:
+            try:
+                json_file = json_path.open("x", encoding="utf-8")
+            except FileExistsError:
+                markdown_path.unlink()
+                raise
+            with json_file:
+                markdown_file.write(markdown)
+                json_file.write(payload)
+    else:
+        markdown_path.write_text(markdown, encoding="utf-8")
+        json_path.write_text(payload, encoding="utf-8")
     return markdown_path, json_path
 
 

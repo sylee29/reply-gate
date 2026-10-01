@@ -269,7 +269,7 @@ def test_구조화_출력에_답변계약_스키마를_그대로_넘긴다() -> 
     assert recorder.calls[0]["schema"] is DRAFT_JSON_SCHEMA
 
 
-def test_effort_는_medium_기본이고_호출자가_바꿀_수_있다() -> None:
+def test_effort_는_기본_미지정이고_호출자가_바꿀_수_있다() -> None:
     generator, recorder = _generator(
         [JsonCompletion(data=VALID_DRAFT, input_tokens=0, output_tokens=0)]
     )

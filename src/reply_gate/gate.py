@@ -111,7 +111,7 @@ def fold_for_detection(text: str) -> str:
     정규식에 걸리지 않는다. NFKC 로 호환 문자를 반각으로 접고, 폭 없는 서식 문자
     (`Cf` 범주 — U+200B 등)를 지운다.
 
-    **이메일 패턴이 쓰는 접기가 이것이고, 여기서 더 넓히지 않는다.** 밑줄과 빗금을
+    **이메일도 이 공통 접기를 쓰되 한국어 산문 경계만 별도로 분리한다.** 밑줄과 빗금을
     하이픈으로 접으면 `a_b@…` 와 `a-b@…` 가 **같은 값이 되어**, 근거에 있는 주소를 한
     글자 바꿔 지어낸 주소가 근거 유래로 통과한다 — 우회 하나를 닫으면서 반대 방향 우회를
     여는 것이다. 밑줄은 이 저장소의 사유 코드·근거 ID·컬럼명에 흔해서, 전역으로 접으면
@@ -145,6 +145,55 @@ def fold_numeric_for_detection(text: str) -> str:
         for ch in folded
         if not unicodedata.category(ch).startswith(_COMBINING_MARK_CATEGORY_PREFIX)
     )
+
+
+_EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@(?:[^\W_]|-)+(?:\.(?:[^\W_]|-)+)+")
+_EMAIL_PROSE_LAST_LABEL = re.compile(
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
+    r"(입니다|으로|에서|로|은|는|을|를|이|가|에|와|과)"
+)
+
+
+def _fold_email_for_detection(text: str) -> str:
+    """ASCII 최종 라벨 뒤 고정 한국어 접미사만 산문 경계로 분리한다.
+
+    ponytail: 산문에서 `com입니다`는 주소와 서술어로 읽는다. 실제 혼합 IDN 주소라면
+    따옴표·백틱·괄호·key=value로 명시해야 한다. 임의 IDN/한국어의 일반 해독은 하지 않는다.
+    명시된 주소와 닫히지 않은 구분자는 줄이지 않으며 근거·초안 모두 같은 경계를 쓴다.
+    """
+    folded = fold_for_detection(text)
+
+    def separate_prose(match: re.Match[str]) -> str:
+        address = match.group()
+        last_label = _EMAIL_PROSE_LAST_LABEL.fullmatch(address.rsplit(".", 1)[-1])
+        if last_label is None:
+            return address
+        tail = folded[match.end() :]
+        if tail and not (tail[0].isspace() or tail[0] in ".,;!?"):
+            return address
+        if tail.startswith(".") and len(tail) > 1 and not tail[1].isspace():
+            return address
+        prefix = folded[: match.start()].rstrip()
+        if prefix.endswith(("=", ":")):
+            return address
+        closing = {"<": ">", "(": ")", "[": "]", "{": "}", "\u201c": "\u201d", "\u2018": "\u2019"}
+        quote_closers = {'"', "'", "`", "\u201d", "\u2019"}
+        opened: list[str] = []
+        for char in prefix:
+            if opened and char == opened[-1]:
+                opened.pop()
+            elif opened and opened[-1] in quote_closers:
+                continue
+            elif char in closing:
+                opened.append(closing[char])
+            elif char in ('"', "'", "`"):
+                opened.append(char)
+        if opened:
+            return address
+        suffix = last_label[2]
+        return address[: -len(suffix)] + " " + suffix
+
+    return _EMAIL_REGEX.sub(separate_prose, folded)
 
 
 # ── PII 정규화 ──────────────────────────────────────────────────────────────
@@ -229,13 +278,13 @@ DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
         fold=fold_numeric_for_detection,
         normalize=normalize_digits,
     ),
-    # 이메일만 **공통 접기**를 든다. 번호 계열 접기를 걸면 밑줄·빗금이 하이픈으로 접혀
+    # 이메일은 공통 접기 뒤 한국어 산문 경계만 분리한다. 번호 접기는 밑줄·빗금을 접어
     # `a_b@…` 와 `a-b@…` 가 같은 allowlist 값이 되고, 근거에 있는 주소를 한 글자 바꿔
     # 지어낸 주소가 통과한다 — 넓히기는 번호 계열 안에서만 한다.
     PiiPattern(
         name="email",
-        regex=re.compile(r"[A-Za-z0-9._%+-]+@(?:[^\W_]|-)+(?:\.(?:[^\W_]|-)+)+"),
-        fold=fold_for_detection,
+        regex=_EMAIL_REGEX,
+        fold=_fold_email_for_detection,
         normalize=normalize_email,
     ),
 )
@@ -287,6 +336,7 @@ def evaluate_draft(*, raw_draft: object, evidences: Sequence[Evidence]) -> GateR
     if _has_unsourced_pii(
         draft_texts=_answer_texts(inspection=inspection, raw_draft=raw_draft),
         evidence_texts=[evidence.evidence_text for evidence in evidences],
+        answer_text=inspection.draft.answer_text if inspection.draft is not None else None,
     ):
         reasons.add(RejectReason.PII_DETECTED)
 
@@ -390,7 +440,9 @@ def _answer_texts(*, inspection: _SchemaInspection, raw_draft: object) -> Sequen
     """PII 검사 대상을 고른다 — **답변으로 나갈 수 있는 텍스트만.**
 
     `to_draft` 가 살려내는 것은 claim 의 `text` 뿐이고 답변은 그것들의 연결이다
-    (`Draft.answer_text`). 초안의 나머지 키(최상위 `debug`, claim 안의 `note` 등)는
+    (`Draft.answer_text`). 개별 claim 과 연결된 답변을 함께 검사한다 — 개별 조각이
+    번호가 아니어도 답변의 공백 연결로 전화번호가 될 수 있기 때문이다.
+    초안의 나머지 키(최상위 `debug`, claim 안의 `note` 등)는
     답변에 실리지 않으므로 검사하면 **답변에 없는 값으로 정상 초안을 기각하게 된다.**
     초안 JSON 은 LLM 산출이라 이런 키가 언제든 늘어날 수 있고, 헤드라인 지표가
     "정상 초안 오탐률"이므로 그 오탐이 곧 지표 오염이다
@@ -401,6 +453,8 @@ def _answer_texts(*, inspection: _SchemaInspection, raw_draft: object) -> Sequen
     `schema_violation` 으로 기각되므로 답변이 나가지는 않지만, 게이트는 모르는 쪽에서
     검사하는 방향으로 보수적으로 간다.
     """
+    if inspection.draft is not None:
+        return (*inspection.answer_texts, inspection.draft.answer_text)
     if inspection.answer_texts:
         return inspection.answer_texts
     return _collect_texts(raw_draft)
@@ -445,7 +499,9 @@ def _normalized_matches(*, texts: Sequence[str], pattern: PiiPattern) -> set[str
     }
 
 
-def _has_unsourced_pii(*, draft_texts: Sequence[str], evidence_texts: Sequence[str]) -> bool:
+def _has_unsourced_pii(
+    *, draft_texts: Sequence[str], evidence_texts: Sequence[str], answer_text: str | None
+) -> bool:
     """초안의 패턴형 PII 중 **근거에서 유래하지 않은 값**이 있으면 True.
 
     대조 방식 — 근거 텍스트에도 **같은 패턴·같은 정규화**를 적용해 값 집합을 뽑고,
@@ -469,7 +525,12 @@ def _has_unsourced_pii(*, draft_texts: Sequence[str], evidence_texts: Sequence[s
     """
     found: set[str] = set()
     for pattern in DEFAULT_PII_PATTERNS:
-        found |= _normalized_matches(texts=draft_texts, pattern=pattern)
+        # 이메일 접미사는 열린 구분자 문맥에 의존한다. 정상 초안은 최종 답변만 읽어야
+        # '<주소' / 'a@example.com입니다' / '>'처럼 갈린 literal을 산문으로 오인하지 않는다.
+        texts = (
+            (answer_text,) if pattern.name == "email" and answer_text is not None else draft_texts
+        )
+        found |= _normalized_matches(texts=texts, pattern=pattern)
     if not found:
         return False
 

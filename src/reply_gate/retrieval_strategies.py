@@ -18,7 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, cast
 
-from reply_gate.llm import GenerationClient
+from reply_gate.llm import GenerationClient, LLMCallError, LLMFormatError
 
 __all__ = [
     "AbstentionGate",
@@ -573,13 +573,16 @@ def llm_rerank(
             max_output_tokens=2000,
         )
     except Exception as exc:
-        # 실패한 호출이 쓴 토큰은 관측 경계 밖이지만, 폴백 사실은 리포트에 남는다.
+        # 거절·형식 오류도 과금된다. 래퍼가 예외에 실은 사용량을 폴백에서 버리지 않는다.
+        input_tokens = output_tokens = 0
+        if isinstance(exc, LLMCallError | LLMFormatError):
+            input_tokens, output_tokens = exc.input_tokens, exc.output_tokens
         return RerankOutcome(
             hits=candidates_tuple,
             fell_back=True,
             fallback_reason=f"호출 실패({type(exc).__name__}): {_truncated(str(exc))}",
-            input_tokens=0,
-            output_tokens=0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             served_from_cache=False,
         )
 

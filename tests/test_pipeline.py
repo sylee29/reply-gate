@@ -18,6 +18,7 @@ DB 테스트는 정책 인덱싱 픽스처(트랜잭션 롤백) 말고는 남기
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
@@ -27,6 +28,7 @@ import pytest
 from psycopg.rows import DictRow
 from pydantic import SecretStr
 
+from reply_gate.api import build_embedding_client
 from reply_gate.config import Settings
 from reply_gate.contracts import (
     ClaimJudgment,
@@ -39,6 +41,7 @@ from reply_gate.contracts import (
     JudgeResult,
     RejectReason,
     Verdict,
+    has_unstorable_characters,
 )
 from reply_gate.draft import DRAFT_STAGE, DraftGenerator
 from reply_gate.evidence import (
@@ -49,7 +52,6 @@ from reply_gate.evidence import (
 from reply_gate.judge import JUDGE_STAGE, Judge, JudgeOutcome
 from reply_gate.llm import (
     AnthropicGenerationClient,
-    EmbeddingClient,
     GenerationClient,
     JsonCompletion,
     LLMCallError,
@@ -66,6 +68,7 @@ from reply_gate.pipeline import (
     Judging,
     MissingCredentialsError,
     PipelineWiringError,
+    ProcessedInquiry,
     ReceiptError,
     accept_inquiry,
     build_pipeline,
@@ -74,7 +77,9 @@ from reply_gate.pipeline import (
 from reply_gate.pipeline import _LazyJudgeClient as LazyJudgeClient
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
 from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
-from reply_gate.testing import LexicalEmbeddingClient
+from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pipeline
+from tests.conftest import declared_settings
+from tests.test_llm_client import _generation_client, _response
 
 INQUIRY = "환불은 언제까지 신청할 수 있나요?"
 MISSING_ORDER_NO = "ORD-20991231-9999"
@@ -312,6 +317,89 @@ def run(pipeline: InquiryPipeline, *, content: str = INQUIRY, order_no: str | No
 def test_접수는_내용이_비면_거부한다() -> None:
     with pytest.raises(ReceiptError):
         accept_inquiry(content="   ")
+
+
+@pytest.mark.parametrize("bad", ["\0", "\ud800", "\udfff"])
+def test_접수는_저장할_수_없는_문의_문자를_거부한다(bad: str) -> None:
+    """원문을 삭제하거나 바꿔 접수하지 않고 DB/외부 호출 전에 입력 오류로 끝낸다."""
+    with pytest.raises(ReceiptError):
+        accept_inquiry(content=f"환불 문의{bad}")
+
+
+def test_접수는_정상_Unicode와_백슬래시_문자열을_보존한다() -> None:
+    content = "환불 문의 😀\n배송 문의 " + r"\u0000"
+    assert accept_inquiry(content=content).content == content
+
+
+UNSTORABLE_DRAFT_MODES = (
+    "escaped_nul",
+    "literal_nul",
+    "surrogate",
+    "literal_pair_nul",
+    "emoji_nul",
+    "backslash_nul",
+)
+
+
+def process_unstorable_draft(mode: str, *, recover: bool) -> tuple[ProcessedInquiry, str]:
+    """실제 SDK 래퍼부터 도는 문자열 경계 대역. DB 왕복 검사도 같은 입력을 사용한다."""
+    normal = {"claims": [{"text": POLICY_EVIDENCE.content, "citation_ids": [POLICY_EVIDENCE.id]}]}
+    bad_texts = {
+        "escaped_nul": "\0",
+        "literal_nul": "\0",
+        "surrogate": "\ud800",
+        "literal_pair_nul": "\ud83d\ude00\0",
+        "emoji_nul": "😀\0",
+        "backslash_nul": r"\ud83d\ude00" + "\0",
+    }
+    invalid = {**normal, "debug": bad_texts[mode]}
+    first = json.dumps(invalid, ensure_ascii=mode in ("escaped_nul", "surrogate"))
+    if mode not in ("escaped_nul", "surrogate"):
+        first = first.replace("\\u0000", "\0")
+    second = json.dumps(normal, ensure_ascii=False) if recover else first
+    client, _ = _generation_client([_response(first), _response(second)])
+    pipeline = InquiryPipeline(
+        collector=StubCollector(collection(evidence=[POLICY_EVIDENCE])),
+        drafter=DraftGenerator(client=client),
+        l2_enabled=False,
+    )
+    processed = pipeline.run(
+        inquiry_id=new_inquiry_id(),
+        content=INQUIRY,
+        order_no=None,
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    return processed, first
+
+
+@pytest.mark.parametrize("mode", UNSTORABLE_DRAFT_MODES)
+@pytest.mark.parametrize("recover", [True, False])
+def test_저장_불가_모델문자는_실제_래퍼에서_L1_기각과_재생성으로_흐른다(
+    mode: str,
+    recover: bool,
+) -> None:
+    """입력을 보정해 정상 초안으로 만들지 않고, 원문 기록이 가능한 기존 형식 실패로 보낸다."""
+    processed, original = process_unstorable_draft(mode, recover=recover)
+    assert len(processed.attempts) == 2
+    assert processed.attempts[0].reject_reasons == (RejectReason.SCHEMA_VIOLATION,)
+    assert (processed.input_tokens, processed.output_tokens) == (33, 17)
+    assert processed.status is (InquiryStatus.ANSWERED if recover else InquiryStatus.ESCALATED)
+    assert processed.escalation_reason is (None if recover else EscalationReason.REJECTED_TWICE)
+    for attempt in processed.attempts:
+        if attempt.verdict is Verdict.REJECT:
+            assert isinstance(attempt.draft, str)
+            assert not has_unstorable_characters(attempt.draft)
+            assert attempt.l2_result is None
+            if has_unstorable_characters(original):
+                prefix = "[Unicode escaped raw text] "
+                assert attempt.draft.startswith(prefix)
+                assert (
+                    attempt.draft.removeprefix(prefix).encode("ascii").decode("unicode_escape")
+                    == original
+                )
+            else:
+                assert attempt.draft == original
 
 
 def test_접수는_주문번호_형식을_코드가_검증한다() -> None:
@@ -973,7 +1061,7 @@ def test_스위치_꺼짐이거나_판정자가_있으면_조립된다() -> None
 def _built_judge(settings: Settings) -> Judge:
     pipeline = build_pipeline(
         generation_client=cast(GenerationClient, scripted_client({})),
-        embedding_client=cast(EmbeddingClient, LexicalEmbeddingClient(dimensions=1536)),
+        embedding_client=build_embedding_client(settings),
         settings=settings,
     )
     return cast(Judge, pipeline._judge)
@@ -981,7 +1069,7 @@ def _built_judge(settings: Settings) -> Judge:
 
 def test_판정_기본_배선은_Anthropic_계열이다() -> None:
     """같은 계열로 바꾸면 self-judging bias 로 검출률이 오염된다 (결정 0004)."""
-    settings = Settings(
+    settings = declared_settings(
         l2_enabled=True,
         anthropic_api_key=SecretStr("키가-아닌-테스트값"),
         judge_effort="low",
@@ -1001,7 +1089,7 @@ def test_판정_기본_배선은_Anthropic_계열이다() -> None:
 
 def test_판정_클라이언트는_첫_호출_때_만들어진다() -> None:
     """조립은 키를 요구하지 않는다 — 조회 전용 경로가 키 없이도 살아 있어야 한다."""
-    judge = _built_judge(Settings(l2_enabled=True, anthropic_api_key=SecretStr("")))
+    judge = _built_judge(declared_settings(l2_enabled=True, anthropic_api_key=SecretStr("")))
     client = cast(LazyJudgeClient, judge._client)
 
     # `anthropic.Anthropic(api_key="")` 는 생성자에서 예외를 던지지 않는다 — 키 검사는
@@ -1012,10 +1100,11 @@ def test_판정_클라이언트는_첫_호출_때_만들어진다() -> None:
 
 def test_build_pipeline_은_스위치가_켜져_있어도_조립에_성공한다() -> None:
     """하위호환은 조립 함수가 진다 — 설정 기반 판정자를 항상 배선한다."""
+    settings = declared_settings(l2_enabled=True, anthropic_api_key=SecretStr(""))
     pipeline = build_pipeline(
         generation_client=cast(GenerationClient, scripted_client({})),
-        embedding_client=cast(EmbeddingClient, LexicalEmbeddingClient(dimensions=1536)),
-        settings=Settings(l2_enabled=True, anthropic_api_key=SecretStr("")),
+        embedding_client=build_embedding_client(settings),
+        settings=settings,
     )
 
     assert pipeline._judge is not None
@@ -1047,10 +1136,11 @@ def live_pipeline(client: ScriptedGenerationClient, *, threshold: float = 0.0) -
     인계 사유 6종·응답 골격은 판정 층과 무관하고, 판정을 켜면 확률 층 대역이 필요해진다
     (그 대역은 사이클 2 T9 가 `testing.py` 에 넣는다).
     """
-    return build_pipeline(
+    return build_stub_pipeline(
         generation_client=cast(GenerationClient, client),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(
+        judge=StubJudge(),
+        settings=declared_settings(
             vector_top_k=5,
             vector_similarity_threshold=threshold,
             sql_max_rows=50,

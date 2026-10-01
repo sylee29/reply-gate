@@ -462,3 +462,76 @@ def test_유래_판정의_각_분기를_뒤집으면_이_입력의_판정이_갈
     더하는 것으로는 부족하다 — 그 입력이 **다른 이유로도** 거부되면 뮤테이션이 살아남는다.
     """
     assert _safe(sql) == ()
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        "customer_phone AS concat, concat('010-', '9999-9999')",
+        f"customer_phone AS {'a' * 63}, concat('010-', '9999-9999') AS {'a' * 63}x",
+        f"customer_phone AS \"{'가' * 21}\", concat('010-', '9999-9999') AS \"{'가' * 21}나\"",
+    ],
+)
+def test_DB_결과_이름이_겹치는_계산값은_직접_컬럼을_덮지_못한다(projection: str) -> None:
+    """DictRow는 DB 출력명이 같으면 뒤의 합성값을 남기므로 실행 전에 거부한다."""
+    assert _reject(f"SELECT {projection} FROM orders {SCOPE}").rule == "unsupported_projection"
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        (
+            f'WITH t AS (SELECT customer_phone AS "Phone" FROM orders {SCOPE}) '
+            'SELECT "Phone" FROM t',
+            ("Phone",),
+        ),
+        (
+            f'WITH "T" AS (SELECT customer_phone AS "Phone" FROM orders {SCOPE}) '
+            'SELECT "T".* FROM "T"',
+            ("Phone",),
+        ),
+        (
+            f'SELECT "D"."Phone" FROM (SELECT customer_phone AS "Phone" FROM orders {SCOPE}) "D"',
+            ("Phone",),
+        ),
+        (
+            f"SELECT coalesce(customer_phone, '미정') FROM orders {SCOPE}",
+            ("coalesce",),
+        ),
+        (
+            f"SELECT customer_phone AS {'a' * 64} FROM orders {SCOPE}",
+            ("a" * 63,),
+        ),
+        (
+            f'SELECT customer_phone AS "{"가" * 20}한글" FROM orders {SCOPE}',
+            ("가" * 20 + "한",),
+        ),
+        (
+            f'WITH t AS (SELECT customer_phone AS "Phone", '
+            f"concat('010-', '9999-9999') AS phone FROM orders {SCOPE}) "
+            'SELECT "Phone", phone FROM t',
+            ("Phone",),
+        ),
+    ],
+)
+def test_DB_출력_이름으로_유래를_전달하여_정상_에코를_보존한다(
+    sql: str, expected: tuple[str, ...]
+) -> None:
+    """quoted 이름·다중바이트 절단·함수 기본 이름을 동일한 해석으로 연결한다."""
+    assert _safe(sql) == expected
+    query = validate_sql(sql, order_no=ORDER_NO, max_rows=MAX_ROWS)
+    _, evidence_text = _sql_evidence_texts(
+        sql=query.sql,
+        rows=({expected[0]: STORED_PHONE},),
+        pii_safe_output_columns=query.pii_safe_output_columns,
+    )
+    assert STORED_PHONE in evidence_text
+
+
+def test_따옴표_대소문자가_다른_컬럼에_유래를_빌려주지_않는다() -> None:
+    """서로 다른 DB 컬럼을 lower()로 합치면 합성값까지 승인될 수 있다."""
+    sql = (
+        f'WITH t AS (SELECT customer_phone AS "Phone", '
+        f"concat('010-', '9999-9999') AS phone FROM orders {SCOPE}) SELECT phone FROM t"
+    )
+    assert _safe(sql) == ()

@@ -449,7 +449,7 @@ def _check_joins(statement: exp.Select) -> None:
 class _Exported(NamedTuple):
     """스코프가 바깥에 내놓는 것 — 컬럼 이름들과, 그중 **유래가 증명된** 이름들."""
 
-    #: 이 스코프가 내놓는 출력 이름 전부 (소문자).
+    #: 이 스코프가 내놓는 DB 출력 이름 전부 (quoted 대소문자는 보존).
     columns: frozenset[str]
     #: 그중 값이 `orders` 직접 컬럼에서 왔음이 증명된 이름들. `columns` 의 부분집합이다.
     pii_safe: frozenset[str]
@@ -461,7 +461,7 @@ class _Source:
 
     #: 스코프 안에서 이 소스를 가리키는 이름 (별칭이 있으면 별칭).
     name: str
-    #: 이 소스가 내놓는 컬럼 이름들 (소문자).
+    #: 이 소스가 내놓는 DB 컬럼 이름들 (quoted 대소문자는 보존).
     columns: frozenset[str]
     #: 화이트리스트 **기저 테이블**이면 그 테이블 이름. CTE·파생 테이블이면 `None`.
     base_table: str | None
@@ -490,7 +490,7 @@ class _Scope:
         별칭이 전역 허용 컬럼이 되어 화이트리스트가 무력화된다.
         """
         return frozenset(
-            expression.alias.lower()
+            expression.alias
             for expression in self.select.expressions
             if isinstance(expression, exp.Alias) and expression.alias
         )
@@ -557,7 +557,7 @@ def _alias_columns(node: exp.Expr) -> list[str]:
     alias = node.args.get("alias")
     if not isinstance(alias, exp.TableAlias):
         return []
-    return [identifier.name.lower() for identifier in alias.columns]
+    return [identifier.name for identifier in alias.columns]
 
 
 class _Analyzer:
@@ -625,7 +625,7 @@ class _Analyzer:
             if not isinstance(cte, exp.CTE):
                 continue
             body = cte.this
-            name = cte.alias_or_name.lower()
+            name = cte.alias_or_name
             if not isinstance(body, exp.Select):
                 raise _reject(
                     SqlGuardRule.UNSUPPORTED_SOURCE,
@@ -655,7 +655,7 @@ class _Analyzer:
             declared = _alias_columns(node)
             exported = _Exported(frozenset(declared), frozenset()) if declared else _exports(inner)
             return _Source(
-                name=node.alias.lower(),
+                name=node.alias,
                 columns=exported.columns,
                 base_table=None,
                 pii_safe_columns=exported.pii_safe,
@@ -668,9 +668,9 @@ class _Analyzer:
 
     def _table_source(self, node: exp.Table, env: Mapping[str, _Exported]) -> _Source:
         self._seen_tables.add(id(node))
-        name = node.name.lower()
-        schema = node.db.lower()
-        catalog = node.catalog.lower()
+        name = node.name
+        schema = node.db
+        catalog = node.catalog
 
         if not name:
             # `FROM generate_series(...)` 같은 테이블 함수 — 이름 없는 FROM 소스다.
@@ -682,7 +682,7 @@ class _Analyzer:
         if name in env and not schema and not catalog:
             exported = _Exported(frozenset(declared), frozenset()) if declared else env[name]
             return _Source(
-                name=(node.alias or name).lower(),
+                name=(node.alias or name),
                 columns=exported.columns,
                 base_table=None,
                 pii_safe_columns=exported.pii_safe,
@@ -711,7 +711,7 @@ class _Analyzer:
         if name not in self.base_tables:
             self.base_tables.append(name)
         return _Source(
-            name=(node.alias or name).lower(),
+            name=(node.alias or name),
             columns=self._whitelist[name],
             base_table=name,
             # 기저 테이블의 컬럼은 정의상 직접 컬럼이다 — 유래 추적의 바닥이다.
@@ -763,7 +763,7 @@ class _Analyzer:
             for identifier in join.args.get("using") or []:
                 if not isinstance(identifier, exp.Expr):
                     continue
-                if not _resolve_bare(scope, identifier.name.lower()):
+                if not _resolve_bare(scope, identifier.name):
                     raise _reject(
                         SqlGuardRule.UNKNOWN_COLUMN,
                         f"화이트리스트 밖 컬럼을 USING 절에 썼다: {identifier.name}",
@@ -774,12 +774,12 @@ class _Analyzer:
             raise _reject(
                 SqlGuardRule.UNKNOWN_TABLE, f"다른 데이터베이스를 참조할 수 없다: {_sql_of(node)}"
             )
-        if node.db and node.db.lower() not in ALLOWED_SCHEMAS:
+        if node.db and node.db not in ALLOWED_SCHEMAS:
             raise _reject(
                 SqlGuardRule.UNKNOWN_TABLE, f"화이트리스트 밖 스키마를 참조했다: {_sql_of(node)}"
             )
 
-        qualifier = node.table.lower()
+        qualifier = node.table
         if qualifier:
             source = _lookup_source(scope, qualifier)
             if source is None:
@@ -790,7 +790,7 @@ class _Analyzer:
             if isinstance(node.this, exp.Star):
                 # `o.*` — 이미 화이트리스트로 확인된 소스의 전체 컬럼이다.
                 return
-            if node.name.lower() not in source.columns:
+            if node.name not in source.columns:
                 raise _reject(
                     SqlGuardRule.UNKNOWN_COLUMN,
                     f"화이트리스트 밖 컬럼을 참조했다: {_sql_of(node)}",
@@ -800,7 +800,7 @@ class _Analyzer:
         if isinstance(node.this, exp.Star):
             return
 
-        name = node.name.lower()
+        name = node.name
         if _resolve_bare(scope, name):
             return
         if name in scope.output_aliases:
@@ -947,8 +947,8 @@ def _projection_provenance(node: exp.Expr, scope: _Scope) -> _Provenance:
         if isinstance(value.this, exp.Star):
             # `o.*` 는 projection 단위가 아니라 소스 단위로 따로 편다.
             return _Provenance.UNKNOWN
-        name = value.name.lower()
-        qualifier = value.table.lower()
+        name = value.name
+        qualifier = value.table
         if qualifier:
             source = _lookup_source(scope, qualifier)
             proven = source is not None and name in source.pii_safe_columns
@@ -989,7 +989,7 @@ def _star_sources(projection: exp.Expr, scope: _Scope) -> tuple[_Source, ...] | 
         return tuple(scope.sources.values())
     value = projection.this if isinstance(projection, exp.Alias) else projection
     if isinstance(value, exp.Column) and isinstance(value.this, exp.Star):
-        qualified = scope.sources.get(value.table.lower())
+        qualified = scope.sources.get(value.table)
         return () if qualified is None else (qualified,)
     return None
 
@@ -1016,12 +1016,10 @@ def _exports(scope: _Scope) -> _Exported:
                 for column in source.columns:
                     record(column, is_direct=column in source.pii_safe_columns)
             continue
-        output = projection.output_name
-        if not output:
-            continue
+        output = _database_output_name(projection)
         value = projection.this if isinstance(projection, exp.Alias) else projection
         record(
-            output.lower(),
+            output,
             is_direct=_projection_provenance(value, scope) is _Provenance.DIRECT,
         )
 
@@ -1098,13 +1096,90 @@ def _check_projections(statement: exp.Select) -> None:
         )
 
 
+def _normalize_identifiers(statement: exp.Select) -> None:
+    """PostgreSQL UTF8 식별자: 따옴표 밖 ASCII 소문자 접기 + 63바이트 절단.
+
+    검증·유래 전달·실행 SQL이 같은 이름을 보도록 스코프를 만들기 전에 한 번만 적용한다.
+    Python lower()는 quoted 이름과 비ASCII 대문자까지 합치므로 여기서는 쓰지 않는다.
+    """
+    lower_ascii = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+    for identifier in statement.find_all(exp.Identifier):
+        name = identifier.name
+        if not identifier.args.get("quoted"):
+            name = name.translate(lower_ascii)
+        identifier.set("this", name.encode("utf-8")[:63].decode("utf-8", errors="ignore"))
+
+
+def _default_output_name(node: exp.Expr) -> tuple[str, bool]:
+    """허용 구문의 PostgreSQL FigureColname 규칙과 강한 이름 여부.
+
+    CASE의 ELSE·CAST는 컬럼/함수의 강한 이름만 물려받는다. sqlglot output_name은
+    함수에서는 비고 상수에서는 상수값이므로 DB 결과 메타데이터로 쓸 수 없다.
+    """
+    value = _unwrap_parens(node)
+    if isinstance(value, exp.Column):
+        return (value.table if value.is_star else value.name), True
+    if isinstance(value, exp.Alias):
+        return value.alias, True
+    if isinstance(value, exp.Cast):
+        name, strong = _default_output_name(value.this)
+        if strong:
+            return name, True
+        type_names = {
+            exp.DataType.Type.TEXT: "text",
+            exp.DataType.Type.VARCHAR: "varchar",
+            exp.DataType.Type.CHAR: "bpchar",
+            exp.DataType.Type.INT: "int4",
+            exp.DataType.Type.BIGINT: "int8",
+            exp.DataType.Type.SMALLINT: "int2",
+            exp.DataType.Type.DECIMAL: "numeric",
+            exp.DataType.Type.FLOAT: "float4",
+            exp.DataType.Type.DOUBLE: "float8",
+            exp.DataType.Type.DATE: "date",
+            exp.DataType.Type.TIMESTAMP: "timestamp",
+            exp.DataType.Type.TIMESTAMPTZ: "timestamptz",
+            exp.DataType.Type.TIME: "time",
+        }
+        target = value.args.get("to")
+        if isinstance(target, exp.DataType) and target.this in type_names:
+            return type_names[target.this], False
+    elif isinstance(value, exp.Case):
+        default = value.args.get("default")
+        if isinstance(default, exp.Expr):
+            name, strong = _default_output_name(default)
+            if strong:
+                return name, True
+        return "case", False
+    elif isinstance(value, exp.Trim):
+        return {"LEADING": "ltrim", "TRAILING": "rtrim"}.get(
+            str(value.args.get("position")), "btrim"
+        ), True
+    elif isinstance(value, exp.CurrentTimestamp):
+        # sqlglot이 NOW()도 CURRENT_TIMESTAMP로 생성한다.
+        return "current_timestamp", True
+    elif isinstance(value, exp.Collate | exp.Window | exp.Filter):
+        return _default_output_name(value.this)
+    elif isinstance(value, exp.Subquery) and isinstance(value.this, exp.Select):
+        projections = value.this.expressions
+        if len(projections) == 1 and not projections[0].is_star:
+            return _database_output_name(projections[0]), True
+    elif isinstance(value, exp.Exists):
+        return "exists", True
+    elif isinstance(value, exp.Binary | exp.Unary | exp.Literal | exp.Null | exp.Boolean):
+        return "?column?", False
+    else:
+        for name, node_type in _ALLOWED_FUNCTIONS:
+            if type(value) is node_type and node_type is not exp.If:
+                return name, True
+    raise _reject(
+        SqlGuardRule.UNSUPPORTED_PROJECTION,
+        f"결과 이름을 증명할 수 없는 표현식이다: {_sql_of(node)}. 고유한 AS 별칭을 붙인다.",
+    )
+
+
 def _database_output_name(projection: exp.Expr) -> str:
-    """PostgreSQL 결과 메타데이터에 나타나는 projection 이름을 반환한다."""
-    if isinstance(projection, exp.Alias):
-        alias = projection.args.get("alias")
-        if isinstance(alias, exp.Identifier) and alias.args.get("quoted"):
-            return projection.output_name
-    return projection.output_name.lower()
+    """명시 별칭·기본 출력명 모두 DB와 같은 이름으로 비교하고 유래를 전달한다."""
+    return _default_output_name(projection)[0]
 
 
 def _projection_output_names(scope: _Scope) -> tuple[str, ...]:
@@ -1122,12 +1197,11 @@ def _projection_output_names(scope: _Scope) -> tuple[str, ...]:
 
         value = projection.this if isinstance(projection, exp.Alias) else projection
         if isinstance(value, exp.Column) and isinstance(value.this, exp.Star):
-            qualified_source = scope.sources.get(value.table.lower())
+            qualified_source = scope.sources.get(value.table)
             if qualified_source is not None:
                 names.extend(sorted(qualified_source.columns))
             continue
-        if projection.output_name:
-            names.append(_database_output_name(projection))
+        names.append(_database_output_name(projection))
     return tuple(names)
 
 
@@ -1167,7 +1241,7 @@ def _pii_safe_output_columns(scope: _Scope) -> tuple[str, ...]:
             continue
 
         value = projection.this if isinstance(projection, exp.Alias) else projection
-        if _projection_provenance(value, scope) is _Provenance.DIRECT and projection.output_name:
+        if _projection_provenance(value, scope) is _Provenance.DIRECT:
             safe.append(_database_output_name(projection))
 
     return tuple(dict.fromkeys(safe))
@@ -1199,10 +1273,10 @@ def _order_scope_qualifier(condition: exp.Expr, order_no: str) -> str | None:
             column = column_side.unnest()
             if (
                 isinstance(column, exp.Column)
-                and column.name.lower() == ORDER_SCOPE_COLUMN
+                and column.name == ORDER_SCOPE_COLUMN
                 and _matches_order_literal(literal_side, order_no)
             ):
-                return column.table.lower()
+                return column.table
         return None
     # `order_no IN ('ORD-...')` — 값이 전부 그 주문번호여야 한다.
     if isinstance(condition, exp.In):
@@ -1210,12 +1284,12 @@ def _order_scope_qualifier(condition: exp.Expr, order_no: str) -> str | None:
         column = condition.this.unnest() if condition.this is not None else None
         if (
             isinstance(column, exp.Column)
-            and column.name.lower() == ORDER_SCOPE_COLUMN
+            and column.name == ORDER_SCOPE_COLUMN
             and isinstance(values, list)
             and values
             and all(_matches_order_literal(value, order_no) for value in values)
         ):
-            return column.table.lower()
+            return column.table
     return None
 
 
@@ -1322,6 +1396,7 @@ def validate_sql(
 
     statement = _require_read_only_select(_parse_single_statement(text))
     _check_joins(statement)
+    _normalize_identifiers(statement)
 
     analyzer = _Analyzer(whitelist)
     root_scope = analyzer.build(statement, None, {})

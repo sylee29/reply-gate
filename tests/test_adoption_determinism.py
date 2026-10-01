@@ -33,7 +33,6 @@ from psycopg.rows import DictRow
 
 from reply_gate.adoption_axis import AbstentionStatistic as HandCalcStatistic
 from reply_gate.adoption_axis import statistic_value as handcalc_statistic_value
-from reply_gate.config import Settings
 from reply_gate.evidence import EvidenceCollector, adopt_policy_hits
 from reply_gate.llm import GenerationClient, JsonCompletion
 from reply_gate.policy_index import (
@@ -52,7 +51,8 @@ from reply_gate.retrieval_strategies import (
     truncate_for_gate,
     undefined_statistic_reason,
 )
-from reply_gate.testing import LexicalEmbeddingClient
+from reply_gate.testing import LexicalEmbeddingClient, StubEvidenceCollector
+from tests.conftest import declared_settings
 
 _TOP_K = 5
 _CUT = 0.30
@@ -215,10 +215,10 @@ class _PolicyIntentClient:
 
 def _collector(*, top_k: int) -> EvidenceCollector:
     """재작성은 끈다 — 이 테스트가 재는 것은 채택 축이고, 재작성 대본은 잡음이다."""
-    return EvidenceCollector(
+    return StubEvidenceCollector(
         generation_client=cast(GenerationClient, _PolicyIntentClient()),
         embedding_client=LexicalEmbeddingClient(dimensions=_INDEX_DIMENSIONS),
-        settings=Settings(
+        settings=declared_settings(
             vector_top_k=top_k,
             vector_similarity_threshold=0.0,
             query_rewrite_enabled=False,

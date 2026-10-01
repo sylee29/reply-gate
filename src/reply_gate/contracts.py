@@ -30,10 +30,20 @@ __all__ = [
     "JudgeResult",
     "RejectReason",
     "Verdict",
+    "has_unstorable_characters",
     "is_policy_evidence_id",
     "policy_evidence_id",
     "sql_evidence_id",
 ]
+
+
+def has_unstorable_characters(text: str) -> bool:
+    """UTF-8/Postgres 문자열로 저장할 수 없는 NUL·surrogate 코드포인트를 찾는다.
+
+    답변 내용이나 PII 판정이 아닌 입력 표현의 경계다. 정상 Unicode·줄바꿈은 허용한다.
+    JSON의 올바른 surrogate escape 쌍은 파싱 시 정상 Unicode 문자로 합쳐진다.
+    """
+    return any(character == "\0" or "\ud800" <= character <= "\udfff" for character in text)
 
 
 class IntentSource(StrEnum):

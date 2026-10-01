@@ -142,10 +142,10 @@ uv run uvicorn reply_gate.api:app --reload
 
 ```bash
 uv run ruff check .            # 0
-uv run ruff format --check .   # 193 files
+uv run ruff format --check .   # 219 files
 uv run mypy                    # strict — 81 files, 0 errors
 uv run pytest                  # DB 를 띄운 실행에서만 건수 대조가 선다
-uv run pytest -m db            # 178 passed, 1,329 deselected · skip 0 이어야 한다
+uv run pytest -m db            # 233 passed, 1,583 deselected · skip 0 이어야 한다
 ```
 
 `pytest` 는 DB 기동을 전제한다. DB 가 없으면 `db` 마커 테스트가 사유를 담아 skip 되므로,
@@ -155,7 +155,7 @@ uv run pytest -m db            # 178 passed, 1,329 deselected · skip 0 이어�
 링크 쪽은 따로도 돌릴 수 있다:
 
 ```bash
-uv run python -m scripts.check_links        # 문서 50개 · 링크 429개 · 깨짐 0건
+uv run python -m scripts.check_links        # 문서 51개 · 링크 433개 · 깨짐 0건
 ```
 
 **건수 대조는 전체 스위트에서만 성립한다.** 경로·`-k`·`-m` 을 주면 그 세션이 스위트가 아니므로
@@ -163,7 +163,7 @@ uv run python -m scripts.check_links        # 문서 50개 · 링크 429개 · �
 
 **그리고 테스트 건수 쪽은 DB 를 띄운 실행에서만 성립한다.** 문서가 인용하는 것은 `N passed`
 인데 세션이 아는 것은 수집 건수이고, 둘은 **skip 이 0 일 때만** 같다. DB 가 없으면 `db` 마커
-178건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
+233건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
 검사 — 은 skip 과 무관해서 계속 대조한다). 이 갈래가 없던 첫 판은 `1,310 passed · 178 skipped`
 인 실행에서도 `1,488 passed` 인용을 초록으로 통과시켰다([findings 37](tracking/findings.md)).
 
@@ -219,7 +219,7 @@ uv run python -m scripts.evaluate --live --measurements 3 --judge-model claude-o
 가드가 대조를 **진행하며 차이를 병기**하고, 선언되지 않은 지문 불일치만 "대조 불가"가 된다.
 선언은 그 실행의 예외 처리이지 승격 등재의 정정이 아니다.
 
-### 다음에 풀셋 라이브를 사면 두 항목을 반드시 선언한다
+### 다음 라이브 비교 전에 코드 조건 변경을 확인한다
 
 **승격 기준선(`-28`·`-29`·`-30`)의 지문 두 칸이 지금 코드와 갈려 있다**
 ([findings 32](tracking/findings.md)) — 사이클 종료 뒤 감사 수정이 `draft_rule_version` 을
@@ -228,8 +228,16 @@ uv run python -m scripts.evaluate --live --measurements 3 --judge-model claude-o
 로 나온다(0 이나 "통과"가 아니다 — 그건 설계대로다).
 
 ```bash
-uv run python -m scripts.evaluate --live   --declare-experiment draft_rule_version   --declare-experiment l1_fixture_version
+uv run python -m scripts.evaluate --live   --declare-experiment draft_rule_version   --declare-experiment l1_fixture_version   --declare-experiment sql_guard_version
 ```
+
+**2026-09-30 정정:** 위 두 칸은 2026-08-26의 상태다. 전체 리뷰에서 claim 연결 판정과 SQL
+출력명 경계를 고치고 행동 탐침을 추가하여 현재는 `sql_guard_version`도 다르다. 위 명령은
+그 세 차이를 표시하는 예시이며 실행 승인이 아니다. L2 산출 해석은 새 `judge_rule_version`에
+기록한다. **과거 보고서에는 이 값이 없으므로 미상으로 남는다.** 선언하거나 대조가
+진행된다는 이유로 과거 parser까지 같은 조건이었다고 읽지 않는다. 새 실행의 규칙 버전이
+서로 다르면 별도 선언 없이는 대조가 거부되고, 선언해도 같은 세트로 묶지 않는다.
+판단 근거는 [결정0028](tracking/decisions/0028-L2-산출-해석-규칙을-별도-지문으로-기록한다.md)이다.
 
 **함께 지는 의무 하나 — 분모를 병기한다.** 채점표가 늘면서 **측정 1 의 검출 분모가
 26 → 28** 이 됐다(양성 28 · 음성 9). 선언한 실행의 비악화 판정은 **분모가 다른 두 값 사이의

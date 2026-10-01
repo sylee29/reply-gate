@@ -390,6 +390,15 @@ def _parse_judge_result(data: object, *, draft: Draft, evidence: Sequence[Eviden
         )
     if RejectReason.CONTRADICTORY_EVIDENCE in reject_reasons and not contradictions:
         raise _ParseError("contradictory_evidence 사유가 있는데 모순 근거쌍 기록이 없다")
+    if RejectReason.CONTRADICTORY_EVIDENCE in reject_reasons:
+        cited_ids = {citation_id for claim in draft.claims for citation_id in claim.citation_ids}
+        if not any(
+            pair.evidence_id_a in cited_ids or pair.evidence_id_b in cited_ids
+            for pair in contradictions
+        ):
+            raise _ParseError(
+                "contradictory_evidence 사유가 있지만 모순 근거쌍을 인용한 claim이 없다"
+            )
 
     return JudgeResult(
         verdict=verdict,

@@ -506,7 +506,8 @@ def main(argv: list[str] | None = None) -> int:
     measurement3_was_due = bool(args.live) and judge_skip is None
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
-    cases = load_golden_set(args.golden_set)
+    # 측정 2 를 실행하지 않으면 골든셋은 입력이 아니다. 측정 3 단독은 판정 픽스처만 쓴다.
+    cases = load_golden_set(args.golden_set) if skip is None else ()
     # 판정 픽스처 로드 실패는 **측정 3 만** 접는다 — 키도 DB 도 필요 없는 측정 1 의 산출물을
     # 판정 픽스처 파일이 인질로 잡으면, 무료 실행이 트레이스백으로 죽으면서 아무것도 안 남는다.
     judge_fixtures: tuple[JudgeFixture, ...] = ()
@@ -661,7 +662,7 @@ def main(argv: list[str] | None = None) -> int:
         similarity_threshold=run_settings.vector_similarity_threshold,
         top_k=run_settings.vector_top_k,
         l1_fixture_count=len(fixtures),
-        golden_case_count=len(cases),
+        golden_case_count=len(cases) if skip is None else None,
         # 로드하지 못했으면 0 이 아니라 **미실행**이다.
         judge_fixture_count=None if judge_fixture_error is not None else len(judge_fixtures),
         # 커밋되는 라이브 리포트에 로컬 절대 경로(사용자명 포함)를 남기지 않는다.

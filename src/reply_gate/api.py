@@ -50,14 +50,18 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
+from math import isfinite
 from pathlib import Path
 from typing import Annotated, Any, Self
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from psycopg.rows import DictRow
 from pydantic import BaseModel, Field, SecretStr, model_validator
@@ -495,6 +499,25 @@ def get_service() -> ServiceOpener:
 
 
 ServiceDep = Annotated[ServiceOpener, Depends(get_service)]
+
+
+@app.exception_handler(RequestValidationError)
+def request_validation_handler(request: Request, exc: RequestValidationError) -> Response:
+    """잘못된 입력의 진단값도 표준 JSON으로 보낸다 — surrogate가 422를 500으로 바꾸지 않는다.
+
+    입력을 고쳐 접수하는 것이 아니다. 비유한 수는 JSON 값으로 표현할 수 없어 오류
+    상세에서만 문자열 진단값으로 남기고, 나머지 값과 기존 detail 구조는 보존한다.
+    """
+    del request
+    detail = jsonable_encoder(
+        exc.errors(),
+        custom_encoder={float: lambda number: number if isfinite(number) else repr(number)},
+    )
+    return Response(
+        status_code=422,
+        media_type="application/json",
+        content=json.dumps({"detail": detail}, ensure_ascii=True, allow_nan=False),
+    )
 
 
 @app.exception_handler(MissingCredentialsError)

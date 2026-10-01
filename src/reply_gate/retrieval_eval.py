@@ -148,7 +148,7 @@ DEFAULT_CUTOFF_SWEEP: Final = tuple(round(0.10 + index * 0.05, 2) for index in r
 _ROOT: Final = Path(__file__).resolve().parents[2]
 DEFAULT_RETRIEVAL_REPORT_DIR: Final = _ROOT / "reports"
 DEFAULT_EMBEDDING_CACHE_DIR: Final = _ROOT / ".retrieval-cache"
-STUB_EMBEDDING_MODEL: Final = "lexical-2gram-v1"
+STUB_EMBEDDING_MODEL: Final = LexicalEmbeddingClient.LEGACY_MODEL
 STUB_DEFAULT_CUTOFF: Final = 0.10
 DEFAULT_RRF_K: Final = 60
 #: RRF 점수는 순위 기반이라 절대 관련성을 표현하지 못한다. 기본값은 무필터(0.0)이고,
@@ -930,6 +930,8 @@ def retrieve_cases(
     `stats` 를 주면 캐시 적중·구매를 그 객체에 누적한다 — 과금 보고가 추정이 아니라
     관측이 되게 하는 계량기이고, 채점에는 영향을 주지 않는다.
     """
+    if embedder.model != config.model:
+        raise ValueError(f"임베더 모델이 구성과 다르다: {embedder.model} != {config.model}")
     if embedder.dimensions != config.dimensions:
         raise ValueError(
             f"임베더 차원이 구성과 다르다: {embedder.dimensions} != {config.dimensions}"
@@ -2881,7 +2883,9 @@ def run_retrieval_comparison(
             raise RetrievalConfigurationError(
                 "OPENAI_API_KEY가 없다 — 실제 임베딩·리랭크 비교는 과금되므로 키를 선검사한다"
             )
-        model = embedding_model or settings.embedding_model
+        model = embedding_model or (
+            embedding_client.model if embedding_client is not None else settings.embedding_model
+        )
         resolved_cutoff = settings.vector_similarity_threshold if cutoff is None else cutoff
         embedder: EmbeddingClient = embedding_client or OpenAIEmbeddingClient(
             api_key=settings.openai_api_key, model=model, dimensions=resolved_dimensions
@@ -2901,7 +2905,7 @@ def run_retrieval_comparison(
             )
         model = STUB_EMBEDDING_MODEL
         resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
-        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)
+        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions, model=model)
         reranker = _IdentityRerankClient() if uses_rerank else None
 
     config = RetrievalEvalConfig(
@@ -3512,7 +3516,7 @@ class ChunkingRow:
 
 @dataclass(frozen=True)
 class ChunkingEmbeddingCost:
-    """관측된 캐시 적중·구매. 달러 환산은 단가표가 있을 때만 한다."""
+    """관측된 캐시 적중·구매. 달러는 환산하지 않고 토큰과 조건을 보고한다."""
 
     model: str
     dimensions: int
@@ -3654,6 +3658,7 @@ def run_chunking_grid(
     default_containment: float = DEFAULT_CHUNK_MIN_CONTAINMENT,
     strategies: Sequence[ChunkingStrategy] = DEFAULT_CHUNKING_STRATEGIES,
     rewritten_queries: Mapping[str, str] | None = None,
+    rewrite_condition: RewriteCondition = RewriteCondition.CALLER_INJECTED,
 ) -> ChunkingGrid:
     """청킹 축 격자를 돌린다. DB 도 제품 경로도 거치지 않는 인메모리 비교다.
 
@@ -3692,12 +3697,19 @@ def run_chunking_grid(
         )
     }
     if rewritten_queries is not None:
+        if rewrite_condition not in {RewriteCondition.BLIND, RewriteCondition.CALLER_INJECTED}:
+            raise RetrievalConfigurationError("청킹 재작성은 blind 또는 caller_injected만 허용한다")
         missing = sorted({case.id for case in cases} - set(rewritten_queries))
         if missing:
             raise RetrievalConfigurationError(
                 f"재작성 질의가 없는 문의가 있다: {', '.join(missing)}"
             )
-        query_sets[CHUNKING_QUERY_BLIND_REWRITE] = tuple(
+        condition = (
+            CHUNKING_QUERY_BLIND_REWRITE
+            if rewrite_condition is RewriteCondition.BLIND
+            else RewriteCondition.CALLER_INJECTED.value
+        )
+        query_sets[condition] = tuple(
             RetrievalQuery(case_id=case.id, text=rewritten_queries[case.id]) for case in cases
         )
 
@@ -3796,7 +3808,7 @@ def run_chunking_grid(
         strategies=strategy_tuple,
         query_conditions=tuple(query_sets),
         query_condition_note=(
-            "재작성 조건은 원문을 blind 재작성문으로 **치환**한 것이다. 제품 사다리의 "
+            "재작성 조건은 원문을 해당 조건의 재작성문으로 **치환**한 것이다. 제품 사다리의 "
             "원문·재작성 합집합(`merge_rewritten_rankings`)이 아니므로 이 열의 절대값을 "
             "전략 사다리 리포트의 `vector_rewrite` 행과 같은 것으로 읽으면 안 된다 — "
             "여기서 읽을 것은 조건이 바뀌어도 청킹 열 사이의 **순서**가 유지되는지다."
@@ -3814,8 +3826,9 @@ def run_chunking_grid(
             embedded_texts=stats.embedded_texts,
             total_tokens=stats.total_tokens,
             dollar_note=(
-                "저장소에 단가표가 없다 — 달러 환산은 미실행(사유: 근거 단가 부재)이고 "
-                "토큰만 보고한다. 환산이 필요하면 단가와 기준일을 함께 적어야 한다."
+                "달러 환산은 미실행(이 비교 리포트는 환산을 구현하지 않고 토큰만 보고한다). "
+                "저장소 단가표는 docs/tracking/pricing.md(기준일 2026-08-19)에 있다. "
+                "환산하려면 해당 모델의 단가와 기준일을 확인해야 한다."
             ),
         ),
     )
@@ -3844,6 +3857,7 @@ def _chunking_strategy(grid: ChunkingGrid, key: str) -> ChunkingStrategy:
 _CHUNKING_CONDITION_LABEL: Final = {
     CHUNKING_QUERY_ORIGINAL: "원문 질의",
     CHUNKING_QUERY_BLIND_REWRITE: "blind 재작성 질의(치환)",
+    RewriteCondition.CALLER_INJECTED.value: "호출자 주입 재작성 질의(출처 미검증·치환)",
 }
 
 
@@ -4305,6 +4319,15 @@ def run_chunking_comparison(
     `--live` 는 고정 크기 청크를 새로 임베딩하므로 과금된다. 조항 단위 열은 현행 인덱싱과
     같은 텍스트라 캐시가 그대로 산다.
     """
+    if rewritten_queries_path is not None:
+        condition = _resolved_rewrite_condition(
+            declared=None,
+            rewritten_queries_path=rewritten_queries_path,
+            caller_injected=False,
+            uses_rewrite=True,
+        )
+        if condition is not RewriteCondition.BLIND:
+            raise RetrievalConfigurationError("청킹 비교의 파일 입력은 blind 재작성만 허용한다")
     settings = get_settings()
     resolved_dimensions = (
         embedding_client.dimensions
@@ -4318,7 +4341,9 @@ def run_chunking_comparison(
             raise RetrievalConfigurationError(
                 "OPENAI_API_KEY가 없다 — 실제 임베딩 비교는 과금되므로 키를 선검사한다"
             )
-        model = embedding_model or settings.embedding_model
+        model = embedding_model or (
+            embedding_client.model if embedding_client is not None else settings.embedding_model
+        )
         resolved_cutoff = settings.vector_similarity_threshold if cutoff is None else cutoff
         embedder: EmbeddingClient = embedding_client or OpenAIEmbeddingClient(
             api_key=settings.openai_api_key, model=model, dimensions=resolved_dimensions
@@ -4330,7 +4355,7 @@ def run_chunking_comparison(
             )
         model = STUB_EMBEDDING_MODEL
         resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
-        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)
+        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions, model=model)
 
     documents = load_policy_documents(policy_dir)
     cases = load_golden_set(golden_set_path)
@@ -4357,5 +4382,6 @@ def run_chunking_comparison(
         default_containment=min_containment,
         strategies=strategies,
         rewritten_queries=rewritten,
+        rewrite_condition=RewriteCondition.BLIND,
     )
     return write_chunking_report(grid, output_dir=output_dir)

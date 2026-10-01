@@ -18,7 +18,6 @@ from typing import Any, cast
 
 import pytest
 
-from reply_gate.config import Settings
 from reply_gate.evidence import RetrievalWiringError, merge_policy_rankings
 from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 from reply_gate.pipeline import MissingCredentialsError
@@ -181,18 +180,18 @@ def test_스위치_켜짐_더하기_미배선은_조립에서_죽는다() -> Non
         EvidenceCollector(
             generation_client=_client(_completion({"rewritten": "질의"})),
             embedding_client=LexicalEmbeddingClient(dimensions=1536),
-            settings=Settings(query_rewrite_enabled=True),
+            settings=declared_settings(query_rewrite_enabled=True),
         )
 
 
 def test_명시적으로_끄면_클라이언트_없이도_조립된다() -> None:
     """양성 대조 — 전부 거부하는 검사는 검사가 아니다. 끄려면 **명시**해야 한다."""
-    from reply_gate.evidence import EvidenceCollector
+    from reply_gate.testing import StubEvidenceCollector
 
-    collector = EvidenceCollector(
+    collector = StubEvidenceCollector(
         generation_client=_client(_completion({"rewritten": "질의"})),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(query_rewrite_enabled=False),
+        settings=declared_settings(query_rewrite_enabled=False),
     )
 
     assert collector is not None

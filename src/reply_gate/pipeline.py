@@ -53,6 +53,7 @@ from reply_gate.contracts import (
     JudgeResult,
     RejectReason,
     Verdict,
+    has_unstorable_characters,
 )
 from reply_gate.draft import DraftGeneration, DraftGenerator
 from reply_gate.evidence import (
@@ -175,6 +176,10 @@ def accept_inquiry(*, content: str, order_no: str | None = None) -> AcceptedInqu
     보내기 때문이다). 미입력이 곧 오류는 아니다 — 의도가 `order`/`both` 일 때 비로소
     `missing_order_ref` 인계가 된다.
     """
+    if has_unstorable_characters(content) or (
+        order_no is not None and has_unstorable_characters(order_no)
+    ):
+        raise ReceiptError("문의 내용과 주문번호에는 NUL 또는 고립 surrogate 문자를 넣을 수 없다")
     text = content.strip()
     if not text:
         raise ReceiptError("문의 내용은 비워 둘 수 없다")

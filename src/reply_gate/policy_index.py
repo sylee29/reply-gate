@@ -304,7 +304,7 @@ def index_policy_documents(
 
 
 def _assert_index_provenance(
-    cur: psycopg.Cursor[DictRow], *, embedding_model: str, embedding_dimensions: int
+    rows: Sequence[DictRow], *, embedding_model: str, embedding_dimensions: int
 ) -> None:
     """저장된 벡터가 전부 질의와 같은 공간에서 나왔는지 확인한다 — 아니면 거부한다.
 
@@ -314,15 +314,6 @@ def _assert_index_provenance(
 
     적재 전(행 0개)은 불일치가 아니다. 검색할 것이 없으면 빈 결과와 같다.
     """
-    cur.execute(
-        """
-        SELECT embedding_model, embedding_dimensions, count(*) AS n
-        FROM policy_chunks
-        GROUP BY embedding_model, embedding_dimensions
-        ORDER BY embedding_model, embedding_dimensions
-        """
-    )
-    rows = cur.fetchall()
     if not rows:
         return
     if len(rows) == 1 and (
@@ -332,7 +323,9 @@ def _assert_index_provenance(
         return
     stored = ", ".join(
         f"{row['embedding_model']}/{int(row['embedding_dimensions'])}차원 {int(row['n'])}건"
-        for row in rows
+        for row in sorted(
+            rows, key=lambda row: (row["embedding_model"], row["embedding_dimensions"])
+        )
     )
     raise PolicyIndexProvenanceError(
         f"정책 인덱스의 임베딩 출처가 질의와 다르다 — 저장: {stored}, "
@@ -377,21 +370,45 @@ def search_policy_chunks(
     register_vector(conn)
     vector = Vector(list(query_vector))
     with conn.cursor() as cur:
-        _assert_index_provenance(
-            cur, embedding_model=embedding_model, embedding_dimensions=embedding_dimensions
-        )
+        # 출처와 검색을 한 statement snapshot으로 묶는다. 검사를 통과한 뒤 재색인이
+        # commit되어 다른 공간의 본문을 검색하는 TOCTOU를 막는다. MATERIALIZED 경계는
+        # 출처가 다를 때 pgvector 거리 연산에 행이 들어가지 않도록 보장한다.
         cur.execute(
             """
-            SELECT evidence_id, document_slug, document_title, article, article_title,
-                   content, 1 - (embedding <=> %s) AS similarity
-            FROM policy_chunks
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> %s, evidence_id
-            LIMIT %s
+            WITH provenance AS MATERIALIZED (
+                SELECT COALESCE(jsonb_agg(to_jsonb(spaces)), '[]'::jsonb) AS index_provenance,
+                       COALESCE(bool_and(embedding_model = %s AND embedding_dimensions = %s),
+                                true) AS compatible
+                FROM (
+                    SELECT embedding_model, embedding_dimensions, count(*) AS n
+                    FROM policy_chunks
+                    GROUP BY embedding_model, embedding_dimensions
+                ) spaces
+            ), compatible_candidates AS MATERIALIZED (
+                SELECT chunks.* FROM policy_chunks chunks CROSS JOIN provenance
+                WHERE provenance.compatible AND chunks.embedding IS NOT NULL
+            )
+            SELECT provenance.index_provenance, hits.*, 1 - hits.distance AS similarity
+            FROM provenance
+            LEFT JOIN LATERAL (
+                SELECT evidence_id, document_slug, document_title, article, article_title,
+                       content, embedding <=> %s AS distance
+                FROM compatible_candidates
+                ORDER BY embedding <=> %s, evidence_id
+                LIMIT %s
+            ) hits ON true
+            ORDER BY hits.distance, hits.evidence_id
             """,
-            (vector, vector, top_k),
+            (embedding_model, embedding_dimensions, vector, vector, top_k),
         )
         rows = cur.fetchall()
+
+    # 집계 행은 빈 인덱스·불일치 때도 남는다. 출처 오류를 먼저 판정한 뒤 빈 hit만 제외한다.
+    _assert_index_provenance(
+        rows[0]["index_provenance"],
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+    )
 
     return [
         PolicySearchHit(
@@ -404,4 +421,5 @@ def search_policy_chunks(
             similarity=float(row["similarity"]),
         )
         for row in rows
+        if row["evidence_id"] is not None
     ]

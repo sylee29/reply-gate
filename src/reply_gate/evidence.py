@@ -46,7 +46,7 @@ from typing import Any, Final
 import psycopg
 from psycopg.rows import DictRow
 
-from reply_gate.config import Settings, get_settings
+from reply_gate.config import AbstentionGateWiringError, Settings, get_settings
 from reply_gate.contracts import (
     EscalationReason,
     Evidence,
@@ -969,9 +969,24 @@ class EvidenceCollector:
         self._embedder = embedding_client
         self._settings = resolved
         self._rewrite_client = rewrite_client
+        self._validate_embedding_condition()
         # 기권 게이트는 설정에서 한 번만 조립한다 — 켜고 끄는 자리가 하나여야 런타임과
         # 리포트의 조건 지문이 갈리지 않는다. `None` 은 "꺼짐"이고 채택은 절대 하한만 남는다.
         self._abstention_gate = resolved.abstention_gate()
+
+    def _validate_embedding_condition(self) -> None:
+        """τ 검증은 설정 이름이 아니라 실제로 검색할 임베더 조건에 걸려야 한다."""
+        if not self._settings.abstention_gate_enabled:
+            return
+        configured = (self._settings.embedding_model, self._settings.embedding_dimensions)
+        actual = (self._embedder.model, self._embedder.dimensions)
+        if actual != configured:
+            raise AbstentionGateWiringError(
+                f"기권 게이트의 설정과 실제 임베더 조건이 다르다: "
+                f"설정 {configured[0]}/{configured[1]}차원, "
+                f"임베더 {actual[0]}/{actual[1]}차원. "
+                "같은 조건을 배선하거나 ABSTENTION_GATE_ENABLED=false 로 명시한다."
+            )
 
     def collect(
         self,

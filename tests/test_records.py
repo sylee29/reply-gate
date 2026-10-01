@@ -27,6 +27,7 @@ from reply_gate.contracts import (
     JudgeResult,
     RejectReason,
     Verdict,
+    has_unstorable_characters,
     policy_evidence_id,
     sql_evidence_id,
 )
@@ -47,9 +48,11 @@ from reply_gate.pipeline import (
 )
 from reply_gate.records import load_inquiry, save_inquiry
 from tests.test_pipeline import (
+    UNSTORABLE_DRAFT_MODES,
     citing_draft,
     intent_completion,
     live_pipeline,
+    process_unstorable_draft,
     run_live,
     scripted_client,
     sql_completion,
@@ -193,6 +196,33 @@ def test_저장한_처리_기록이_그대로_복원된다(app_conn: psycopg.Con
     loaded = load_inquiry(conn=app_conn, inquiry_id=processed.inquiry_id)
 
     assert loaded == processed
+
+
+@pytest.mark.parametrize("mode", UNSTORABLE_DRAFT_MODES)
+@pytest.mark.parametrize("recover", [True, False])
+def test_저장_불가_모델원문도_실제_래퍼_파이프라인을_거쳐_기록이_왕복한다(
+    app_conn: psycopg.Connection[DictRow],
+    mode: str,
+    recover: bool,
+) -> None:
+    """형식 실패 이후 원시 문자열 저장에서 다시 죽던 경로를 실제 JSONB 왕복으로 검증한다."""
+    processed, original = process_unstorable_draft(mode, recover=recover)
+    save_inquiry(conn=app_conn, processed=processed)
+    loaded = load_inquiry(conn=app_conn, inquiry_id=processed.inquiry_id)
+
+    assert loaded is not None
+    assert _without_durations(loaded) == _without_durations(processed)
+    assert len(loaded.attempts) == 2
+    assert loaded.attempts[0].reject_reasons == (RejectReason.SCHEMA_VIOLATION,)
+    assert (loaded.input_tokens, loaded.output_tokens) == (33, 17)
+    diagnostic = loaded.attempts[0].draft
+    assert isinstance(diagnostic, str)
+    if has_unstorable_characters(original):
+        prefix = "[Unicode escaped raw text] "
+        assert diagnostic.startswith(prefix)
+        assert diagnostic.removeprefix(prefix).encode("ascii").decode("unicode_escape") == original
+    else:
+        assert diagnostic == original
 
 
 def test_인계_기록도_그대로_복원된다(app_conn: psycopg.Connection[DictRow]) -> None:

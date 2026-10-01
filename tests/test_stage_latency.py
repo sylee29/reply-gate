@@ -31,7 +31,6 @@ from psycopg.rows import DictRow
 
 from reply_gate import evidence, llm
 from reply_gate.api import AttemptOut, InquiryResponse, MetricsOut
-from reply_gate.config import Settings
 from reply_gate.contracts import (
     EscalationReason,
     Evidence,
@@ -73,6 +72,7 @@ from reply_gate.policy_index import index_policy_documents, load_policy_document
 from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
 from reply_gate.records import load_inquiry, save_inquiry
 from reply_gate.testing import LexicalEmbeddingClient
+from tests.conftest import declared_settings
 from tests.test_api import ATTEMPT_KEYS, METRICS_KEYS, RESPONSE_KEYS
 from tests.test_evaluation import (
     GOLDEN,
@@ -951,7 +951,13 @@ def test_질의_임베딩이_예외로_죽은_문의도_그_구간을_남긴다(
                 elapsed_ms=23.0,
             )
         ),
-        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.0, sql_max_rows=50),
+        # 이 테스트는 임베딩 전송 실패의 시간 보존을 잰다. 채택 게이트는 실행되지 않는다.
+        settings=declared_settings(
+            vector_top_k=5,
+            vector_similarity_threshold=0.0,
+            sql_max_rows=50,
+            abstention_gate_enabled=False,
+        ),
         rewrite_client=cast(llm.GenerationClient, client),
     )
 

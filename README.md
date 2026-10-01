@@ -674,7 +674,7 @@ uv run uvicorn reply_gate.api:app --reload   # http://127.0.0.1:8000
 - **토큰 4계열 분리 집계** — 생성·임베딩·판정·검색을 끝까지 섞지 않는다. 캐시 계열은 별도 칸
   (없으면 다음에 누가 캐싱을 켤 때 판정 입력 토큰이 **77% 줄어든 것처럼** 찍힌다)
 - **회귀 가드 상설화** — 실행마다 **이중 기준선 두 줄**(승격=구속 / 직전 라이브=경보),
-  **비악화 두 겹**(일치 감소 + 근거 부분 손실), **조건 지문 25칸**, "검사가 안 돌았으면 보류"
+  **비악화 두 겹**(일치 감소 + 근거 부분 손실), **조건 지문 26칸**, "검사가 안 돌았으면 보류"
 - **케이스별 실패 귀인** — 합산 지표가 가리지 못하도록 케이스마다 분류한다. 이 절이 아니었으면
   사이클 3 의 가장 값진 회귀(모순 기각 소멸)를 아무도 못 봤다
 - **단계별 지연 계측(구간 아홉)** — L2 판정 8.4~10.1초 · 초안 2.1~2.5초 · **L1 게이트 0.5 ms**.
@@ -782,4 +782,4 @@ uv run uvicorn reply_gate.api:app --reload   # http://127.0.0.1:8000
 | [`data/promoted_baseline.json`](data/promoted_baseline.json) | **승격 기준선 참조** — 회귀 판정을 구속하는 유일한 기준선. **사람만 바꾼다**(구조 테스트가 쓰기 경로를 막는다) |
 | [`scripts/handcalc_adoption_axis.py`](scripts/handcalc_adoption_axis.py) | 채택 축 손계산 산출물 — **무과금·오프라인**, 커밋된 검색 리포트만 읽는다 |
 | [`scripts/seed_orders.py`](scripts/seed_orders.py) · [`scripts/index_policies.py`](scripts/index_policies.py) | 시딩 · 인덱싱 |
-| [`tests/`](tests/) | **1,507건** (그중 DB 통합 **178건**) |
+| [`tests/`](tests/) | **1,816건** (그중 DB 통합 **233건**) |

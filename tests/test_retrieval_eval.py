@@ -38,6 +38,7 @@ from reply_gate.retrieval_eval import (
     evaluate_strategy_ladder,
     retrieve_cases,
     retrieve_strategy_ladder,
+    run_chunking_comparison,
     run_embedding_model_axis,
     run_retrieval_comparison,
     score_retrieval,
@@ -52,6 +53,7 @@ from reply_gate.testing import LexicalEmbeddingClient
 
 class _FixedEmbedder:
     def __init__(self, vectors: dict[str, list[float]]) -> None:
+        self.model = "fixed"
         self._vectors = vectors
         self.calls: list[tuple[str, tuple[str, ...]]] = []
 
@@ -192,6 +194,7 @@ def test_embedding_cache_reuses_same_text_and_invalidates_changed_policy(
         config=config,
         cache_dir=tmp_path,
     )
+    embedder.model = "fixed-v2"
     retrieve_cases(
         queries=queries,
         policy_texts=(("policy:a:1", "정책 A"), ("policy:b:1", "정책 B 변경")),
@@ -236,7 +239,7 @@ def test_단일_설정_리포트는_30건을_싣고_같은_이름을_덮어쓰�
             for document in documents
             for chunk in document.chunks
         ),
-        embedder=LexicalEmbeddingClient(dimensions=64),
+        embedder=LexicalEmbeddingClient(dimensions=64, model=STUB_EMBEDDING_MODEL),
         config=config,
         cache_dir=tmp_path / "cache",
     )
@@ -396,8 +399,8 @@ def test_리랭크_과금_미승인이면_그_단만_사유와_함께_미측정�
     """무과금이라고 안내한 실행이 조용히 과금하지 않고, 빈 자리를 0 으로 채우지도 않는다."""
     paths = run_retrieval_comparison(
         live=True,
-        embedding_model="local-fake",
-        embedding_client=LexicalEmbeddingClient(dimensions=32),
+        embedding_model="stub:local-fake",
+        embedding_client=LexicalEmbeddingClient(dimensions=32, model="stub:local-fake"),
         paid_rerank=False,
         cutoff=0.10,
         sweep_start=0.10,
@@ -600,7 +603,7 @@ def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_c
         cases=cases,
         labels=load_retrieval_labels(),
         rewritten_queries={case.id: f"{case.content} 재작성" for case in cases},
-        embedder=LexicalEmbeddingClient(dimensions=32),
+        embedder=LexicalEmbeddingClient(dimensions=32, model=STUB_EMBEDDING_MODEL),
         embedding_config=RetrievalEvalConfig(
             model="lexical-2gram-v1",
             dimensions=32,
@@ -940,3 +943,63 @@ def test_대역_임베딩_구현은_모델_버전_문자열에_고정된다() ->
         0.577350269,
         0.577350269,
     ]
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_다른_모델의_임베더는_캐시_읽기와_쓰기_전에_거부한다(
+    tmp_path: Path, warm_cache: bool
+) -> None:
+    """차원이 같아도 다른 모델의 벡터를 선언 모델 캐시로 재사용하면 안 된다."""
+    embedder = _FixedEmbedder({"정책": [1.0, 0.0], "문의": [1.0, 0.0]})
+    kwargs: dict[str, Any] = dict(
+        queries=(RetrievalQuery(case_id="G", text="문의"),),
+        policy_texts=(("policy:a:1", "정책"),),
+        embedder=embedder,
+        config=RetrievalEvalConfig(model="fixed", dimensions=2),
+        cache_dir=tmp_path / "cache",
+    )
+    if warm_cache:
+        retrieve_cases(**kwargs)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*.json")}
+    embedder.model = "another-model"
+    embedder.calls.clear()
+    with pytest.raises(ValueError, match="모델"):
+        retrieve_cases(**kwargs)
+    assert embedder.calls == []
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*.json")} == before
+
+
+def test_주입_임베더의_모델을_검색_리포트와_캐시에_추론한다(tmp_path: Path) -> None:
+    """주입 클라이언트가 있는데 환경 기본 모델 이름으로 캐싱하지 않는다."""
+    paths = run_retrieval_comparison(
+        live=True,
+        embedding_client=LexicalEmbeddingClient(dimensions=8, model="stub:local-test"),
+        paid_rerank=False,
+        strategies=(StrategyDefinition("vector", (RetrievalStage.VECTOR,)),),
+        output_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+    )
+    payload = json.loads(paths.json.read_text())
+    assert payload["configuration"]["embedding_model"] == "stub:local-test"
+    cached = [json.loads(p.read_text()) for p in (tmp_path / "cache").glob("*.json")]
+    assert cached and all(row["model"] == "stub:local-test" for row in cached)
+
+
+@pytest.mark.parametrize("chunking", [False, True])
+def test_명시한_모델과_주입_클라이언트가_다르면_비교를_거부한다(
+    tmp_path: Path, chunking: bool
+) -> None:
+    """명시 모델은 실제 클라이언트의 provenance를 덮어쓸 수 없다."""
+    kwargs: dict[str, Any] = dict(
+        live=True,
+        embedding_model="declared",
+        embedding_client=_CandidateEmbedder(2, "actual"),
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "reports",
+    )
+    with pytest.raises(ValueError, match="모델"):
+        if chunking:
+            run_chunking_comparison(**kwargs)
+        else:
+            run_retrieval_comparison(**kwargs, paid_rerank=False)
+    assert not list(tmp_path.rglob("*.json"))

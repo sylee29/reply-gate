@@ -33,6 +33,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
+from math import isfinite
 from time import perf_counter
 from typing import Any, Protocol, cast
 
@@ -41,6 +42,8 @@ import openai
 from anthropic.types import Message
 from openai.types.responses import Response
 from pydantic import SecretStr
+
+from reply_gate.contracts import has_unstorable_characters
 
 __all__ = [
     "AnthropicGenerationClient",
@@ -185,6 +188,11 @@ class LLMCallError(RuntimeError):
 class LLMFormatError(ValueError):
     """구조화 출력이 기대 형식과 다름. 재시도 정책은 호출자가 정한다.
 
+    원문에 NUL/lone surrogate가 있으면 저장 가능한 진단 표현으로 보존한다:
+    [Unicode escaped raw text] 뒤 ASCII 표현을 unicode_escape로 해석하면 코드포인트가
+    정확히 복원된다. JSON 재해석과 달리 literal surrogate pair 두 개를 하나로 합치지 않는다.
+    안전한 원문은 접두어처럼 보여도 그대로 둔다. 접두어만 보고 자동 복원하지 않는다.
+
     원문(`raw_text`)과 토큰 사용량을 함께 실어 보낸다 — 초안 생성은 재시도하지 않고
     이 산출을 그대로 L1 에 넘겨 `schema_violation` 으로 판정시키기 때문이다
     (docs/standards.md "재시도 상한").
@@ -212,7 +220,11 @@ class LLMFormatError(ValueError):
         super().__init__(f"구조화 출력 형식 불일치 (stage={stage}): {detail}")
         self.stage = stage
         self.detail = detail
-        self.raw_text = raw_text
+        self.raw_text = (
+            "[Unicode escaped raw text] " + raw_text.encode("unicode_escape").decode("ascii")
+            if has_unstorable_characters(raw_text)
+            else raw_text
+        )
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.transport_attempts = transport_attempts
@@ -351,6 +363,29 @@ def _call_with_one_retry[T](
     ) from last
 
 
+def _finite_json_float(value: str) -> float:
+    """비표준 NaN/Infinity와 유효 숫자 표기의 float 오버플로를 함께 거부한다."""
+    number = float(value)
+    if not isfinite(number):
+        raise ValueError("JSON 숫자는 유한해야 한다")
+    return number
+
+
+def _require_storable_json_strings(data: object) -> None:
+    """JSON의 모든 문자열을 검사한다. 깊은 입력도 추가 재귀 한계를 만들지 않는다."""
+    pending = [data]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            if has_unstorable_characters(value):
+                raise ValueError("JSON 문자열에 저장할 수 없는 문자가 있다")
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
 def _parse_json_completion(
     *,
     stage: str,
@@ -380,8 +415,10 @@ def _parse_json_completion(
             elapsed_ms=elapsed_ms,
         )
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
+        data = json.loads(text, parse_constant=_finite_json_float, parse_float=_finite_json_float)
+        _require_storable_json_strings(data)
+    except (ValueError, RecursionError) as exc:
+        # JSONDecodeError뿐 아니라 정수 자릿수·중첩 깊이 제한도 모델 산출의 파싱 실패다.
         raise LLMFormatError(
             stage=stage,
             detail=f"JSON 파싱 실패: {exc}",

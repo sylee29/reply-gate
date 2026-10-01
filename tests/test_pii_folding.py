@@ -284,10 +284,33 @@ def test_패턴마다_접기가_따로_붙어_있다() -> None:
     """접기는 패턴별이다 — 번호 계열 넷과 이메일이 서로 다른 접기를 든다."""
     folds = {pattern.name: pattern.fold for pattern in DEFAULT_PII_PATTERNS}
 
-    assert folds["email"] is fold_for_detection
+    assert folds["email"]("hong@example.com입니다.") == "hong@example.com 입니다."
+    assert folds["email"]("customer_email=hong@example.com입니다") == (
+        "customer_email=hong@example.com입니다"
+    )
     assert {name for name, _template in NUMBER_FAMILIES} <= set(folds)
     for name, _template in NUMBER_FAMILIES:
         assert folds[name] is fold_numeric_for_detection
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hong@example.com입니다.",
+        "customer_email=hong@example.com입니다",
+        "<hong@example.com입니다>",
+        "support@쇼핑몰.한국",
+    ],
+)
+def test_이메일_산문_경계도_근거_필터와_게이트가_같은_정의를_쓴다(text: str) -> None:
+    """산문 접미사를 분리해도 이메일 자체는 PII이며 계산 근거로 승인되지 않는다."""
+    assert pii_shaped(text)
+    _, evidence_text = _sql_evidence_texts(
+        sql="SELECT '…' AS computed FROM orders",
+        rows=({"computed": text},),
+        pii_safe_output_columns=(),
+    )
+    assert "computed=" not in evidence_text
 
 
 # ── 반대 방향 구멍 — 이메일은 지금의 접기를 유지한다 ────────────────────────

@@ -90,6 +90,8 @@ LIVE_SERIES_PREFIX: Final = "evaluation-live"
 #: 허용 캐스트 타입·PII 유래 승인)의 판 · 검색 정렬의 tie-break · 기권 게이트의 미정의
 #: 처리 방식. **이 확장은 그 이전에 커밋된 라이브 전부를 그 항목 "미상"으로 만든다** —
 #: 대조 계보가 한 번 끊기는 대가를 재등재 시점에 치른 것이다.
+#: L2 산출 해석 규칙은 별도 판이다. 과거 프롬프트 지문으로 추정하지 않아 옛 값은 미상이고,
+#: 새 세트 편입에는 이 값까지 알려진 동일성을 요구한다. 기존 승격 참조는 소급 수정하지 않는다.
 FINGERPRINT_FIELDS: Final[tuple[str, ...]] = (
     "label_version",
     "retrieval_labels_version",
@@ -107,6 +109,7 @@ FINGERPRINT_FIELDS: Final[tuple[str, ...]] = (
     "judge_effort",
     "judge_thinking",
     "judge_prompt_version",
+    "judge_rule_version",
     "judge_fixture_version",
     "judge_prompt_caching",
     "draft_rule_version",
@@ -978,6 +981,7 @@ JUDGING_FINGERPRINT_FIELDS: Final[frozenset[str]] = frozenset(
         "judge_model",
         "judge_effort",
         "judge_prompt_version",
+        "judge_rule_version",
         "judge_fixture_version",
         "judge_prompt_caching",
     }
