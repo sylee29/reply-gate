@@ -4,11 +4,10 @@ docs/security.md "text-to-SQL 안전장치" 1번(read-only DB 계정)의 코드 
 실행 경로는 반드시 `readonly_connect()` 를 쓴다 — 권한 자체가 SELECT 뿐이라 실수로
 쓰기 경로를 타도 DB 가 거부한다.
 
-DSN 은 `reply_gate.config.Settings` 가 만들고 **비밀 전용 타입으로 내놓는다**. 그래서 이
-모듈에 평문으로 꺼내는 자리가 정확히 **한 줄** 생긴다 — psycopg 에 넘기기 직전이다. 그 한
-줄이 이 모듈에서 비밀번호가 문자열이 되는 유일한 자리이고, 그 밖의 어디에도 DSN 을 그대로
-싣지 않는다. 오류 메시지·로그에 쓰는 접속 대상 설명은 비밀번호를 아예 담지 않는다
-(`describe_target`).
+비밀번호는 psycopg 의 개별 연결 인자로 넘기기 직전 **한 줄**에서만 꺼낸다. 비밀번호 포함
+URI 는 호스트 파싱 실패가 URI 전체를 오류에 싣는 경로이므로 연결에 쓰지 않는다. 드라이버
+연결 예외도 비민감 진단으로 바꾸며 원래 예외 연결을 표시하지 않는다. 접속 대상 설명에는
+비밀번호를 담지 않는다(`describe_target`).
 """
 
 from __future__ import annotations
@@ -53,18 +52,32 @@ def connect(
     생기지 않는다.
     """
     settings = settings if settings is not None else get_settings()
-    # 이 모듈에서 비밀번호가 평문 문자열이 되는 **유일한 줄**이다 — psycopg 에 넘기기 직전.
-    dsn = (settings.readonly_database_url if readonly else settings.database_url).get_secret_value()
-    options = (
-        None if statement_timeout_ms is None else f"-c statement_timeout={statement_timeout_ms:d}"
-    )
-    return psycopg.connect(
-        dsn,
-        row_factory=dict_row,
-        autocommit=autocommit,
-        connect_timeout=connect_timeout,
-        options=options,
-    )
+    if statement_timeout_ms is not None and statement_timeout_ms <= 0:
+        raise ValueError("statement_timeout_ms 는 양수여야 한다")
+    if readonly and settings.postgres_app_user == settings.postgres_ro_user:
+        raise ValueError("앱 계정과 읽기전용 계정은 서로 달라야 한다")
+    options = []
+    if statement_timeout_ms is not None:
+        options.append(f"-c statement_timeout={statement_timeout_ms:d}")
+    if readonly:
+        # SQL 가드가 검사한 일반 문자열 리터럴과 Postgres 해석을 같게 고정한다.
+        options.append("-c standard_conforming_strings=on")
+    password = settings.postgres_ro_password if readonly else settings.postgres_app_password
+    try:
+        return psycopg.connect(
+            host=settings.postgres_host,
+            port=settings.postgres_port,
+            dbname=settings.postgres_db,
+            user=settings.postgres_ro_user if readonly else settings.postgres_app_user,
+            password=password.get_secret_value(),
+            row_factory=dict_row,
+            autocommit=autocommit,
+            connect_timeout=connect_timeout,
+            options=" ".join(options) or None,
+        )
+    except psycopg.Error as exc:
+        # 드라이버 문면에는 conninfo 가 들어갈 수 있다. 타입은 보존하고 내용·연결은 감춘다.
+        raise type(exc)(f"Postgres 연결 실패 ({type(exc).__name__})") from None
 
 
 def readonly_connect(

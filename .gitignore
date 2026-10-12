@@ -21,8 +21,7 @@ venv/
 
 # dryforge 로컬 작업 공간
 .dryforge/
-.dryforge/worktrees/
-.dryforge/backup/
+# worktrees/ · backups/ 를 포함해 로컬 사이클 자료 전체를 제외한다.
 .scratch/
 
 # 산출물 — 라이브 실측 리포트만 추적한다.

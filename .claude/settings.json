@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/ian/.local/bin/uv run --project /Users/ian/workspace/reject-bench python -m rejectbench.wrapper --guard \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect-live-reports.sh\"",
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/protect-live-reports.sh\"",
             "timeout": 10,
             "statusMessage": "라이브 리포트 불변식 확인"
           }
