@@ -59,6 +59,7 @@ __all__ = [
     "OptionalEmbeddingDependencyError",
     "accumulate_optional_ms",
     "accumulate_optional_tokens",
+    "validate_embedding_vectors",
 ]
 
 #: 최초 호출 + 재시도 1회 = 최대 2회 전송 시도 (docs/standards.md "재시도 상한").
@@ -272,6 +273,24 @@ class EmbeddingResult:
     elapsed_ms: float = 0.0
 
 
+def validate_embedding_vectors(
+    vectors: Sequence[Sequence[float]], *, count: int, dimensions: int
+) -> None:
+    """provider·캐시·주입 임베더에 같은 수치 계약을 적용한다."""
+    if len(vectors) != count:
+        raise ValueError("임베딩 개수가 입력 텍스트 수와 다르다")
+    for vector in vectors:
+        if len(vector) != dimensions:
+            raise ValueError("임베딩 차원이 구성과 다르다")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value)
+            for value in vector
+        ):
+            raise ValueError("임베딩 값은 유한한 숫자여야 한다")
+        if not any(value != 0 for value in vector):
+            raise ValueError("임베딩은 영벡터일 수 없다")
+
+
 class GenerationClient(Protocol):
     """생성 LLM 클라이언트 계약 — 실제 구현과 테스트 대역이 공유한다."""
 
@@ -386,6 +405,15 @@ def _require_storable_json_strings(data: object) -> None:
             pending.extend(value)
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON 객체에 중복 키가 있다")
+        result[key] = value
+    return result
+
+
 def _parse_json_completion(
     *,
     stage: str,
@@ -415,7 +443,12 @@ def _parse_json_completion(
             elapsed_ms=elapsed_ms,
         )
     try:
-        data = json.loads(text, parse_constant=_finite_json_float, parse_float=_finite_json_float)
+        data = json.loads(
+            text,
+            parse_constant=_finite_json_float,
+            parse_float=_finite_json_float,
+            object_pairs_hook=_unique_json_object,
+        )
         _require_storable_json_strings(data)
     except (ValueError, RecursionError) as exc:
         # JSONDecodeError뿐 아니라 정수 자릿수·중첩 깊이 제한도 모델 산출의 파싱 실패다.
@@ -790,9 +823,16 @@ class OpenAIEmbeddingClient:
             is_transport_error=_is_openai_transport_error,
             is_api_error=_is_openai_api_error,
         )
+        indices = [item.index for item in response.data]
+        if any(type(index) is not int for index in indices) or sorted(indices) != list(
+            range(len(inputs))
+        ):
+            raise ValueError("임베딩 응답 index는 입력 범위와 정확히 일치해야 한다")
         ordered = sorted(response.data, key=lambda item: item.index)
+        vectors = [list(item.embedding) for item in ordered]
+        validate_embedding_vectors(vectors, count=len(inputs), dimensions=self._dimensions)
         return EmbeddingResult(
-            vectors=[list(item.embedding) for item in ordered],
+            vectors=vectors,
             total_tokens=response.usage.total_tokens,
             elapsed_ms=elapsed,
         )
@@ -852,9 +892,12 @@ class BgeM3EmbeddingClient:
         for vector in raw:
             if not isinstance(vector, list) or len(vector) != self.DIMENSIONS:
                 raise ValueError(f"BGE-M3 임베딩은 {self.DIMENSIONS}차원이어야 한다")
-            if any(not isinstance(value, int | float) for value in vector):
+            if any(
+                isinstance(value, bool) or not isinstance(value, int | float) for value in vector
+            ):
                 raise ValueError("BGE-M3 임베딩 값은 숫자여야 한다")
             vectors.append([float(value) for value in vector])
+        validate_embedding_vectors(vectors, count=len(texts), dimensions=self.DIMENSIONS)
         # 로컬 추론은 provider 토큰 과금이 없으므로 기존 EmbeddingResult 계약에서 0이다.
         # **시간은 0 이 아니다** — 과금이 없다는 것과 시간을 쓰지 않았다는 것은 다르다.
         return EmbeddingResult(vectors=vectors, total_tokens=0, elapsed_ms=_elapsed_ms(started))
