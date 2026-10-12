@@ -176,7 +176,7 @@
     </div>
     <div class="field">
       <label for="phone-last4">전화번호 뒷자리 (선택)</label>
-      <input id="phone-last4" name="phone_last4" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off">
+      <input id="phone-last4" name="phone_last4" inputmode="numeric" pattern="[0-9]{4}|[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*" maxlength="4" autocomplete="off">
       <p class="hint">생략하면 상품을 확인한 뒤 개인정보를 제외한 안내를 받습니다.</p>
     </div>
     <div class="field">
