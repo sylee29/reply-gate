@@ -137,12 +137,6 @@ def test_기본_설정이_결정_0014_가_고른_구성을_그대로_들고_있�
     assert settings.vector_top_k == 5
 
 
-def test_설정이_조립한_게이트가_통계량과_tau_를_그대로_싣는다() -> None:
-    gate = declared_settings().abstention_gate()
-
-    assert gate == AbstentionGate(statistic=AbstentionStatistic.SPREAD, tau=0.06)
-
-
 def test_스위치를_끄면_게이트가_아예_조립되지_않는다() -> None:
     """끄기는 설정 한 줄이다 — 원복 범위가 게이트 하나로 남는다(결정 0011)."""
     assert declared_settings(abstention_gate_enabled=False).abstention_gate() is None

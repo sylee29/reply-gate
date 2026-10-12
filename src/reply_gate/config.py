@@ -94,8 +94,6 @@ class Settings(BaseSettings):
     # ── 모델 ────────────────────────────────────────────────────────────────
     # 생성 LLM 모델 등급은 조정 가능 기본값 (docs/operations.md "환경 변수").
     generation_model: str = "gpt-5.6-terra"
-    #: 합성 데이터 1회 제작에만 쓰는 상위 모델. 런타임 경로에는 쓰지 않는다.
-    bulk_generation_model: str = "gpt-5.6-sol"
     generation_effort: str | None = None
     #: **이 값을 바꾸면 `abstention_tau` 는 따라오지 않는다.** τ 는 임베딩 모델에 묶인
     #: 조건 종속 인자이고, `text-embedding-3-small` d1536 밖에서는 이전되지 않는다 —

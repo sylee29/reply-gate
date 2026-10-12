@@ -91,7 +91,6 @@ __all__ = [
     "INTENT_STAGE",
     "INTENT_SYSTEM_PROMPT",
     "ORDER_EXISTS_SQL",
-    "SPAN_GATE",
     "SPAN_NAMES",
     "SPAN_POLICY_SEARCH",
     "SPAN_SQL_EXECUTION",
@@ -169,12 +168,12 @@ CONTENT_ROW_LIMIT: Final = 10
 # 바깥에서 감싸면 그 여섯이 한 칸으로 접힌다. 그래서 계측이 이 모듈 안까지 들어오고,
 # 결과 묶음(`EvidenceCollection`)이 구간 시간을 함께 들고 나온다.
 
-#: 코드만 도는 구간 셋의 이름. **밖으로 나가는 구간 여섯은 단계 이름을 그대로 쓴다**
+#: 코드만 도는 구간 셋 중 이 모듈이 재는 둘의 이름 — 게이트 판정은 파이프라인이
+#: `StageDurations.gate_ms` 칸에 직접 싣는다. **밖으로 나가는 구간 여섯은 단계 이름을 그대로 쓴다**
 #: (`INTENT_STAGE`·`QUERY_REWRITE_STAGE`·`INQUIRY_EMBEDDING_STAGE`·`SQL_GENERATION_STAGE`·
 #: `draft.DRAFT_STAGE`·`pipeline.L2_JUDGE_STAGE`) — 이름을 두 벌로 두면 한쪽만 바뀐다.
 SPAN_POLICY_SEARCH: Final = "policy_search"
 SPAN_SQL_EXECUTION: Final = "sql_execution"
-SPAN_GATE: Final = "gate"
 
 
 @dataclass(frozen=True)
@@ -898,10 +897,6 @@ class EvidenceCollection:
     #: 0 이 아니라 미측정(`None`)이다. 초안·게이트·판정 세 칸은 여기서 늘 미측정이고
     #: 파이프라인이 채운다.
     stage_durations: StageDurations = field(default_factory=StageDurations)
-
-    @property
-    def escalated(self) -> bool:
-        return self.escalation_reason is not None
 
 
 @dataclass

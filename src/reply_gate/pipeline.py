@@ -310,10 +310,6 @@ class ProcessedInquiry:
     #: 안쪽에서 재고 서로 겹치지 않는다). **DB 에도 HTTP 응답에도 싣지 않는다.**
     stage_durations: StageDurations = field(default_factory=StageDurations)
 
-    @property
-    def escalated(self) -> bool:
-        return self.status is InquiryStatus.ESCALATED
-
 
 # ── 협력자 계약 (테스트가 대역으로 갈아 끼울 수 있게 Protocol 로) ───────────
 

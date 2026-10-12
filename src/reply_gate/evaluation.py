@@ -339,10 +339,6 @@ class L1Outcome:
     actual_reasons: tuple[RejectReason, ...]
 
     @property
-    def verdict_matched(self) -> bool:
-        return self.expected_verdict is self.actual_verdict
-
-    @property
     def reasons_matched(self) -> bool:
         """사유 목록이 **순서까지** 같은가. L1 은 결정론이므로 순서도 계약이다."""
         return self.expected_reasons == self.actual_reasons
@@ -2290,27 +2286,23 @@ def build_report(
     pipeline: PipelineAgreement | SkippedMeasurement,
     judge_accuracy: JudgeAccuracy | SkippedMeasurement,
     retrieval_labels_path: Path | None = None,
-    regression_guard: RegressionGuard | GuardUnavailable | None = None,
 ) -> EvaluationReport:
     """리포트를 조립한다. **측정 3 도 명시해야 한다** — 기본값으로 비워 두면 미실행이
     조용히 "사유 없는 미실행"으로 찍힌다.
 
     회귀 가드는 리포트 JSON 을 입력으로 쓰므로 조립 뒤에 붙이는 것이 자연스럽다 —
-    `attach_regression_guard` 가 그 순서를 들고 있다. 여기서 넘기지 않으면 가드 절은
+    `attach_regression_guard` 가 그 순서를 들고 있다. 그것을 거치지 않으면 가드 절은
     **미산출 + 사유**로 남는다."""
     failure_attribution = _build_failure_attribution(
         pipeline=pipeline,
         retrieval_labels_path=retrieval_labels_path,
     )
-    report = EvaluationReport(
+    return EvaluationReport(
         conditions=conditions,
         gate_accuracy=gate_accuracy,
         pipeline=pipeline,
         judge_accuracy=judge_accuracy,
         failure_attribution=failure_attribution,
-    )
-    return (
-        report if regression_guard is None else replace(report, regression_guard=regression_guard)
     )
 
 

@@ -500,10 +500,6 @@ class OpenAIGenerationClient:
         )
         self._model = model
 
-    @property
-    def model(self) -> str:
-        return self._model
-
     def complete_json(
         self,
         *,

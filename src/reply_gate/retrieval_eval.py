@@ -111,7 +111,6 @@ __all__ = [
     "RerankStats",
     "RetrievalConfigurationError",
     "RetrievalEvalConfig",
-    "RetrievalEvaluation",
     "RetrievalQuery",
     "RetrievalScore",
     "RetrievedCase",
@@ -140,7 +139,6 @@ __all__ = [
     "score_retrieval",
     "score_strategy_ladder",
     "write_chunking_report",
-    "write_report",
     "write_strategy_report",
 ]
 
@@ -739,16 +737,6 @@ class CutoffSweepPoint:
     macro_f1: float | None
     precision_case_count: int
     recall_case_count: int
-
-
-@dataclass(frozen=True)
-class RetrievalEvaluation:
-    """한 벡터 구성의 기본 컷 결과, 컷 스윕, 최적점."""
-
-    config: RetrievalEvalConfig
-    score: RetrievalScore
-    sweep: tuple[CutoffSweepPoint, ...]
-    best_cutoff: float | None
 
 
 @dataclass(frozen=True)
@@ -1893,28 +1881,6 @@ def _score(value: float | None) -> str:
     return "미측정" if value is None else f"{value:.6f}"
 
 
-def _report_slug(config: RetrievalEvalConfig) -> str:
-    mode = "stub" if config.is_stub else "live"
-    model = re.sub(r"[^a-z0-9]+", "-", config.model.lower()).strip("-") or "model"
-    cutoff = f"{round(config.cutoff * 100):03d}"
-    return f"vector-{mode}-{model}-d{config.dimensions}-k{config.top_k}-c{cutoff}"
-
-
-def _report_paths(output_dir: Path, config: RetrievalEvalConfig, suffix: int | None) -> ReportPaths:
-    ending = "" if suffix is None else f"-{suffix}"
-    stem = f"retrieval-{_report_slug(config)}{ending}"
-    return ReportPaths(markdown=output_dir / f"{stem}.md", json=output_dir / f"{stem}.json")
-
-
-def _next_report_paths(output_dir: Path, config: RetrievalEvalConfig) -> ReportPaths:
-    suffix: int | None = None
-    while True:
-        paths = _report_paths(output_dir, config, suffix)
-        if not paths.markdown.exists() and not paths.json.exists():
-            return paths
-        suffix = 2 if suffix is None else suffix + 1
-
-
 def _metrics_json(metrics: AggregateMetrics) -> dict[str, float | int | None]:
     return {
         "recall_at_1": metrics.recall_at_1,
@@ -1925,183 +1891,6 @@ def _metrics_json(metrics: AggregateMetrics) -> dict[str, float | int | None]:
         "precision_case_count": metrics.precision_case_count,
         "recall_case_count": metrics.recall_case_count,
     }
-
-
-def _json_report(evaluation: RetrievalEvaluation) -> dict[str, object]:
-    config = evaluation.config
-    return {
-        "configuration": {
-            "strategy": "vector_only",
-            "model": config.model,
-            "dimensions": config.dimensions,
-            "top_k": config.top_k,
-            "cutoff": config.cutoff,
-            "cutoff_sweep": list(config.cutoff_sweep),
-            "stub": config.is_stub,
-        },
-        "run_conditions": {
-            "database_used": False,
-            "labels_used_for_retrieval": False,
-            "warning": (
-                "결정론 어휘 임베딩 대역 수치는 실제 검색 품질이 아니다. "
-                "외부 호출 없는 배관 검증용이다."
-                if config.is_stub
-                else None
-            ),
-        },
-        "aggregate": _metrics_json(evaluation.score.aggregate),
-        "sweep": [
-            {
-                "cutoff": point.cutoff,
-                "accepted_precision": point.accepted_precision,
-                "accepted_recall": point.accepted_recall,
-                "macro_f1": point.macro_f1,
-                "precision_case_count": point.precision_case_count,
-                "recall_case_count": point.recall_case_count,
-            }
-            for point in evaluation.sweep
-        ],
-        "best_cutoff": evaluation.best_cutoff,
-        "best_cutoff_selection": ("macro F1 최대, 동률이면 precision, recall, 높은 cutoff 순"),
-        "cases": [
-            {
-                "id": case.case_id,
-                "relevant_evidence_ids": sorted(case.relevant_evidence_ids),
-                "recall_at_1": case.recall_at_1,
-                "recall_at_3": case.recall_at_3,
-                "recall_at_5": case.recall_at_5,
-                "accepted_precision": case.accepted_precision,
-                "accepted_recall": case.accepted_recall,
-                "accepted_hits": [
-                    {
-                        "rank": hit.rank,
-                        "evidence_id": hit.evidence_id,
-                        "similarity": hit.similarity,
-                    }
-                    for hit in case.accepted_hits
-                ],
-                "ranked_hits": [
-                    {
-                        "rank": hit.rank,
-                        "evidence_id": hit.evidence_id,
-                        "similarity": hit.similarity,
-                    }
-                    for hit in case.ranked_hits
-                ],
-            }
-            for case in evaluation.score.cases
-        ],
-    }
-
-
-def _markdown_report(evaluation: RetrievalEvaluation) -> str:
-    config = evaluation.config
-    aggregate = evaluation.score.aggregate
-    # 조항 수는 실제 주입된 코퍼스에서 읽는다 — 하드코딩하면 축소 코퍼스 실행에서 거짓이 된다.
-    corpus_size = max((len(case.ranked_hits) for case in evaluation.score.cases), default=0)
-    lines = [
-        "# 정책 검색 비교 — 벡터 단독",
-        "",
-        "## 실행 조건",
-        "",
-        "- 전략: 벡터 단독 (DB 미사용, 메모리 코사인 유사도)",
-        f"- 임베딩: `{config.model}` ({config.dimensions}차원)",
-        f"- top_k: {config.top_k}",
-        f"- 채택 코사인 컷: {config.cutoff:.2f}",
-        "- 라벨 사용 경계: 검색 완료 뒤 채점 단계에서만 사용",
-    ]
-    if config.is_stub:
-        lines.extend(
-            [
-                "- **경고: 결정론 어휘 임베딩 대역 수치는 실제 검색 품질이 아니다. "
-                "외부 호출 없는 배관 검증용이다.**",
-                "- 대역 실행 조건: `testing.LexicalEmbeddingClient`, 과금 0회, DB 0회",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "## 기본 컷 집계",
-            "",
-            "| metric | macro value | denominator cases |",
-            "|---|---:|---:|",
-            f"| recall@1 | {_number(aggregate.recall_at_1)} | {aggregate.recall_case_count} |",
-            f"| recall@3 | {_number(aggregate.recall_at_3)} | {aggregate.recall_case_count} |",
-            f"| recall@5 | {_number(aggregate.recall_at_5)} | {aggregate.recall_case_count} |",
-            "| accepted precision | "
-            f"{_number(aggregate.accepted_precision)} | {aggregate.precision_case_count} |",
-            "| accepted recall | "
-            f"{_number(aggregate.accepted_recall)} | {aggregate.recall_case_count} |",
-            "",
-            "## 컷 스윕",
-            "",
-            "최적점은 macro F1 최대, 동률이면 precision, recall, 높은 cutoff 순이다.",
-            f"선택된 최적 컷: {_number(evaluation.best_cutoff)}",
-            "",
-            "| cutoff | precision | recall | macro F1 | precision n | recall n |",
-            "|---:|---:|---:|---:|---:|---:|",
-        ]
-    )
-    for point in evaluation.sweep:
-        lines.append(
-            f"| {point.cutoff:.2f} | {_number(point.accepted_precision)} | "
-            f"{_number(point.accepted_recall)} | {_number(point.macro_f1)} | "
-            f"{point.precision_case_count} | {point.recall_case_count} |"
-        )
-    lines.extend(
-        [
-            "",
-            "## 케이스별 결과",
-            "",
-            f"`전체 순위`는 임계값과 top_k를 적용하기 전 {corpus_size}개 조항의 순위다. "
-            "`컷 통과`는 top_k 안에서 구성 컷을 넘은 조항이다.",
-            "",
-            "| case | relevant | r@1/3/5 | cutoff precision/recall | 컷 통과 | 전체 순위 |",
-            "|---|---|---|---|---|---|",
-        ]
-    )
-    for case in evaluation.score.cases:
-        relevant = ", ".join(sorted(case.relevant_evidence_ids)) or "없음"
-        accepted = (
-            "<br>".join(
-                f"{hit.rank}. {hit.evidence_id} ({_score(hit.similarity)})"
-                for hit in case.accepted_hits
-            )
-            or "없음"
-        )
-        ranking = "<br>".join(
-            f"{hit.rank}. {hit.evidence_id} ({_score(hit.similarity)})" for hit in case.ranked_hits
-        )
-        lines.append(
-            f"| {case.case_id} | {relevant} | {_number(case.recall_at_1)} / "
-            f"{_number(case.recall_at_3)} / {_number(case.recall_at_5)} | "
-            f"{_number(case.accepted_precision)} / {_number(case.accepted_recall)} | "
-            f"{accepted} | {ranking} |"
-        )
-    return "\n".join(lines) + "\n"
-
-
-def write_report(evaluation: RetrievalEvaluation, *, output_dir: Path) -> ReportPaths:
-    """두 형식 보고서를 다음 사용 가능한 retrieval 이름에 써 기존 산출물을 보존한다."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    paths = _next_report_paths(output_dir, evaluation.config)
-    markdown = _markdown_report(evaluation)
-    json_text = json.dumps(_json_report(evaluation), ensure_ascii=False, indent=2) + "\n"
-    # 경로 선택 뒤에도 독점 생성 모드로 재확인해 스크립트 재실행/동시 실행의 덮어쓰기를 막는다.
-    created_markdown = False
-    try:
-        with paths.markdown.open("x", encoding="utf-8") as handle:
-            handle.write(markdown)
-        created_markdown = True
-        with paths.json.open("x", encoding="utf-8") as handle:
-            handle.write(json_text)
-    except FileExistsError:
-        # 동시 실행이 사이에 선점했다면 그 산출물은 건드리지 않고 다음 이름을 다시 찾는다.
-        # 이 실행이 먼저 만든 Markdown만 있는 경우에는 불완전한 쌍을 남기지 않는다.
-        if created_markdown:
-            paths.markdown.unlink(missing_ok=True)
-        return write_report(evaluation, output_dir=output_dir)
-    return paths
 
 
 def _strategy_hit_json(hit: RankedHit) -> dict[str, object]:

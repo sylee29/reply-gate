@@ -117,8 +117,8 @@
 
 ### 이 표에 없는 모델
 
-`config.py` 에는 `bulk_generation_model=gpt-5.6-sol` 과 `rerank_model=gpt-5.6-luna` 도 있다.
-둘 다 **아래 환산이 인용하는 리포트들의 실행 경로에 없다** — 제품 파이프라인은
+`config.py` 에는 `rerank_model=gpt-5.6-luna` 도 있다.
+이 모델은 **아래 환산이 인용하는 리포트들의 실행 경로에 없다** — 제품 파이프라인은
 `generation_model`·`embedding_model`·`judge_model` 셋만 부르고, rerank 는 오프라인 검색 전략
 비교 하네스(`retrieval_eval.py`)에만 있다. 그래서 단가를 조회하지 않았고 **여기 싣지 않는다.**
 그 계열의 비용을 말해야 할 일이 생기면 그때 기준일과 함께 새로 조회한다.

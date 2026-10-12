@@ -22,14 +22,12 @@ from reply_gate.retrieval_eval import (
     DEFAULT_EMBEDDING_CANDIDATES,
     DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
     STUB_EMBEDDING_MODEL,
-    CutoffSweepPoint,
     EmbeddingCandidate,
     EmbeddingProvider,
     RankedHit,
     ReportPaths,
     RetrievalConfigurationError,
     RetrievalEvalConfig,
-    RetrievalEvaluation,
     RetrievalQuery,
     RetrievedCase,
     RewriteCondition,
@@ -43,7 +41,6 @@ from reply_gate.retrieval_eval import (
     run_retrieval_comparison,
     score_retrieval,
     score_strategy_ladder,
-    write_report,
     write_strategy_report,
 )
 from reply_gate.retrieval_labels import RetrievalLabel, load_retrieval_labels
@@ -213,80 +210,6 @@ def test_embedding_cache_reuses_same_text_and_invalidates_changed_policy(
     ]
 
 
-def test_단일_설정_리포트는_30건을_싣고_같은_이름을_덮어쓰지_않는다(tmp_path: Path) -> None:
-    """`write_report` 의 렌더와 **덮어쓰기 방지**를 본다.
-
-    30건을 실제로 검색·채점해 리포트 문면을 만든다. 이전에는 `evaluate_retrieval` 이 이
-    조립을 대신했는데, 그 함수는 컷 스윕과 최적점 선택을 전략 사다리(`_sweep_point` ·
-    `_best_sweep_cutoff`)와 **중복 구현**하고 있었고 어떤 실행 경로도 부르지 않아 지웠다.
-    조립은 여기서 명시한다 — 스윕 값 자체는 사다리 쪽 검사가 들고 있으므로 여기서는
-    렌더 경로만 태운다.
-    """
-    config = RetrievalEvalConfig(
-        model="lexical-2gram-v1",
-        dimensions=64,
-        top_k=5,
-        cutoff=0.10,
-        is_stub=True,
-    )
-    documents = load_policy_documents()
-    retrieved = retrieve_cases(
-        queries=tuple(
-            RetrievalQuery(case_id=case.id, text=case.content) for case in load_golden_set()
-        ),
-        policy_texts=tuple(
-            (chunk.evidence_id, chunk.embedding_text)
-            for document in documents
-            for chunk in document.chunks
-        ),
-        embedder=LexicalEmbeddingClient(dimensions=64, model=STUB_EMBEDDING_MODEL),
-        config=config,
-        cache_dir=tmp_path / "cache",
-    )
-    labels = tuple(load_retrieval_labels())
-    score = score_retrieval(retrieved, labels, top_k=config.top_k, cutoff=config.cutoff)
-
-    def _point(cutoff: float) -> CutoffSweepPoint:
-        aggregate = score_retrieval(retrieved, labels, top_k=config.top_k, cutoff=cutoff).aggregate
-        return CutoffSweepPoint(
-            cutoff=cutoff,
-            accepted_precision=aggregate.accepted_precision,
-            accepted_recall=aggregate.accepted_recall,
-            # macro F1 의 정의는 사다리 쪽 한 곳이 소유한다 — 여기서 다시 쓰지 않는다.
-            macro_f1=None,
-            precision_case_count=aggregate.precision_case_count,
-            recall_case_count=aggregate.recall_case_count,
-        )
-
-    sweep = (_point(0.10), _point(0.30))
-    evaluation = RetrievalEvaluation(
-        config=config, score=score, sweep=sweep, best_cutoff=config.cutoff
-    )
-
-    assert len(evaluation.score.cases) == 30
-    assert all(len(case.ranked_hits) == 26 for case in evaluation.score.cases)
-
-    first = write_report(evaluation, output_dir=tmp_path / "reports")
-    markdown_before = first.markdown.read_text(encoding="utf-8")
-    json_before = first.json.read_text(encoding="utf-8")
-    second = write_report(evaluation, output_dir=tmp_path / "reports")
-
-    assert first.markdown.exists() and first.json.exists()
-    assert second.markdown.exists() and second.json.exists()
-    assert second.markdown.stem == f"{first.markdown.stem}-2"
-    assert second.json.stem == f"{first.json.stem}-2"
-    assert first.markdown.read_text(encoding="utf-8") == markdown_before
-    assert first.json.read_text(encoding="utf-8") == json_before
-    assert "실제 검색 품질이 아니다" in markdown_before
-    assert "결정론 어휘 임베딩 대역" in markdown_before
-    assert "G17" in markdown_before
-    assert "policy:support:4-1" in markdown_before
-    for case_id in ("G21", "G22", "G23", "G24"):
-        assert case_id in markdown_before
-    assert '"database_used": false' in json_before
-    assert '"labels_used_for_retrieval": false' in json_before
-
-
 def test_전략_리포트는_전략마다_컷_스윕과_최적점을_싣는다(tmp_path: Path) -> None:
     """컷 스윕이 산출물에 없으면 고정 컷 한 점 비교가 유일한 근거가 된다."""
     paths = run_retrieval_comparison(
@@ -324,8 +247,8 @@ def test_전략_리포트는_기존_산출물을_덮어쓰지_않는다(tmp_path
     바뀌지 않아야 한다. 재생성에 과금이 들고 확률 층이라 같은 값이 나오지 않으므로, 덮어쓰기는
     복구 불가능한 손실이다(하드 게이트 7).
 
-    이 검사는 오래 없었다 — 단일 설정 쪽 writer 의 검사가 이 writer 까지 덮는 것처럼 보이는
-    착시였고, 두 writer 는 이름 규칙도 재귀 지점도 다르다.
+    이 검사는 오래 없었다 — 단일 설정 쪽 writer(지금은 지웠다)의 검사가 이 writer 까지 덮는
+    것처럼 보이는 착시였고, 두 writer 는 이름 규칙도 재귀 지점도 달랐다.
 
     **이 검사가 붙잡는 층은 경로 선택기**(`_next_strategy_report_paths`)다. writer 의
     `open("x")` + `FileExistsError` 재귀는 **경쟁 상태** 방어라 순차 실행으로는 탈 수 없다.

@@ -140,14 +140,6 @@ def echo_rewrite(user_prompt: str) -> JsonCompletion:
     )
 
 
-def rewrite_completion(
-    text: str, *, input_tokens: int = 7, output_tokens: int = 3
-) -> JsonCompletion:
-    return JsonCompletion(
-        data={"rewritten": text}, input_tokens=input_tokens, output_tokens=output_tokens
-    )
-
-
 class StubCollector:
     """`EvidenceCollecting` 대역 — 정해진 수집 결과를 돌려주고 호출을 기록한다."""
 
