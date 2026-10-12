@@ -478,7 +478,7 @@ def test_승인된_직접_컬럼_값은_접기를_넓혀도_문면_그대로_남
         pii_safe_output_columns=("customer_phone",),
     )
 
-    assert evidence_text == f"1) customer_phone={value}"
+    assert evidence_text == f"1) customer_phone= {value}"
 
 
 def test_변종_구분자로_쓰인_근거는_지어낸_반각_번호의_출처가_되지_않는다() -> None:

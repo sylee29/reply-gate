@@ -151,7 +151,22 @@ def test_이메일_필드명과_동일한_localpart도_명시된_주소에서는
 
 
 @pytest.mark.parametrize(
-    "alias", ["contact", "연락처", "user_address", "contact(1)", "contact[primary]", "customer's"]
+    "alias",
+    [
+        "contact",
+        "연락처",
+        "user_address",
+        "contact(1)",
+        "contact[primary]",
+        "customer's",
+        "<contact>",
+        "[contact]",
+        "(contact)",
+        "a=b",
+        "contact primary",
+        '"contact"',
+        "x,y",
+    ],
 )
 @pytest.mark.parametrize("address", ["user@example.com", "a=user@example.com"])
 def test_실제_SQL_근거의_임의_별칭을_분리하되_이메일값은_한번만_분리한다(
@@ -159,7 +174,8 @@ def test_실제_SQL_근거의_임의_별칭을_분리하되_이메일값은_한�
 ) -> None:
     """직접 컬럼의 별칭은 렌더가 key=value로 만든다. local part의 다음 '='는 값이다."""
     order_no = "ORD-20260201-0001"
-    sql = f"SELECT customer_email AS \"{alias}\" FROM orders WHERE order_no = '{order_no}'"
+    quoted_alias = alias.replace('"', '""')
+    sql = f"SELECT customer_email AS \"{quoted_alias}\" FROM orders WHERE order_no = '{order_no}'"
     query = validate_sql(sql, order_no=order_no, max_rows=50)
     content, evidence_text = _sql_evidence_texts(
         sql=sql, rows=({alias: address},), pii_safe_output_columns=query.pii_safe_output_columns
