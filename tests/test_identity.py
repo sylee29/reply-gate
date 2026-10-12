@@ -12,7 +12,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg.rows import DictRow
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from reply_gate.api import InquiryRequest, InquiryService, ServiceOpener, app, get_service
 from reply_gate.contracts import EscalationReason, Evidence, EvidenceSource, RejectReason
@@ -585,7 +585,7 @@ def test_주문번호_숫자도_ASCII로_제한한다(number: str) -> None:
 def test_HMAC키는_접수와_확인에만_선검사하고_422를_가리지_않는다(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = declared_settings(l2_enabled=False)
+    settings = declared_settings(l2_enabled=False, phone_hmac_secret=SecretStr(""))
     monkeypatch.setattr("reply_gate.api.get_settings", lambda: settings)
     with TestClient(app) as client:
         assert client.post("/inquiries", json={"content": "문의"}).status_code == 503

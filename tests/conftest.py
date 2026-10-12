@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections import Counter
 from collections.abc import Iterator
 from typing import Any
@@ -23,6 +24,22 @@ from scripts.seed_orders import seed_orders
 
 from reply_gate.config import Settings, get_settings
 from reply_gate.db import connect, database_unavailable_reason, readonly_connect
+
+
+@pytest.fixture(scope="session", autouse=True)
+def temporary_identity_credentials() -> Iterator[None]:
+    """테스트 세션 전용 키. 개발자의 비밀·환경 설정 없이 문의 대역을 실행한다.
+
+    선언 기본값과 키 부재 검사는 빈 키를 명시한다. DB 설정 픽스처보다 먼저 캐시를
+    비우고, 세션 종료에는 원래 환경을 복원한 뒤 캐시까지 지운다.
+    """
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("PHONE_HMAC_SECRET", secrets.token_urlsafe(32))
+            get_settings.cache_clear()
+            yield
+    finally:
+        get_settings.cache_clear()
 
 
 class _DeclaredSettings(Settings):
