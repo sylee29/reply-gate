@@ -84,7 +84,15 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 ## 대표 흐름 — 주문 문의 1건
 
-1. `POST /inquiries {order_no, content}` → `api.py` 가 `pipeline.accept_inquiry` 로 넘긴다.
+`pipeline.run`은 의도 분류 전에 주문번호가 있는 모든 문의를 확인한다. 뒷자리 성공은 기존
+흐름으로, 생략·실재 주문은 상품명 확인 질문을 저장하고 대기 응답으로 끝낸다. 없는 주문·
+불일치·잠금은 같은 인계이며 분류·정책 검색을 부르지 않는다.
+`POST /inquiries/{id}/confirm`은 대기 행을 원자적으로 선점하고 true일 때만 아래 의도 분류부터
+이어 간다. 선점은 별도 짧은 트랜잭션으로 먼저 확정하며, 이후 오류도 선점을 되돌리지 않는다. 기존 ID의 결과·근거·시도 갱신은 한 트랜잭션이다. 개인정보 없는 경로의 축소 SQL
+화이트리스트는 근거 수집까지 전달하고, L1에만 빈 PII 허용목록을 넘긴다. 초안·L2에는 허용된
+근거를 그대로 유지한다. 실패 횟수는 앱 전용 DB 표에서 행 잠금으로 직렬화한다.
+
+1. `POST /inquiries {order_no, content, phone_last4?}` → `api.py` 가 `pipeline.accept_inquiry` 로 넘긴다.
    주문번호 형식이 틀리면 여기서 **422 로 끝난다** — 파이프라인에 들어가지 않는다.
 2. 문의 ID(UUID)를 **근거 수집 전에** 만든다. SQL 근거 ID 가 문의 ID 를 품고 DB CHECK 가
    그 형태를 강제하므로 순서를 바꿀 수 없다.

@@ -872,6 +872,7 @@ def keyless_pipeline() -> InquiryPipeline:
     settings = declared_settings(
         openai_api_key=SecretStr(""),
         anthropic_api_key=SecretStr(""),
+        phone_hmac_secret=get_settings().phone_hmac_secret,
         l2_enabled=True,
         vector_top_k=5,
         vector_similarity_threshold=0.0,
@@ -965,6 +966,7 @@ def test_인덱스와_다른_모델로_질의하면_503_이고_인계로_기록�
             vector_similarity_threshold=0.0,
             l2_enabled=False,
             abstention_gate_enabled=False,
+            phone_hmac_secret=get_settings().phone_hmac_secret,
         ),
     )
 
@@ -1154,13 +1156,13 @@ def test_저장_불가_입력은_자원을_열지_않고_표준_JSON_422다(
     assert isinstance(body["detail"], list) and body["detail"]
 
 
-def test_422의_정상_Unicode와_유한_숫자_진단값은_그대로다() -> None:
-    """안전 직렬화는 입력 진단의 정상값과 기존 상세 키를 바꾸지 않는다."""
+def test_422는_입력값없이_오류위치와_종류만_알린다() -> None:
+    """형식 오류여도 전화 뒷자리나 본문을 input/ctx/msg에 반사하지 않는다."""
     with TestClient(app) as http:
         response = http.post("/inquiries", json={"content": 1.25, "order_no": "주문😀"})
     assert response.status_code == 422
     error = response.json()["detail"][0]
-    assert error["input"] == 1.25
+    assert "input" not in error
     assert error["loc"] == ["body", "content"]
     assert error["type"] == "string_type"
 

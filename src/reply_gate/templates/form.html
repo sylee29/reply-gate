@@ -63,7 +63,8 @@
     textarea { min-height: 5.5rem; resize: vertical; }
     .field { margin-bottom: .8rem; }
     .row { display: flex; gap: .5rem; align-items: flex-end; }
-    .row .field { flex: 1; margin-bottom: 0; }
+    .row .field { flex: 1; min-width: 0; margin-bottom: 0; }
+    .card, pre, .cid, #answer, .pair { min-width: 0; overflow-wrap: anywhere; }
     button {
       font: inherit;
       font-weight: 600;
@@ -174,6 +175,11 @@
       <p class="hint">형식 검증은 코드가 한다. 형식이 틀리면 파이프라인을 돌리지 않고 422 로 거부한다.</p>
     </div>
     <div class="field">
+      <label for="phone-last4">전화번호 뒷자리 (선택)</label>
+      <input id="phone-last4" name="phone_last4" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="off">
+      <p class="hint">생략하면 상품을 확인한 뒤 개인정보를 제외한 안내를 받습니다.</p>
+    </div>
+    <div class="field">
       <label for="content">문의 내용 (필수)</label>
       <textarea id="content" name="content" placeholder="예) 환불은 언제까지 신청할 수 있나요?"></textarea>
     </div>
@@ -191,11 +197,12 @@
     <p class="hint">저장된 처리 기록에서 같은 화면을 다시 그린다 (GET /inquiries/&lt;id&gt;).</p>
   </form>
 
-  <p id="error" hidden></p>
+  <p id="error" role="alert" hidden></p>
+  <p id="request-state" role="status" aria-live="polite"></p>
 
   <section id="result" hidden>
     <div class="card">
-      <p id="status-line"></p>
+      <p id="status-line" role="status" aria-live="polite"></p>
       <p class="hint" id="inquiry-id-line"></p>
       <div class="viewbar">
         <label for="customer-view">
@@ -205,6 +212,14 @@
         <span class="hint" id="view-note"></span>
       </div>
     </div>
+
+    <section class="card" id="confirmation" hidden>
+      <h2>주문 상품 확인</h2>
+      <p id="confirmation-question"></p>
+      <p>상품이 맞으면 개인정보를 제외한 안내를 이어갑니다. 확인 시간이 만료되면 새로 문의해 주세요.</p>
+      <button id="confirm-yes" type="button">맞아요</button>
+      <button id="confirm-no" type="button" class="ghost">아니에요</button>
+    </section>
 
     <section class="card" id="verdict-flow">
       <h2>게이트 판정 — 시도별 층별 이력</h2>
@@ -482,7 +497,7 @@
     const customer = el("customer-view").checked;
     const escalated = payload.status === "escalated";
 
-    show("verdict-flow", !customer);
+    show("verdict-flow", !customer && payload.status !== "awaiting_confirmation");
     show("citations-section", !customer);
     show("metrics-section", !customer);
 
@@ -491,7 +506,7 @@
     show("escalation-detail", !customer);
     show("escalation-customer", customer && escalated);
 
-    show("answer-section", payload.answer !== null);
+    show("answer-section", payload.answer !== null && payload.status !== "awaiting_confirmation");
     show("claims", !customer);
 
     setText(
@@ -505,12 +520,15 @@
   function render(payload) {
     lastPayload = payload;
     const escalated = payload.status === "escalated";
+    const awaiting = payload.status === "awaiting_confirmation";
+    show("confirmation", awaiting);
+    setText("confirmation-question", awaiting ? payload.answer : "");
     const line = el("status-line");
     clear(line);
-    line.appendChild(document.createTextNode("최종 상태: "));
-    line.appendChild(badge(escalated ? "escalate" : "pass", payload.status));
+    line.appendChild(document.createTextNode("처리 상태: "));
+    line.appendChild(badge(awaiting ? "skip" : escalated ? "escalate" : "pass", payload.status));
     line.appendChild(
-      document.createTextNode(escalated ? " 상담원 인계 대상" : " 답변 확정")
+      document.createTextNode(awaiting ? " 상품 확인 대기" : escalated ? " 상담원 인계 대상" : " 답변 확정")
     );
     setText("inquiry-id-line", "문의 ID: " + payload.inquiry_id);
 
@@ -541,21 +559,35 @@
     show("error", true);
   }
 
+  let requestVersion = 0;
   async function call(url, options, busyButton) {
+    const version = ++requestVersion;
     show("error", false);
     busyButton.disabled = true;
+    setText("request-state", "처리 중입니다.");
+    el("result").setAttribute("aria-busy", "true");
     try {
       const response = await fetch(url, options);
-      const payload = await response.json();
+      const payload = await response.json().catch(() => null);
+      if (version !== requestVersion) return;
       if (!response.ok) {
-        fail("요청이 거부되었다 (HTTP " + response.status + "): " + JSON.stringify(payload.detail));
+        fail("요청이 거부되었다 (HTTP " + response.status + "): " +
+          (payload ? JSON.stringify(payload.detail) : "서버가 오류를 반환했습니다."));
+        return;
+      }
+      if (!payload) {
+        fail("응답을 읽을 수 없습니다 (HTTP " + response.status + ").");
         return;
       }
       render(payload);
     } catch (error) {
-      fail("요청을 보내지 못했다: " + error);
+      if (version === requestVersion) fail("요청을 보내지 못했다: " + error);
     } finally {
       busyButton.disabled = false;
+      if (version === requestVersion) {
+        setText("request-state", "처리가 끝났습니다.");
+        el("result").setAttribute("aria-busy", "false");
+      }
     }
   }
 
@@ -563,8 +595,10 @@
     event.preventDefault();
     const body = JSON.stringify({
       content: el("content").value,
-      order_no: el("order-no").value
+      order_no: el("order-no").value,
+      phone_last4: el("phone-last4").value
     });
+    el("phone-last4").value = "";
     const options = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -574,6 +608,16 @@
   });
 
   el("customer-view").addEventListener("change", applyView);
+
+  for (const [id, confirmed] of [["confirm-yes", true], ["confirm-no", false]]) {
+    el(id).addEventListener("click", () => {
+      if (!lastPayload || lastPayload.status !== "awaiting_confirmation") return;
+      call("/inquiries/" + encodeURIComponent(lastPayload.inquiry_id) + "/confirm", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmed })
+      }, el(id));
+    });
+  }
 
   el("lookup-form").addEventListener("submit", (event) => {
     event.preventDefault();

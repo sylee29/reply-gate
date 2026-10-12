@@ -29,7 +29,7 @@ from psycopg.rows import DictRow
 from pydantic import SecretStr
 
 from reply_gate.api import build_embedding_client
-from reply_gate.config import Settings
+from reply_gate.config import Settings, get_settings
 from reply_gate.contracts import (
     ClaimJudgment,
     EscalationReason,
@@ -44,6 +44,7 @@ from reply_gate.contracts import (
     has_unstorable_characters,
 )
 from reply_gate.draft import DRAFT_STAGE, DraftGenerator
+from reply_gate.evaluation import fixture_phone_last4
 from reply_gate.evidence import (
     INTENT_STAGE,
     SQL_GENERATION_STAGE,
@@ -1132,11 +1133,13 @@ def live_pipeline(client: ScriptedGenerationClient, *, threshold: float = 0.0) -
         generation_client=cast(GenerationClient, client),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
         judge=StubJudge(),
-        settings=declared_settings(
-            vector_top_k=5,
-            vector_similarity_threshold=threshold,
-            sql_max_rows=50,
-            l2_enabled=False,
+        settings=get_settings().model_copy(
+            update={
+                "vector_top_k": 5,
+                "vector_similarity_threshold": threshold,
+                "sql_max_rows": 50,
+                "l2_enabled": False,
+            }
         ),
     )
 
@@ -1155,6 +1158,7 @@ def run_live(
         order_no=order_no,
         app_conn=app_conn,
         readonly_conn=ro_conn,
+        phone_last4=fixture_phone_last4(order_no),
     )
 
 

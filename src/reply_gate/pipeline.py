@@ -19,21 +19,24 @@
 무너진다. L2 호출이 실패하면(전송 오류·형식 불일치 소진) 검증하지 못한 답변을 내보내지
 않고 `llm_call_failed` 로 인계한다.
 
-**이 모듈은 DB 에 쓰지 않는다.** 처리 기록 저장은 `records.py` 가, HTTP 표면은 `api.py` 가
+**확인 선점·전화 실패 상태만 별도 짧은 트랜잭션으로 쓴다.** 처리 기록 저장은
+`records.py` 가, HTTP 표면은 `api.py` 가
 맡는다. 여기서 나오는 `ProcessedInquiry` 가 세 층의 공통 자료형이다(평가 하네스도 이것을
 그대로 소비하면 된다).
 
 인프라 장애(`psycopg.Error` 등)는 인계 사유로 바꾸지 않고 그대로 올려보낸다. 인계 사유
-6종은 **업무 판정**이고, DB 가 죽은 것을 `no_evidence` 로 기록하면 평가 지표가 오염된다.
+7종은 **업무 판정**이고, DB 가 죽은 것을 `no_evidence` 로 기록하면 평가 지표가 오염된다.
 같은 이유로 **자격 증명 부재(`MissingCredentialsError`)도 인계가 아니다** — 설정 오류로
 그대로 전파해 HTTP 표면이 503 으로 끝낸다.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import Any, Final, Protocol
 
@@ -55,6 +58,7 @@ from reply_gate.contracts import (
     Verdict,
     has_unstorable_characters,
 )
+from reply_gate.db import connect
 from reply_gate.draft import DraftGeneration, DraftGenerator
 from reply_gate.evidence import (
     EvidenceCollection,
@@ -108,7 +112,7 @@ __all__ = [
 MAX_DRAFT_ATTEMPTS: Final = 2
 
 #: L2 판정 호출이 실패했을 때 처리 기록에 남는 실패 단계 이름
-#: (docs/business-rules.md "인계 사유 6종" — `llm_call_failed` 는 단계 이름을 함께 남긴다).
+#: (docs/business-rules.md "인계 사유 7종" — `llm_call_failed` 는 단계 이름을 함께 남긴다).
 #: 판정 모듈이 LLM 래퍼에 넘기는 단계 이름(`judge.JUDGE_STAGE`)과 달리, 이 값은
 #: **파이프라인 층에서 어디가 무너졌는지**를 가리킨다.
 L2_JUDGE_STAGE: Final = "l2_judge"
@@ -151,6 +155,56 @@ class MissingCredentialsError(RuntimeError):
     """
 
 
+class ConfirmationNotFound(LookupError):
+    """확인할 문의가 없다."""
+
+
+class ConfirmationConflict(RuntimeError):
+    """대기가 아니거나 만료됐거나 다른 요청이 이미 선점했다."""
+
+
+def require_identity_credentials(settings: Settings) -> None:
+    if not settings.phone_hmac_secret:
+        raise MissingCredentialsError("PHONE_HMAC_SECRET 가 설정되지 않았다")
+
+
+def _check_phone_attempt(order_no: str, matched: bool, settings: Settings) -> bool:
+    """확인 상태만 짧게 커밋한다. 이후 모델 오류가 성공0/실패횟수를 되돌리지 않는다."""
+    with connect(settings=settings) as conn:
+        return _record_phone_attempt(conn, order_no, matched, settings)
+
+
+def _record_phone_attempt(
+    conn: psycopg.Connection[DictRow],
+    order_no: str,
+    matched: bool,
+    settings: Settings,
+) -> bool:
+    """동일 문자열의 실패를 행 잠금으로 직렬화한다. 원문 입력은 저장하지 않는다."""
+    conn.execute(
+        "INSERT INTO order_verification_attempts (order_no) VALUES (%s) ON CONFLICT DO NOTHING",
+        (order_no,),
+    )
+    row = conn.execute(
+        "SELECT failures, locked_until, locked_until > clock_timestamp() AS locked "
+        "FROM order_verification_attempts WHERE order_no = %s FOR UPDATE",
+        (order_no,),
+    ).fetchone()
+    if row is None:
+        raise PipelineWiringError("주문 확인 실패 행이 없다")
+    if row["locked"]:
+        return False
+    failures = 0 if row["locked_until"] is not None else row["failures"]
+    failures = 0 if matched else failures + 1
+    conn.execute(
+        "UPDATE order_verification_attempts SET failures = %s, updated_at = clock_timestamp(), "
+        "locked_until = CASE WHEN %s >= %s THEN clock_timestamp() + %s * interval '1 minute' "
+        "ELSE NULL END WHERE order_no = %s",
+        (failures, failures, settings.phone_failure_limit, settings.phone_lock_minutes, order_no),
+    )
+    return matched
+
+
 # ── 1. 접수 [코드] ──────────────────────────────────────────────────────────
 
 
@@ -164,9 +218,12 @@ class AcceptedInquiry:
 
     content: str
     order_no: str | None
+    phone_last4: str | None = field(default=None, repr=False)
 
 
-def accept_inquiry(*, content: str, order_no: str | None = None) -> AcceptedInquiry:
+def accept_inquiry(
+    *, content: str, order_no: str | None = None, phone_last4: str | None = None
+) -> AcceptedInquiry:
     """접수 검증 — `content` 필수, `order_no` 는 선택이되 주면 형식이 맞아야 한다.
 
     형식 정의는 `reply_gate.order_ref` 가 단독 소유한다. 여기서 정규식을 다시 쓰지 않는다.
@@ -176,6 +233,11 @@ def accept_inquiry(*, content: str, order_no: str | None = None) -> AcceptedInqu
     보내기 때문이다). 미입력이 곧 오류는 아니다 — 의도가 `order`/`both` 일 때 비로소
     `missing_order_ref` 인계가 된다.
     """
+    if phone_last4 is not None:
+        if not phone_last4.strip():
+            phone_last4 = None
+        elif len(phone_last4) != 4 or any(c not in "0123456789" for c in phone_last4):
+            raise ReceiptError("전화번호 뒷자리는 ASCII 숫자 정확히 4자리여야 한다")
     if has_unstorable_characters(content) or (
         order_no is not None and has_unstorable_characters(order_no)
     ):
@@ -185,12 +247,12 @@ def accept_inquiry(*, content: str, order_no: str | None = None) -> AcceptedInqu
         raise ReceiptError("문의 내용은 비워 둘 수 없다")
 
     if order_no is None or not order_no.strip():
-        return AcceptedInquiry(content=text, order_no=None)
+        return AcceptedInquiry(content=text, order_no=None, phone_last4=phone_last4)
 
     normalized = normalize_order_no(order_no)
     if not is_valid_order_no(normalized):
-        raise ReceiptError(f"주문번호 형식이 아니다: {order_no!r} (기대 형식: ORD-YYYYMMDD-NNNN)")
-    return AcceptedInquiry(content=text, order_no=normalized)
+        raise ReceiptError("주문번호 형식이 아니다 (기대 형식: ORD-YYYYMMDD-NNNN)")
+    return AcceptedInquiry(content=text, order_no=normalized, phone_last4=phone_last4)
 
 
 def new_inquiry_id() -> str:
@@ -309,6 +371,8 @@ class ProcessedInquiry:
     #: 미측정이며, 측정된 구간의 합은 `latency_ms` 를 넘지 않는다(구간은 전부 처리 창
     #: 안쪽에서 재고 서로 겹치지 않는다). **DB 에도 HTTP 응답에도 싣지 않는다.**
     stage_durations: StageDurations = field(default_factory=StageDurations)
+    verification_method: str = "none"
+    phone_last4_hmac: str | None = field(default=None, repr=False)
 
 
 # ── 협력자 계약 (테스트가 대역으로 갈아 끼울 수 있게 Protocol 로) ───────────
@@ -325,6 +389,7 @@ class EvidenceCollecting(Protocol):
         order_no: str | None,
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> EvidenceCollection: ...
 
 
@@ -417,6 +482,7 @@ class InquiryPipeline:
         drafter: DraftGenerating,
         judge: Judging | None = None,
         l2_enabled: bool = True,
+        settings: Settings | None = None,
     ) -> None:
         """`l2_enabled` 가 켜져 있으면 판정자는 **필수**다.
 
@@ -433,6 +499,7 @@ class InquiryPipeline:
         self._drafter = drafter
         self._judge = judge
         self._l2_enabled = l2_enabled
+        self._settings = settings
 
     def run(
         self,
@@ -442,6 +509,166 @@ class InquiryPipeline:
         order_no: str | None,
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
+        phone_last4: str | None = None,
+    ) -> ProcessedInquiry:
+        """접수 경로 전체: 의도 분류 전에 주문 확인을 코드가 수행한다."""
+        started = perf_counter()
+        accepted = accept_inquiry(content=content, order_no=order_no, phone_last4=phone_last4)
+        settings = self._settings if self._settings is not None else get_settings()
+        require_identity_credentials(settings)
+        order_no, content, phone_last4 = accepted.order_no, accepted.content, accepted.phone_last4
+        digest = (
+            hmac.new(
+                settings.phone_hmac_secret.get_secret_value().encode(),
+                phone_last4.encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            if phone_last4 is not None
+            else None
+        )
+        method = "none"
+        if order_no is not None:
+            row = app_conn.execute(
+                "SELECT product_name, customer_phone FROM orders WHERE order_no = %s",
+                (order_no,),
+            ).fetchone()
+            if phone_last4 is None:
+                return self._identity_result(
+                    inquiry_id=inquiry_id,
+                    content=content,
+                    order_no=order_no,
+                    started=started,
+                    product_name=row["product_name"] if row else None,
+                )
+            matched = row is not None and hmac.compare_digest(
+                "".join(c for c in row["customer_phone"] if c in "0123456789")[-4:], phone_last4
+            )
+            if not _check_phone_attempt(order_no, matched, settings):
+                return replace(
+                    self._identity_result(
+                        inquiry_id=inquiry_id,
+                        content=content,
+                        order_no=order_no,
+                        started=started,
+                    ),
+                    phone_last4_hmac=digest,
+                )
+            method = "phone"
+        result = self._run_verified(
+            inquiry_id=inquiry_id,
+            content=content,
+            order_no=order_no,
+            app_conn=app_conn,
+            readonly_conn=readonly_conn,
+        )
+        return replace(
+            result,
+            verification_method=method,
+            phone_last4_hmac=digest,
+            latency_ms=int(_span_ms(started)),
+        )
+
+    @staticmethod
+    def _identity_result(
+        *,
+        inquiry_id: str,
+        content: str,
+        order_no: str | None,
+        started: float,
+        product_name: str | None = None,
+        reason: EscalationReason = EscalationReason.ORDER_NOT_FOUND,
+    ) -> ProcessedInquiry:
+        return ProcessedInquiry(
+            inquiry_id=inquiry_id,
+            order_no=order_no,
+            content=content,
+            intent=None,
+            status=(
+                InquiryStatus.AWAITING_CONFIRMATION
+                if product_name is not None
+                else InquiryStatus.ESCALATED
+            ),
+            answer=(
+                f"주문하신 상품이 {product_name} 맞나요?" if product_name is not None else None
+            ),
+            claims=(),
+            escalation_reason=None if product_name is not None else reason,
+            failed_stage=None,
+            evidence=(),
+            sql_snapshots=(),
+            sql_failures=(),
+            attempts=(),
+            latency_ms=int(_span_ms(started)),
+            input_tokens=0,
+            output_tokens=0,
+            embedding_tokens=0,
+        )
+
+    def confirm(
+        self,
+        *,
+        inquiry_id: str,
+        confirmed: bool,
+        app_conn: psycopg.Connection[DictRow],
+        readonly_conn: psycopg.Connection[DictRow],
+    ) -> ProcessedInquiry:
+        """대기 행을 원자적으로 선점하고 저장된 원문의 처리를 이어 간다.
+
+        선점은 별도 짧은 트랜잭션으로 확정한다. 이후 실패도 선점을 되돌리지 않는다.
+        """
+        started = perf_counter()
+        settings = self._settings if self._settings is not None else get_settings()
+        require_identity_credentials(settings)
+        try:
+            canonical = str(uuid.UUID(inquiry_id))
+        except ValueError as exc:
+            raise ConfirmationNotFound from exc
+        with connect(settings=settings) as claim_conn:
+            row = claim_conn.execute(
+                "UPDATE inquiries SET confirmation_claimed_at = clock_timestamp(), "
+                "verification_method = 'product_confirm' "
+                "WHERE id = %s AND status = 'awaiting_confirmation' "
+                "AND confirmation_claimed_at IS NULL "
+                "AND created_at > clock_timestamp() - %s * interval '1 minute' RETURNING *",
+                (canonical, settings.confirmation_ttl_minutes),
+            ).fetchone()
+            if row is None:
+                present = claim_conn.execute(
+                    "SELECT 1 FROM inquiries WHERE id = %s", (canonical,)
+                ).fetchone()
+                if present is None:
+                    raise ConfirmationNotFound
+                raise ConfirmationConflict
+        if not confirmed:
+            result = self._identity_result(
+                inquiry_id=canonical,
+                content=row["content"],
+                order_no=row["order_no"],
+                started=started,
+                reason=EscalationReason.ORDER_UNCONFIRMED,
+            )
+        else:
+            result = self._run_verified(
+                inquiry_id=canonical,
+                content=row["content"],
+                order_no=row["order_no"],
+                app_conn=app_conn,
+                readonly_conn=readonly_conn,
+                exclude_personal_columns=True,
+            )
+        return replace(
+            result, verification_method="product_confirm", latency_ms=int(_span_ms(started))
+        )
+
+    def _run_verified(
+        self,
+        *,
+        inquiry_id: str,
+        content: str,
+        order_no: str | None,
+        app_conn: psycopg.Connection[DictRow],
+        readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> ProcessedInquiry:
         """docs/architecture.md "대표 흐름" 3~7단계를 순서대로 실행한다.
 
@@ -455,12 +682,16 @@ class InquiryPipeline:
         started = perf_counter()
         tally = _Tally(attempts=[], input_tokens=0, output_tokens=0)
 
+        collection_options: dict[str, Any] = {}
+        if exclude_personal_columns:
+            collection_options["exclude_personal_columns"] = True
         collection = self._collector.collect(
             inquiry_id=inquiry_id,
             content=content,
             order_no=order_no,
             app_conn=app_conn,
             readonly_conn=readonly_conn,
+            **collection_options,
         )
         tally.input_tokens += collection.input_tokens
         tally.output_tokens += collection.output_tokens
@@ -486,7 +717,12 @@ class InquiryPipeline:
                 started=started,
             )
 
-        outcome = self._draft_loop(content=content, collection=collection, tally=tally)
+        outcome = self._draft_loop(
+            content=content,
+            collection=collection,
+            tally=tally,
+            exclude_personal_columns=exclude_personal_columns,
+        )
         return self._finish(
             inquiry_id=inquiry_id,
             order_no=order_no,
@@ -510,7 +746,12 @@ class InquiryPipeline:
         failed_stage: str | None
 
     def _draft_loop(
-        self, *, content: str, collection: EvidenceCollection, tally: _Tally
+        self,
+        *,
+        content: str,
+        collection: EvidenceCollection,
+        tally: _Tally,
+        exclude_personal_columns: bool = False,
     ) -> _LoopOutcome:
         """초안 생성 ↔ L1 ↔ L2 루프. **상한은 이 for 문의 범위가 강제한다.**"""
         reject_reasons: tuple[RejectReason, ...] = ()
@@ -563,7 +804,12 @@ class InquiryPipeline:
             gate_started = perf_counter()
             try:
                 l1_result: GateResult = evaluate_draft(
-                    raw_draft=generation.raw, evidences=collection.evidence
+                    raw_draft=generation.raw,
+                    evidences=(
+                        tuple(replace(item, evidence_text="") for item in collection.evidence)
+                        if exclude_personal_columns
+                        else collection.evidence
+                    ),
                 )
                 # L1 을 통과한 초안만 `Draft` 로 해석된다 — L2 입력이자 최종 답변의 원본이다.
                 draft = to_draft(generation.raw) if l1_result.verdict is Verdict.PASS else None
@@ -852,4 +1098,5 @@ def build_pipeline(
         drafter=DraftGenerator(client=generation_client, effort=resolved.generation_effort),
         judge=build_judge(resolved),
         l2_enabled=resolved.l2_enabled,
+        settings=resolved,
     )

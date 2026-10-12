@@ -227,4 +227,5 @@ def build_stub_pipeline(
         drafter=DraftGenerator(client=generation_client, effort=settings.generation_effort),
         judge=judge,
         l2_enabled=settings.l2_enabled,
+        settings=settings,
     )

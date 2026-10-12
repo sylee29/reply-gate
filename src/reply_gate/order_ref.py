@@ -40,7 +40,7 @@ ORDER_NO_PREFIX = "ORD"
 
 #: 주문번호의 **형태** 정규식. Postgres CHECK 제약(`db/schema.sql`)이 이 문자열을 그대로 쓴다.
 #: 캡처 그룹을 두지 않는다 — Postgres 정규식과 문자 단위로 동일해야 하기 때문이다.
-ORDER_NO_REGEX = r"^ORD-\d{8}-\d{4}$"
+ORDER_NO_REGEX = r"^ORD-[0-9]{8}-[0-9]{4}$"
 
 #: 하루 안에서 허용되는 순번 범위 (`0000` 은 주문이 아니므로 제외).
 ORDER_NO_MIN_SEQUENCE = 1

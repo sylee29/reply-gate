@@ -211,21 +211,23 @@ class JudgeResult:
 
 
 class EscalationReason(StrEnum):
-    """상담원 인계 사유. docs/business-rules.md "인계 사유 6종" 이 전부다."""
+    """상담원 인계 사유. docs/business-rules.md "인계 사유 7종" 이 전부다."""
 
     NO_EVIDENCE = "no_evidence"
     MISSING_ORDER_REF = "missing_order_ref"
     ORDER_NOT_FOUND = "order_not_found"
+    ORDER_UNCONFIRMED = "order_unconfirmed"
     SQL_FAILED = "sql_failed"
     LLM_CALL_FAILED = "llm_call_failed"
     REJECTED_TWICE = "rejected_twice"
 
 
 class InquiryStatus(StrEnum):
-    """문의의 최종 상태 (종결 상태, 역방향 전이 없음)."""
+    """문의 상태. 확인 대기에서만 한 번 처리로 진행하고 종결 뒤 역방향 전이는 없다."""
 
     ANSWERED = "answered"
     ESCALATED = "escalated"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
 
 
 #: 초안 생성 LLM 의 구조화 출력 스키마 = L1 기계 검사의 대상.

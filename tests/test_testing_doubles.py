@@ -182,6 +182,8 @@ def test_대역_조립기는_임베딩_검증_경계만_가르고_같은_수집_
     assert StubEvidenceCollector._collect_policy is EvidenceCollector._collect_policy
     assert type(stub._drafter) is type(real._drafter)
     assert stub._l2_enabled == real._l2_enabled is True
+    same_identity_settings = stub._settings is real._settings is settings
+    assert same_identity_settings, "확인 TTL·실패 제한·HMAC 설정도 수집기 밖까지 전달해야 한다"
     # 검색 전략 배선까지 같아야 한다 — 여기서 `None` 이면 대역 실행이 재작성 없는
     # 파이프라인을 재고, 그 수치가 "대역 완주"로 보고된다. 타입 대조만으로는 못 잡는다.
     stub_collector = stub._collector
