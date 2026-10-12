@@ -640,7 +640,7 @@ def _render_value(value: Any) -> str:
 def _render_rows(rows: Sequence[Mapping[str, Any]], *, limit: int | None = None) -> str:
     shown = rows if limit is None else rows[:limit]
     lines = [
-        f"{index}) " + ", ".join(f"{key}={_render_value(value)}" for key, value in row.items())
+        f"{index}) " + ", ".join(f"{key}= {_render_value(value)}" for key, value in row.items())
         for index, row in enumerate(shown, start=1)
     ]
     if limit is not None and len(rows) > limit:
