@@ -390,6 +390,16 @@ def test_비밀번호가_없으면_접속_문자열에_자격_증명_구획이_�
 # ── 선언값 헬퍼 — 테스트가 개발자의 `.env` 를 재지 않게 한다 ─────────────────
 
 
+def test_세션_임시_HMAC은_DB설정에_전달되고_선언기본값은_비어있다(
+    db_settings: Settings,
+) -> None:
+    """세션 설정 캐시를 먼저 비워야 DB 픽스처에도 임시 키가 보이고 기본값은 불변이다."""
+    session_has_key = bool(db_settings.phone_hmac_secret)
+    declared_has_no_key = not declared_settings().phone_hmac_secret
+    assert session_has_key
+    assert declared_has_no_key
+
+
 def test_선언값_헬퍼는_환경도_env_파일도_읽지_않는다(monkeypatch: pytest.MonkeyPatch) -> None:
     """인자 없는 `Settings()` 는 `.env` 와 환경 변수를 함께 읽는다.
 
