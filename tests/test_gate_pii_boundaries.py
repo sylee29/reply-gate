@@ -150,7 +150,9 @@ def test_이메일_필드명과_동일한_localpart도_명시된_주소에서는
     assert _judge("user@example.com", f"{field}=user@example.com").verdict is Verdict.PASS
 
 
-@pytest.mark.parametrize("alias", ["contact", "연락처", "user_address"])
+@pytest.mark.parametrize(
+    "alias", ["contact", "연락처", "user_address", "contact(1)", "contact[primary]", "customer's"]
+)
 @pytest.mark.parametrize("address", ["user@example.com", "a=user@example.com"])
 def test_실제_SQL_근거의_임의_별칭을_분리하되_이메일값은_한번만_분리한다(
     alias: str, address: str
@@ -212,6 +214,45 @@ def test_같은_금액과_수량의_쉼표_제거를_새_대표번호로_기각�
     assert _judge(canonical, amount + unit).verdict is Verdict.PASS
     assert _judge(amount + unit, canonical).verdict is Verdict.PASS
     assert RejectReason.PII_DETECTED in _judge(canonical, "다른 금액 123원").reject_reasons
+
+
+@pytest.mark.parametrize("unit", ["원", "개", "건", "명"])
+@pytest.mark.parametrize("amount", ["10,000,000", "82,000,000"])
+def test_연속된_양수_금액과_수량의_부호는_국가번호가_아니다(unit: str, amount: str) -> None:
+    unsigned = f"추가 수량은 {amount}{unit}입니다."
+    positive = f"추가 수량은 +{amount.replace(',', '')}{unit}입니다."
+    assert _judge(positive, unsigned).verdict is Verdict.PASS
+    assert _judge(unsigned, positive).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize("number", ["+01012345678", "+15881234", "+9001011234567"])
+def test_양수_단위_접기가_기존_국내전화나_주민번호를_지우지_않는다(number: str) -> None:
+    assert RejectReason.PII_DETECTED in _judge(number + "원").reject_reasons
+
+
+@pytest.mark.parametrize(
+    "number", ["+12025550123", "+442079460958", "+821012345678", "+1-202-555-0123원"]
+)
+def test_단위없는_국제번호와_구분된_국제번호는_계속_탐지한다(number: str) -> None:
+    assert RejectReason.PII_DETECTED in _judge(number).reject_reasons
+
+
+@pytest.mark.parametrize("local", ["customer's=a", "foo=a", "foo=b"])
+def test_필드명_괄호와_apostrophe_지원이_명시된_주소의_등호를_자르지_않는다(local: str) -> None:
+    address = f"<{local}@example.com>"
+    assert _judge(address, address).verdict is Verdict.PASS
+    assert RejectReason.PII_DETECTED in _judge(address, "a@example.com").reject_reasons
+    assert RejectReason.PII_DETECTED in _judge(address, "b@example.com").reject_reasons
+
+
+def test_공백으로_분리된_필드값의_등호는_두번째_필드경계가_아니다() -> None:
+    """별칭의 '='와 값의 '='를 렌더에서 구별한 문면을 다시 합치지 않는다."""
+    assert _judge("<b=user@example.com>", "1) a= b=user@example.com").verdict is Verdict.PASS
+    assert _judge("<user@example.com>", "1) a=b= user@example.com").verdict is Verdict.PASS
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge("user@example.com", "1) a= b=user@example.com").reject_reasons
+    )
 
 
 def test_금액_보정이_임의_쉼표나_전화번호를_지우지_않는다() -> None:

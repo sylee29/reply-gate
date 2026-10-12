@@ -110,6 +110,7 @@ _FORMAT_CATEGORY = "Cf"
 # NFKC 이후에도 공백으로 분류되지 않는 빈칸. 문장/행 구분자는 지우지 않는다.
 _BLANK_CHARACTERS = frozenset(("\u115f", "\u1160", "\u2800", "\u3164", "\uffa0"))
 _GROUPED_QUANTITY = re.compile(r"(?<![0-9,])[0-9]{1,3}(?:,[0-9]{3})+(?= ?(?:원|개|건|명))")
+_POSITIVE_QUANTITY_SIGN = re.compile(r"(?<![0-9])\+(?=[0-9]+ ?(?:원|개|건|명))")
 _INTERNATIONAL_PHONE = re.compile(
     r"(?<![0-9])(?:\+|00)[1-9](?:[-. ()]*[0-9]){6,14}(?![-. ()]*[0-9])"
 )
@@ -164,6 +165,9 @@ def fold_numeric_for_detection(text: str) -> str:
     )
     # 단위가 붙은 올바른 천 단위 묶음만 접는다. 쉼표를 임의 구분자로 받지 않는다.
     numeric = _GROUPED_QUANTITY.sub(lambda match: match.group().replace(",", ""), numeric)
+    # 연속 숫자+단위의 '+'는 양수 부호다. 부호만 없애므로 기존 국내전화/주민번호
+    # 검사는 그대로 돈다. 내부 구분자가 있는 국제전화나 단위 없는 '+'는 보존한다.
+    numeric = _POSITIVE_QUANTITY_SIGN.sub("", numeric)
     # 국제번호 안의 국내형 조각을 별도 번호로 뽑으면 +1 1588 1234와 +115881234의
     # allowlist가 달라진다. 명시적 국제 후보 안에서만 구분자를 지워 경계를 유지한다.
     return _INTERNATIONAL_PHONE.sub(
@@ -191,7 +195,9 @@ _EMAIL_REGEX = re.compile(
     rf'(?:"(?:[^"\\\r\n]|\\[^\r\n])*"|{_EMAIL_LOCAL}+)'
     rf"@{_EMAIL_LABEL}+(?:\.{_EMAIL_LABEL}+)+"
 )
-_EMAIL_VALUE_PREFIX = re.compile(r"""(?<!\S)[^\s=<>()[\]{}"'`\u2018\u2019\u201c\u201d]+ *=(?=\S)""")
+_EMAIL_VALUE_PREFIX = re.compile(
+    r"""(?<!\S)[^\s=<>()[\]{}"'`\u2018\u2019\u201c\u201d][^\s=<>]* *=(?=\S)"""
+)
 _EMAIL_WRAPPED_VALUE = re.compile(r"(?<!\S)(['`{])([^\s<>]+@[^\s<>]+)(['`}])")
 _EMAIL_PROSE_LAST_LABEL = re.compile(
     r"([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)"
@@ -232,7 +238,13 @@ def _fold_email_for_detection(text: str) -> str:
     # 구분 없는 a=user@…는 필드 문법이고 <a=user@…>는 local part에 '='가 있는 주소다.
     folded = _EMAIL_VALUE_PREFIX.sub(
         lambda match: (
-            match.group() + ("" if _email_literal_is_open(folded[: match.start()]) else " ")
+            match.group()
+            + (
+                ""
+                if folded[: match.start()].rstrip().endswith("=")
+                or _email_literal_is_open(folded[: match.start()])
+                else " "
+            )
         ),
         folded,
     )
