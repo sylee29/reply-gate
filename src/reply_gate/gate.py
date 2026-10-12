@@ -109,8 +109,16 @@ _FORMAT_CATEGORY = "Cf"
 
 # NFKC 이후에도 공백으로 분류되지 않는 빈칸. 문장/행 구분자는 지우지 않는다.
 _BLANK_CHARACTERS = frozenset(("\u115f", "\u1160", "\u2800", "\u3164", "\uffa0"))
-_GROUPED_QUANTITY = re.compile(r"(?<![0-9,])[0-9]{1,3}(?:,[0-9]{3})+(?= ?(?:원|개|건|명))")
-_POSITIVE_QUANTITY_SIGN = re.compile(r"(?<![0-9])\+(?=[0-9]+ ?(?:원|개|건|명))")
+_QUANTITY_UNIT = r"(?:원|개|건|명)"
+_QUANTITY_END = r"(?:입니다|이에요|예요|으로|은|는|을|를|이|가|에|로)?(?=$|\s|[.,!?;:)\]}>])"
+_GROUPED_QUANTITY = re.compile(
+    rf"(?<![0-9,])[0-9]{{1,3}}(?:,[0-9]{{3}})+(?= ?{_QUANTITY_UNIT}{_QUANTITY_END})"
+)
+_QUANTITY = re.compile(
+    rf"(?<![\w+\-.,@/])(?P<sign>\+?)(?P<number>[0-9]+) ?"
+    rf"(?P<unit>{_QUANTITY_UNIT}){_QUANTITY_END}"
+)
+_INTEGER_VALUE = re.compile(r"(?<![\w+\-.,@/])\+?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?![\w.,@/\-])")
 _INTERNATIONAL_PHONE = re.compile(
     r"(?<![0-9])(?:\+|00)[1-9](?:[-. ()]*[0-9]){6,14}(?![-. ()]*[0-9])"
 )
@@ -165,9 +173,6 @@ def fold_numeric_for_detection(text: str) -> str:
     )
     # 단위가 붙은 올바른 천 단위 묶음만 접는다. 쉼표를 임의 구분자로 받지 않는다.
     numeric = _GROUPED_QUANTITY.sub(lambda match: match.group().replace(",", ""), numeric)
-    # 연속 숫자+단위의 '+'는 양수 부호다. 부호만 없애므로 기존 국내전화/주민번호
-    # 검사는 그대로 돈다. 내부 구분자가 있는 국제전화나 단위 없는 '+'는 보존한다.
-    numeric = _POSITIVE_QUANTITY_SIGN.sub("", numeric)
     # 국제번호 안의 국내형 조각을 별도 번호로 뽑으면 +1 1588 1234와 +115881234의
     # allowlist가 달라진다. 명시적 국제 후보 안에서만 구분자를 지워 경계를 유지한다.
     return _INTERNATIONAL_PHONE.sub(
@@ -592,13 +597,29 @@ def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
     return []
 
 
-def _normalized_matches(*, texts: Sequence[str], pattern: PiiPattern) -> set[str]:
+def _normalized_matches(
+    *,
+    texts: Sequence[str],
+    pattern: PiiPattern,
+    sourced_numbers: frozenset[str] = frozenset(),
+) -> set[str]:
     """패턴 하나가 텍스트들에서 뽑은 **정규화된 값** 집합. 접기는 그 패턴의 것을 쓴다."""
-    return {
-        pattern.normalize(match)
-        for text in texts
-        for match in pattern.regex.findall(pattern.fold(text))
-    }
+    values: set[str] = set()
+    for text in texts:
+        folded = pattern.fold(text)
+        if pattern.name != "email" and sourced_numbers:
+            # 같은 완전한 정수가 근거에 있는 수량 토큰에서만 '+'를 대조용으로 접는다.
+            # 단위 없는 전화까지 전역 allowlist에 넣거나 pii_shaped의 탐지를 끄지 않는다.
+            folded = _QUANTITY.sub(
+                lambda match: (
+                    match.group()[1:]
+                    if match["sign"] == "+" and match["number"] in sourced_numbers
+                    else match.group()
+                ),
+                folded,
+            )
+        values.update(pattern.normalize(match) for match in pattern.regex.findall(folded))
+    return values
 
 
 def _has_unsourced_pii(
@@ -625,6 +646,22 @@ def _has_unsourced_pii(
     근거 필터·조회 가드도 같은 집합을 가져다 쓴다 — 층마다 다른 집합을 받을 수 있으면
     한쪽만 넓혀져 기준이 갈린다.
     """
+    # 값의 표기 차이만 대조한다. SQL의 단위 없는 정수도 근거이며 단위 의미는 L2다.
+    # 긴 ID의 조각·소수·음수·이메일 일부는 독립된 양수 정수로 채택하지 않는다.
+    sourced_numbers: set[str] = set()
+    for text in evidence_texts:
+        numeric = fold_numeric_for_detection(text)
+        sourced_numbers.update(
+            match["number"]
+            for match in _QUANTITY.finditer(numeric)
+            if not numeric[: match.start()].rstrip().endswith("-")
+        )
+        sourced_numbers.update(
+            normalize_digits(match.group())
+            for match in _INTEGER_VALUE.finditer(numeric)
+            if not numeric[: match.start()].rstrip().endswith("-")
+        )
+    quantity_references = frozenset(sourced_numbers)
     found: set[str] = set()
     for pattern in DEFAULT_PII_PATTERNS:
         # 이메일 접미사는 열린 구분자 문맥에 의존한다. 정상 초안은 최종 답변만 읽어야
@@ -632,7 +669,9 @@ def _has_unsourced_pii(
         texts = (
             (answer_text,) if pattern.name == "email" and answer_text is not None else draft_texts
         )
-        found |= _normalized_matches(texts=texts, pattern=pattern)
+        found |= _normalized_matches(
+            texts=texts, pattern=pattern, sourced_numbers=quantity_references
+        )
     if not found:
         return False
 
@@ -640,6 +679,8 @@ def _has_unsourced_pii(
     # 근거에 있었다는 사실은 같기 때문이다(숫자열과 이메일은 정규화 결과가 겹치지 않는다).
     allowed: set[str] = set()
     for pattern in DEFAULT_PII_PATTERNS:
-        allowed |= _normalized_matches(texts=evidence_texts, pattern=pattern)
+        allowed |= _normalized_matches(
+            texts=evidence_texts, pattern=pattern, sourced_numbers=quantity_references
+        )
 
     return bool(found - allowed)

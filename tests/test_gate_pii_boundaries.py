@@ -253,6 +253,98 @@ def test_단위없는_국제번호와_구분된_국제번호는_계속_탐지한
     assert RejectReason.PII_DETECTED in _judge(number).reject_reasons
 
 
+@pytest.mark.parametrize("number", ["+12025550123", "+442079460958", "+821012345678"])
+@pytest.mark.parametrize("word", ["개인", "원본", "건물", "명단"])
+@pytest.mark.parametrize("evidence", ["일반 안내", ""])
+def test_단위로_시작하는_단어는_전화번호의_국가번호를_지우지_않는다(
+    number: str, word: str, evidence: str
+) -> None:
+    text = f"국제전화 {number} {word} 연락처입니다."
+    assert gate.pii_shaped(text)
+    assert RejectReason.PII_DETECTED in _judge(text, evidence).reject_reasons
+
+
+@pytest.mark.parametrize("unit", ["원", "개", "건", "명"])
+@pytest.mark.parametrize("suffix", ["", "입니다.", "을 안내합니다.", "으로 안내합니다."])
+def test_완전한_단위와_허용한_조사서술어만_수량_에코로_대조한다(unit: str, suffix: str) -> None:
+    assert _judge(f"+10000000{unit}{suffix}", f"10,000,000{unit}").verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "",
+        "안내",
+        "10,000,001원",
+        "-10,000,000원",
+        "10,000,000원본",
+        "991000000099",
+        "ORD10000000원",
+        "-10000000",
+        "- 10000000",
+        "- 10000000원",
+        "10000000.0",
+        "10000000@example.com",
+    ],
+)
+def test_같은_양수_수량_근거가_없으면_부호있는_숫자를_기각한다(evidence: str) -> None:
+    assert gate.pii_shaped("+10000000원입니다.")
+    assert RejectReason.PII_DETECTED in _judge("+10000000원입니다.", evidence).reject_reasons
+
+
+@pytest.mark.parametrize("evidence", ["10,000,000원", "+10,000,000원"])
+def test_수량_에코_허용이_별도로_쓴_전화번호까지_허용하지_않는다(evidence: str) -> None:
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge("+10000000원, 연락처 +10000000", evidence).reject_reasons
+    )
+    assert (
+        RejectReason.PII_DETECTED in _judge("+10000000 원본 연락처입니다.", evidence).reject_reasons
+    )
+
+
+@pytest.mark.parametrize("word", ["개인", "원본", "건물", "명단"])
+def test_쉼표_접기도_단어접두를_수량단위로_읽지_않는다(word: str) -> None:
+    assert gate.fold_numeric_for_detection("10,000,000" + word) == "10,000,000" + word
+    assert gate.fold_numeric_for_detection("10,000,000원입니다.") == "10000000원입니다."
+
+
+def test_표시용_content의_수량은_빈_evidence_text를_대신하지_않는다() -> None:
+    result = gate.evaluate_draft(
+        raw_draft={"claims": [{"text": "+10000000원입니다.", "citation_ids": ["policy:audit:1"]}]},
+        evidences=[
+            Evidence(
+                id="policy:audit:1",
+                source=EvidenceSource.POLICY,
+                content="10,000,000원",
+                evidence_text="",
+            )
+        ],
+    )
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+@pytest.mark.parametrize(
+    "evidence", ["10000000", "10,000,000", "10,000,000개", "1) total_price_krw= 10000000"]
+)
+def test_같은_독립된_정수의_수량_표현은_단위_의미까지_판정하지_않는다(evidence: str) -> None:
+    assert _judge("+10000000원입니다.", evidence).verdict is Verdict.PASS
+    assert RejectReason.PII_DETECTED in _judge("연락처 +10000000", evidence).reject_reasons
+
+
+def test_실제_SQL_금액의_독립된_정수는_양수_금액으로_에코한다() -> None:
+    order_no = "ORD-20260201-0001"
+    sql = f"SELECT total_price_krw FROM orders WHERE order_no = '{order_no}'"
+    query = validate_sql(sql, order_no=order_no, max_rows=50)
+    _, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"total_price_krw": 10000000},),
+        pii_safe_output_columns=query.pii_safe_output_columns,
+    )
+    assert evidence_text == "1) total_price_krw= 10000000"
+    assert _judge("+10000000원입니다.", evidence_text).verdict is Verdict.PASS
+
+
 @pytest.mark.parametrize("local", ["customer's=a", "foo=a", "foo=b"])
 def test_필드명_괄호와_apostrophe_지원이_명시된_주소의_등호를_자르지_않는다(local: str) -> None:
     address = f"<{local}@example.com>"
