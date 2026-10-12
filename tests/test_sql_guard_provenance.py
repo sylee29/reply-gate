@@ -154,7 +154,7 @@ def test_임시테이블을_거친_정상_에코가_게이트를_통과한다() 
         evidences=(evidence,),
     )
 
-    assert f"customer_phone={STORED_PHONE}" in evidence_text
+    assert f"customer_phone= {STORED_PHONE}" in evidence_text
     assert result.verdict is Verdict.PASS
     assert result.reject_reasons == ()
 
