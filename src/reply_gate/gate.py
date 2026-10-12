@@ -608,7 +608,8 @@ def _without_email_tokens(text: str) -> str:
     """이메일과 같은 접기 버퍼에서 주소 전체를 제외한다. 원문 span을 재사용하지 않는다."""
     folded = _fold_email_for_detection(text)
     # no-@의 빈 반환값은 이메일 후보가 없다는 뜻이지, 근거 전체가 없다는 뜻이 아니다.
-    return _EMAIL_REGEX.sub(" ", folded) if folded else text
+    # 공백으로만 지우면 양옆의 숫자가 이어져 원래 없던 전화번호가 될 수 있다.
+    return _EMAIL_REGEX.sub("[email]", folded) if folded else text
 
 
 def _normalized_matches(
@@ -622,16 +623,19 @@ def _normalized_matches(
     for text in texts:
         candidate = text if pattern.name == "email" else _without_email_tokens(text)
         if pattern.name != "email" and sourced_numbers:
-            # 같은 완전한 정수가 근거에 있는 수량 토큰에서만 '+'를 대조용으로 접는다.
-            # 단위 없는 전화까지 전역 allowlist에 넣거나 pii_shaped의 탐지를 끄지 않는다.
-            candidate = _QUANTITY.sub(
-                lambda match: (
-                    match.group()[1:]
-                    if match["sign"] == "+" and normalize_digits(match["number"]) in sourced_numbers
+            # 같은 완전한 정수가 근거에 있는 수량 토큰만 숫자형 대조 복사본에서 뺀다.
+            # 부호 유무/PII 종류와 무관한 경계이며 실제 답변·근거·이메일 입력은 보존한다.
+            candidate = _fold_numeric_characters(candidate)
+
+            def omit_quantity(match: re.Match[str], original: str = candidate) -> str:
+                return (
+                    "[quantity]"
+                    if normalize_digits(match["number"]) in sourced_numbers
+                    and not original[: match.start()].rstrip().endswith("-")
                     else match.group()
-                ),
-                _fold_numeric_characters(candidate),
-            )
+                )
+
+            candidate = _QUANTITY.sub(omit_quantity, candidate)
         folded = pattern.fold(candidate)
         values.update(pattern.normalize(match) for match in pattern.regex.findall(folded))
     return values

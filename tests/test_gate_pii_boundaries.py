@@ -397,6 +397,44 @@ def test_0인_소수부의_비교는_float_반올림을_사용하지_않는다()
     )
 
 
+@pytest.mark.parametrize("evidence_text", ["15,881,234.00원", "15,881,234.00", "+15881234.0"])
+@pytest.mark.parametrize("answer", ["15881234원입니다", "+15881234원입니다"])
+def test_같은_수량의_표현은_대표번호_허용집합의_모양에_의존하지_않는다(
+    evidence_text: str, answer: str
+) -> None:
+    """부호만 지우면 서비스번호 검출값과 소수 표기 근거가 여전히 달라졌다."""
+    raw = {"claims": [{"text": answer, "citation_ids": ["policy:audit:1"]}]}
+    evidence = Evidence(
+        id="policy:audit:1",
+        source=EvidenceSource.POLICY,
+        content=evidence_text,
+        evidence_text=evidence_text,
+    )
+    assert gate.evaluate_draft(raw_draft=raw, evidences=[evidence]).verdict is Verdict.PASS
+    assert gate.to_draft(raw).answer_text == answer
+    assert evidence.evidence_text == evidence_text
+
+
+@pytest.mark.parametrize("number", ["15881234", "821012345678", "9001011234567"])
+def test_근거있는_수량의_예외는_이메일이나_별도_전화로_퍼지지_않는다(number: str) -> None:
+    evidence = f"{number}.00원"
+    assert _judge(f"+{number}원입니다.", evidence).verdict is Verdict.PASS
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge(f"+{number}원, 연락처 +{number}", evidence).reject_reasons
+    )
+    assert RejectReason.PII_DETECTED in _judge(f"{number}원@example.com", evidence).reject_reasons
+    assert RejectReason.PII_DETECTED in _judge(f"+{number}원입니다.", "").reject_reasons
+
+
+def test_수량_제외가_양옆의_숫자를_새_전화번호로_이어붙이지_않는다() -> None:
+    assert _judge("010 15881234원 1234 5678", "15,881,234.00원").verdict is Verdict.PASS
+
+
+def test_이메일_제외도_양옆의_숫자를_새_전화번호로_이어붙이지_않는다() -> None:
+    assert _judge("010 user@example.com 1234 5678", "user@example.com").verdict is Verdict.PASS
+
+
 @pytest.mark.parametrize("local", ["customer's=a", "foo=a", "foo=b"])
 def test_필드명_괄호와_apostrophe_지원이_명시된_주소의_등호를_자르지_않는다(local: str) -> None:
     address = f"<{local}@example.com>"
