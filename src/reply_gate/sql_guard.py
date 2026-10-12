@@ -33,6 +33,8 @@ data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다 — 둘 다
 6. **PII allowlist 출력 유래** — 어느 결과 컬럼의 값이 `orders` 직접 컬럼에서 왔는지를
    스코프를 타고 내려가며 증명한다(아래 `_projection_provenance`). 증명하지 못한 출력은
    **자동으로 불승인**이다 — 허용을 늘리는 방식이지 거부 목록을 두는 방식이 아니다.
+7. **실행 문자열의 의미 보존** — LIMIT 을 반영해 직렬화한 최종 문자열을 다시 파싱하고,
+   승인 AST와 다르면 거부한다. 주문 범위·출력 유래를 검사한 트리와 실행문이 같아야 한다.
 
 거부 규칙은 `SqlGuardRule` 이 전부이고, 거부 사유는 SQL 재생성 프롬프트에 그대로 실린다
 (docs/standards.md "재시도 상한" — 오류 내용을 피드백으로 1회 재시도). 그러므로 사유
@@ -256,6 +258,7 @@ class SqlGuardRule(StrEnum):
     UNSUPPORTED_PROJECTION = "unsupported_projection"
     ORDER_SCOPE = "order_scope"
     UNSUPPORTED_LIMIT = "unsupported_limit"
+    SERIALIZATION_MISMATCH = "serialization_mismatch"
 
 
 class SqlGuardRejection(ValueError):
@@ -1367,6 +1370,32 @@ def _enforce_limit(statement: exp.Select, max_rows: int) -> tuple[exp.Select, in
     return statement.limit(effective), effective
 
 
+def _ast_structure(value: object) -> object:
+    """위치 메타데이터와 빈 기본 인자를 제외한 AST 구조·값을 대조한다.
+
+    sqlglot 의 노드 동등성은 일부 문자열을 소문자로 접어 해시만 비교한다. escape 리터럴의
+    대소문자도 값이므로 문자열은 그대로 비교한다. dollar quoting은 렌더러가 일반 문자열로
+    바꾸므로 두 노드만 같은 값으로 대조한다. 유래 판정은 원래의 보수적 결과를 유지한다.
+    """
+    if isinstance(value, exp.Expr):
+        node_type = type(value)
+        args = value.args
+        if isinstance(value, exp.RawString):
+            node_type = exp.Literal
+            args = {**args, "is_string": True}
+        return (
+            node_type,
+            tuple(
+                (key, _ast_structure(item))
+                for key, item in sorted(args.items())
+                if item is not None and item is not False and item != []
+            ),
+        )
+    if isinstance(value, list):
+        return tuple(_ast_structure(item) for item in value)
+    return value
+
+
 # ── 진입점 ──────────────────────────────────────────────────────────────────
 
 
@@ -1410,9 +1439,17 @@ def validate_sql(
     analyzer.check_order_scope(order_no)
 
     limited, effective = _enforce_limit(statement, max_rows)
+    executable_sql = limited.sql(dialect=DIALECT)
+    reparsed = _parse_single_statement(executable_sql)
+    if _ast_structure(limited) != _ast_structure(reparsed):
+        raise _reject(
+            SqlGuardRule.SERIALIZATION_MISMATCH,
+            "직렬화 뒤 SQL 의미가 검증한 AST와 달라졌다. "
+            "이스케이프 리터럴 등 특수 표기를 빼고 SELECT 문을 다시 쓴다.",
+        )
 
     return ValidatedQuery(
-        sql=limited.sql(dialect=DIALECT),
+        sql=executable_sql,
         limit=effective,
         max_rows=max_rows,
         tables=tables,
