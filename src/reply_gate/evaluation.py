@@ -849,6 +849,7 @@ class PipelineRunning(Protocol):
         order_no: str | None,
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
+        phone_last4: str | None = None,
     ) -> ProcessedInquiry: ...
 
 
@@ -886,6 +887,19 @@ def _compare(case: GoldenCase, processed: ProcessedInquiry) -> tuple[bool, tuple
         mismatches.append(f"금지 기각 사유가 발화했다(오탐): {', '.join(forbidden)}")
 
     return not mismatches, tuple(mismatches)
+
+
+def fixture_phone_last4(order_no: str | None) -> str | None:
+    """평가자는 커밋된 합성 주문의 정당한 주문자로 요청한다. 골든셋은 불변이다."""
+    if order_no is None:
+        return None
+    for line in (
+        (_ROOT / "db" / "fixtures" / "orders.jsonl").read_text(encoding="utf-8").splitlines()
+    ):
+        row = json.loads(line)
+        if row["order_no"] == order_no:
+            return "".join(c for c in row["customer_phone"] if c in "0123456789")[-4:]
+    return None
 
 
 def evaluate_case(
@@ -929,6 +943,7 @@ def evaluate_case(
         order_no=accepted.order_no,
         app_conn=app_conn,
         readonly_conn=readonly_conn,
+        phone_last4=fixture_phone_last4(accepted.order_no),
     )
     matched, mismatches = _compare(case, processed)
     return GoldenOutcome(
@@ -2488,6 +2503,7 @@ ORDER_STAGE_ESCALATIONS: Final[frozenset[EscalationReason]] = frozenset(
     {
         EscalationReason.MISSING_ORDER_REF,
         EscalationReason.ORDER_NOT_FOUND,
+        EscalationReason.ORDER_UNCONFIRMED,
         EscalationReason.SQL_FAILED,
     }
 )

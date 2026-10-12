@@ -1,6 +1,6 @@
 # 외부 인터페이스 계약
 
-HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
+HTTP 엔드포인트 5개가 외부 표면의 전부다. 계정 인증은 없고 주문 확인 두 경로가 있다.
 
 접수하는 것은 고객 문의다. 반품·교환·환불 접수나 주문 상태 변경을 실행하지 않는다.
 `escalated`는 추가 확인이 필요한 인계 대상으로 기록했다는 뜻이며, 상담원에게 알림을
@@ -11,9 +11,9 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 - 요청·응답 모두 `application/json` (웹 폼 `GET /` 만 `text/html`).
 - **응답 스키마의 모든 키는 항상 존재한다.** 해당 없는 값은 `null`(스칼라) 또는 `[]`(배열)이며,
   키가 빠지지 않는다. 소비자는 키 존재 여부로 분기하지 않고 값으로 분기한다.
-- 일반 HTTP 오류는 `{"detail": "<한국어 설명>"}`, 입력 검증 422는 FastAPI의 `detail` 오류 배열이다.
-  오류 입력의 surrogate는 JSON escape로 직렬화하고, 비유한 숫자는 오류 상세에서만
-  문자열 진단값으로 표시한다. 잘못된 값을 고쳐 접수하는 것은 아니다.
+- 일반 HTTP 오류는 `{"detail": "<한국어 설명>"}`, 입력 검증 422는 `detail` 오류 배열이다.
+  `loc`·`type`·일반적인 `msg`만 보내며 입력 원문과 `ctx`는 싣지 않는다. 전화 뒷자리가
+  잘못된 타입이나 다른 필드의 오류 옆에 있어도 응답·오류에 반사하지 않는다.
 - 문의 ID 는 소문자 하이픈 UUID 문자열이다.
 - 문의 내용과 주문번호는 UTF-8/PostgreSQL에 저장 가능한 문자열이어야 한다. 정상 한글·이모지·줄바꿈은 허용한다.
 
@@ -39,6 +39,7 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 |---|---|---|
 | `content` | ✅ | 빈 문자열·공백만은 거부. NUL·고립 surrogate는 저장 불가 문자이므로 422 |
 | `order_no` | — | 주면 `ORD-YYYYMMDD-NNNN` 형식이어야 하고 날짜가 실재해야 한다. 빈 문자열·공백은 **미입력으로 취급**(HTML 폼이 빈 필드를 항상 보내기 때문) |
+| `phone_last4` | — | ASCII 숫자 정확히 4자리. 빈 문자열·공백만은 미입력, 그 밖의 오형식은 422. 입력값은 응답에 포함하지 않는다 |
 
 **응답 200** — 아래는 **L1 기각 → 재생성 → L2 기각**으로 인계된 장면이다(`answered` 면
 `answer`/`claims` 가 채워지고 `escalation_reason` 이 `null` 이다).
@@ -75,15 +76,15 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 }
 ```
 
-- `status` — `answered` | `escalated`
+- `status` — `answered` | `escalated` | `awaiting_confirmation`
 - `answer` / `claims` — `answered` 면 확정 답변 텍스트와 claim 배열
   (`{text, citation_ids}` — 아래 "답변 계약" 절과 같은 모양)이 실리고, `escalated` 면
-  각각 `null` 과 `[]` 이다. **이 셋은 함께 움직인다** — `answered` ⟺ `answer != null` ⟺
-  `escalation_reason == null` 이고, DB 도 같은 불변식을 CHECK 로 건다
+  각각 `null` 과 `[]` 이다. 대기는 `answer`에 상품명만 넣은 확인 질문, `claims=[]`,
+  `escalation_reason=null`이다. 세 상태별 모양을 DB CHECK로 건다
   (`inquiries_terminal_shape`)
 - `attempts` — 최대 2건. 초안 전 인계면 `[]`
 - `escalation_reason` — `no_evidence` | `missing_order_ref` | `order_not_found` | `sql_failed`
-  | `llm_call_failed` | `rejected_twice`. `answered` 면 `null`
+  | `llm_call_failed` | `rejected_twice` | `order_unconfirmed`. 답변·대기는 `null`
 - `reject_reasons` — L1 4종 `schema_violation` | `missing_citation` | `invalid_citation`
   | `pii_detected` + L2 2종 `unsupported_claim` | `contradictory_evidence`.
   최상위 `attempts[].reject_reasons` 는 **종합**(두 층 사유의 합집합)이고 순서는 고정이다
@@ -158,7 +159,7 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
   걸러져 **초안 없이** 끝나는 것이 이 제품의 장면인데, 재작성 토큰이 생성 칸에 들어가면
   초안을 만들지도 않은 문의가 초안 생성 토큰을 쓴 것으로 찍힌다 — 리포트가 거짓말을 한다.
   **생성 토큰의 정의는 바뀌지 않았다**(의도 해석 + SQL 생성 + 초안 생성 합산). 의도 해석은
-  검색보다 먼저·무조건 돌므로 생성 토큰은 원래 0 이 되지 않는다.
+  주문 확인을 통과한 문의에서 검색보다 먼저 돈다. 확인 단계 종결은 토큰 0이다.
 
 - **판정 프롬프트 캐싱이 켜진 조건에서 `judge_input` 이 담는 값은 "비캐시 입력"이다.**
   Anthropic 의 `usage.input_tokens` 가 캐시 적중분을 **제외한** 값이라, 캐싱을 켜면 이 키가
@@ -198,17 +199,42 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
 **입력 검증 422와 판정 키 선검사 503은 DB 연결보다 먼저다.** 생성 키는 첫 생성 호출에서
 검사하고, 정책 인덱스 오류는 DB 검색 결과로 판정하므로 DB 장애와 무관하지 않다.
 빈 인덱스 검사는 의도 분류 후 실제 정책 검색(`policy`·`both`)에서만 실행한다.
-`order`와 저장 기록 조회는 영향을 받지 않는다. `both`는 정책을 먼저 검색하므로 빈 인덱스
+`order`와 저장 기록 조회는 영향을 받지 않는다. 주문 확인을 통과했거나 번호가 없는 `both`는 정책을 먼저 검색하므로 빈 인덱스
 503이 주문번호 누락 등 주문 단계의 업무 인계보다 앞선다. 그 전에 의도 분류·재작성·임베딩
 호출은 이미 실행될 수 있다. 정상 인덱스에서 컷·기권으로 채택 결과가 빈 경우는 기존 업무
 판정 그대로다. 전체 조항의 완전성 검사는 하지 않는다.
 
-판정 키 선검사는 **`POST /inquiries` 경로 전용**이다. 처리에 진입하자마자 보므로 생성
+판정 키·HMAC 키 선검사는 **접수와 확인 POST 경로 전용**이다. 처리에 진입하자마자 보므로 생성
 토큰을 태우기 전에 503 이 난다 — 검증하지 못할 답변을 만들기 시작하지 않는 것이
 fail-closed 다. `GET` 라우트와 접수 거부 422 는 판정 키가 없어도 그대로 산다(선검사가
 `Depends` 가 아니라 POST 핸들러 안에 있다).
 
+## 주문 확인과 `POST /inquiries/{id}/confirm`
+
+`order_no`가 있으면 의도 분류 전에 코드가 확인한다. 뒷자리 일치·잠금 아님이면 기존 처리를
+계속한다. 뒷자리 불일치·없는 주문·잠금은 모두 동일한 200 `escalated/order_not_found`다.
+분류·정책 검색 전 종료하므로 `both` 문의도 근거·시도·토큰은 모두 비어 있다.
+
+뒷자리 생략 시 없는 주문은 같은 인계(실패 횟수 불증가), 있는 주문은
+`awaiting_confirmation`이다. 질문은 상품명만 포함하고 옵션·수량은 포함하지 않는다.
+`claims/citations/attempts=[]`, `escalation_reason=null`, 토큰 0, 실측 지연을 반환한다.
+
+확인 요청은 `{"confirmed": true}` 또는 `{"confirmed": false}`다. true는 저장한 원문의
+의도 분류부터 같은 ID로 진행하며 개인정보 네 열을 근거에서 제외한다. false는
+`escalated/order_unconfirmed`, `answer=null`로 종결한다. 두 경우 200 골격은 접수와 같다.
+없는/UUID 아닌 ID는 404, 본문 오류는 422, 대기가 아니거나 생성 후 기본 30분이 지났거나
+다른 요청이 선점했으면 409다. 대기 행을 원자 선점하며 만료 상태는 대기 그대로 남는다.
+선점은 별도 짧은 트랜잭션으로 먼저 확정한다. 이후 외부/DB 오류로 결과 저장이 실패해도
+대기+선점 시각을 유지해 다음 확인은 409다. 새 문의로 다시 시작해야 한다.
+확인 POST도 접수 POST와 동일하게 판정 키와 `PHONE_HMAC_SECRET` 부재를 DB 연결 전 503으로
+막는다. TTL과 실패 제한은 `CONFIRMATION_TTL_MINUTES`, `PHONE_FAILURE_LIMIT`(5),
+`PHONE_LOCK_MINUTES`(15)로 설정한다.
+
 ## `GET /inquiries/{id}` — 처리 기록 조회
+
+UUID4를 아는 사람은 기록을 볼 수 있는 능력 URL이다. 링크를 공유하면 접근 권한도 공유된다.
+별도 조회 인증은 없다. `verification_method`(`phone`/`product_confirm`/`none`)는 내부 저장
+필드이며 기록을 재구성할 때 확인 경로를 보존한다. 기존 기록은 `none`이다.
 
 **저장된 기록에서** `POST /inquiries` 와 같은 골격을 재구성한다(메모리 캐시가 아니다).
 시도 이력·근거 스냅샷·판정이 그대로 남아 있어, 기각이 일어난 문의를 나중에 다시 열어

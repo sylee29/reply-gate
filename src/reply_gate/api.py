@@ -1,6 +1,7 @@
-"""FastAPI 표면 — 엔드포인트 4개와 응답 스키마 (docs/contracts.md).
+"""FastAPI 표면 — 엔드포인트 5개와 응답 스키마 (docs/contracts.md).
 
 | `POST /inquiries`       | 문의 접수 + 동기 처리 |
+| `POST /inquiries/{id}/confirm` | 상품 확인 + 같은 문의 처리 |
 | `GET  /inquiries/{id}`  | 처리 기록 조회 (저장된 값에서 재구성) |
 | `GET  /`                | 최소 웹 폼 1장 |
 | `GET  /health`          | 헬스 체크 |
@@ -53,18 +54,16 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from math import isfinite
 from pathlib import Path
 from typing import Annotated, Any, Self
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from psycopg.rows import DictRow
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, StrictBool, model_validator
 
 from reply_gate.config import Settings, get_settings
 from reply_gate.contracts import GateResult, JudgeResult
@@ -79,6 +78,8 @@ from reply_gate.llm import (
 )
 from reply_gate.pipeline import (
     AttemptRecord,
+    ConfirmationConflict,
+    ConfirmationNotFound,
     InquiryPipeline,
     MissingCredentialsError,
     ProcessedInquiry,
@@ -86,6 +87,7 @@ from reply_gate.pipeline import (
     accept_inquiry,
     build_pipeline,
     new_inquiry_id,
+    require_identity_credentials,
 )
 from reply_gate.policy_index import PolicyIndexEmptyError, PolicyIndexProvenanceError
 from reply_gate.records import load_inquiry, save_inquiry
@@ -125,16 +127,24 @@ class InquiryRequest(BaseModel):
 
     content: str = Field(description="문의 내용 (필수)")
     order_no: str | None = Field(default=None, description="주문번호 ORD-YYYYMMDD-NNNN (선택)")
+    phone_last4: str | None = Field(default=None, repr=False, description="전화번호 뒷자리 (선택)")
 
     @model_validator(mode="after")
     def _accept(self) -> Self:
         try:
-            accepted = accept_inquiry(content=self.content, order_no=self.order_no)
+            accepted = accept_inquiry(
+                content=self.content, order_no=self.order_no, phone_last4=self.phone_last4
+            )
         except ReceiptError as exc:
             raise ValueError(str(exc)) from exc
         self.content = accepted.content
         self.order_no = accepted.order_no
+        self.phone_last4 = accepted.phone_last4
         return self
+
+
+class ConfirmationRequest(BaseModel):
+    confirmed: StrictBool
 
 
 # ── 응답 ────────────────────────────────────────────────────────────────────
@@ -376,7 +386,9 @@ class InquiryService:
         self._app_conn = app_conn
         self._open_readonly = open_readonly
 
-    def process(self, *, content: str, order_no: str | None) -> ProcessedInquiry:
+    def process(
+        self, *, content: str, order_no: str | None, phone_last4: str | None = None
+    ) -> ProcessedInquiry:
         with self._open_readonly() as readonly_conn:
             processed = self._open_pipeline().run(
                 inquiry_id=new_inquiry_id(),
@@ -384,8 +396,20 @@ class InquiryService:
                 order_no=order_no,
                 app_conn=self._app_conn,
                 readonly_conn=readonly_conn,
+                phone_last4=phone_last4,
             )
         save_inquiry(conn=self._app_conn, processed=processed)
+        return processed
+
+    def confirm(self, *, inquiry_id: str, confirmed: bool) -> ProcessedInquiry:
+        with self._open_readonly() as readonly_conn:
+            processed = self._open_pipeline().confirm(
+                inquiry_id=inquiry_id,
+                confirmed=confirmed,
+                app_conn=self._app_conn,
+                readonly_conn=readonly_conn,
+            )
+        save_inquiry(conn=self._app_conn, processed=processed, update_pending=True)
         return processed
 
     def fetch(self, inquiry_id: str) -> ProcessedInquiry | None:
@@ -508,16 +532,12 @@ ServiceDep = Annotated[ServiceOpener, Depends(get_service)]
 
 @app.exception_handler(RequestValidationError)
 def request_validation_handler(request: Request, exc: RequestValidationError) -> Response:
-    """잘못된 입력의 진단값도 표준 JSON으로 보낸다 — surrogate가 422를 500으로 바꾸지 않는다.
-
-    입력을 고쳐 접수하는 것이 아니다. 비유한 수는 JSON 값으로 표현할 수 없어 오류
-    상세에서만 문자열 진단값으로 남기고, 나머지 값과 기존 detail 구조는 보존한다.
-    """
+    """오류 위치와 종류만 반환한다. input/ctx/원문 메시지는 민감 입력을 반사할 수 있다."""
     del request
-    detail = jsonable_encoder(
-        exc.errors(),
-        custom_encoder={float: lambda number: number if isfinite(number) else repr(number)},
-    )
+    detail = [
+        {"loc": error["loc"], "type": error["type"], "msg": "입력 형식을 확인하세요"}
+        for error in exc.errors()
+    ]
     return Response(
         status_code=422,
         media_type="application/json",
@@ -571,6 +591,7 @@ def _require_judge_credentials() -> None:
     무관하다 — 그 경로는 이 함수에 닿기 전에 끝난다.
     """
     settings = get_settings()
+    require_identity_credentials(settings)
     if settings.l2_enabled and not settings.anthropic_api_key:
         raise MissingCredentialsError(
             "ANTHROPIC_API_KEY 가 설정되지 않았다. L2 판정이 켜져 있으면 판정 없이 답변을 "
@@ -588,7 +609,26 @@ def create_inquiry(payload: InquiryRequest, open_service: ServiceDep) -> Inquiry
     # 처리 기록을 남기기 전에 끝낸다 — 설정 오류는 인계(`llm_call_failed`)가 아니다.
     _require_judge_credentials()
     with open_service() as service:
-        processed = service.process(content=payload.content, order_no=payload.order_no)
+        processed = service.process(
+            content=payload.content, order_no=payload.order_no, phone_last4=payload.phone_last4
+        )
+    return InquiryResponse.of(processed)
+
+
+@app.post("/inquiries/{inquiry_id}/confirm")
+def confirm_inquiry(
+    inquiry_id: str, payload: ConfirmationRequest, open_service: ServiceDep
+) -> InquiryResponse:
+    _require_judge_credentials()
+    try:
+        with open_service() as service:
+            processed = service.confirm(inquiry_id=inquiry_id, confirmed=payload.confirmed)
+    except ConfirmationNotFound as exc:
+        raise HTTPException(status_code=404, detail="그런 문의가 없다") from exc
+    except ConfirmationConflict as exc:
+        raise HTTPException(
+            status_code=409, detail="확인 대기가 아니거나 확인 시간이 만료되었다"
+        ) from exc
     return InquiryResponse.of(processed)
 
 

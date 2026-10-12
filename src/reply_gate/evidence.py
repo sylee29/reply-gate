@@ -44,7 +44,9 @@ from time import perf_counter
 from typing import Any, Final
 
 import psycopg
+import sqlglot
 from psycopg.rows import DictRow
+from sqlglot import exp
 
 from reply_gate.config import AbstentionGateWiringError, Settings, get_settings
 from reply_gate.contracts import (
@@ -78,6 +80,7 @@ from reply_gate.retrieval_strategies import (
 from reply_gate.sql_guard import (
     SCHEMA_WHITELIST,
     SqlGuardRejection,
+    SqlGuardRule,
     ValidatedQuery,
     describe_allowed_functions,
     describe_whitelist,
@@ -991,6 +994,7 @@ class EvidenceCollector:
         order_no: str | None,
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> EvidenceCollection:
         """문의 1건의 근거를 모은다. 결과는 근거 목록 또는 초안 전 인계 사유다."""
         ledger = _Ledger()
@@ -1037,6 +1041,7 @@ class EvidenceCollector:
                     content=content,
                     order_no=order_no,
                     readonly_conn=readonly_conn,
+                    exclude_personal_columns=exclude_personal_columns,
                 )
                 # 주문 측 구조적 사유는 정책 근거를 이미 모았더라도 인계가 우선한다.
                 if escalation is not None:
@@ -1181,6 +1186,7 @@ class EvidenceCollector:
         content: str,
         order_no: str | None,
         readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> EscalationReason | None:
         """선검사 → text-to-SQL. 인계 사유가 있으면 그것을, 없으면 `None` 을 돌려준다."""
         if order_no is None or not order_no.strip():
@@ -1209,6 +1215,7 @@ class EvidenceCollector:
             content=content,
             order_no=normalized,
             readonly_conn=readonly_conn,
+            exclude_personal_columns=exclude_personal_columns,
         )
 
     def _run_text_to_sql(
@@ -1219,9 +1226,19 @@ class EvidenceCollector:
         content: str,
         order_no: str,
         readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> EscalationReason | None:
         """생성 → 검증 → 실행. 실패는 피드백을 실어 **1회만** 재시도한다(코드가 상한 강제)."""
         max_rows = self._settings.sql_max_rows
+        personal_columns = {"customer_name", "customer_phone", "customer_email", "shipping_address"}
+        whitelist = (
+            {
+                table: tuple(c for c in columns if c not in personal_columns)
+                for table, columns in SCHEMA_WHITELIST.items()
+            }
+            if exclude_personal_columns
+            else SCHEMA_WHITELIST
+        )
         previous_sql: str | None = None
         previous_error: str | None = None
 
@@ -1232,6 +1249,7 @@ class EvidenceCollector:
                     inquiry=content,
                     order_no=order_no,
                     max_rows=max_rows,
+                    whitelist=whitelist,
                     previous_sql=previous_sql,
                     previous_error=previous_error,
                     effort=self._settings.generation_effort,
@@ -1279,7 +1297,18 @@ class EvidenceCollector:
             try:
                 # 조회 범위를 **선검사를 통과한 주문 1건**으로 묶는 것도 검증 단계의 일이다
                 # (docs/architecture.md "대표 흐름" 3단계). 프롬프트 문구는 그 보증이 되지 못한다.
-                query = validate_sql(generation.sql, order_no=order_no, max_rows=max_rows)
+                query = validate_sql(
+                    generation.sql, order_no=order_no, max_rows=max_rows, whitelist=whitelist
+                )
+                # 축소 whitelist가 SELECT *의 실제 DB projection까지 좁히지는 않는다.
+                if exclude_personal_columns and any(
+                    isinstance(star.parent, (exp.Select, exp.Column))
+                    for star in sqlglot.parse_one(query.sql, dialect="postgres").find_all(exp.Star)
+                ):
+                    raise SqlGuardRejection(
+                        rule=SqlGuardRule.UNSUPPORTED_PROJECTION,
+                        detail="상품 확인 경로는 허용된 열 이름을 명시해야 한다 (* 사용 불가)",
+                    )
             except SqlGuardRejection as rejection:
                 previous_sql = generation.sql
                 previous_error = f"{rejection.rule.value}: {rejection.detail}"

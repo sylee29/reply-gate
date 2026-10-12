@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = Field(default=SecretStr(""), repr=False)
     #: L2 판정(Anthropic) 전용. 비밀 — 환경 변수 또는 .env 에만 둔다.
     anthropic_api_key: SecretStr = Field(default=SecretStr(""), repr=False)
+    phone_hmac_secret: SecretStr = Field(default=SecretStr(""), repr=False)
+    confirmation_ttl_minutes: int = Field(default=30, ge=1)
+    phone_failure_limit: int = Field(default=5, ge=1)
+    phone_lock_minutes: int = Field(default=15, ge=1)
 
     # ── Postgres 접속 ───────────────────────────────────────────────────────
     postgres_host: str = "localhost"

@@ -68,6 +68,7 @@ def test_기각사유와_인계사유_집합이_문서_계약과_일치한다() 
         "no_evidence",
         "missing_order_ref",
         "order_not_found",
+        "order_unconfirmed",
         "sql_failed",
         "llm_call_failed",
         "rejected_twice",

@@ -59,12 +59,55 @@ __all__ = ["load_inquiry", "save_inquiry"]
 # ── 저장 ────────────────────────────────────────────────────────────────────
 
 
-def save_inquiry(*, conn: psycopg.Connection[DictRow], processed: ProcessedInquiry) -> None:
+def save_inquiry(
+    *, conn: psycopg.Connection[DictRow], processed: ProcessedInquiry, update_pending: bool = False
+) -> None:
     """문의 1건 + 시도 + 근거 스냅샷 + SQL 실패 내역을 한 트랜잭션 안에서 넣는다.
 
     `id` 를 DB 기본값에 맡기지 않고 **명시적으로** 넣는다: SQL 근거 ID 가 이미 이 값을
     품고 있고 `inquiry_evidence` 의 CHECK 가 둘의 일치를 강제하기 때문이다.
     """
+    with conn.cursor() as cur:
+        if update_pending:
+            # 선점한 행만 갱신한다. ID·created_at·선점 시각과 자식 기록은 보존한다.
+            cur.execute(
+                "UPDATE inquiries SET intent_source=%s, status=%s, answer=%s, claims=%s, "
+                "escalation_reason=%s, failed_stage=%s, latency_ms=%s, input_tokens=%s, "
+                "output_tokens=%s, embedding_tokens=%s, judge_input_tokens=%s, "
+                "judge_output_tokens=%s, retrieval_input_tokens=%s, retrieval_output_tokens=%s, "
+                "retrieval_fallback_reason=%s, verification_method=%s, phone_last4_hmac=%s "
+                "WHERE id=%s AND status='awaiting_confirmation' "
+                "AND confirmation_claimed_at IS NOT NULL",
+                (
+                    _enum_value(processed.intent),
+                    processed.status.value,
+                    processed.answer,
+                    Jsonb(_claims_json(processed.claims)),
+                    _enum_value(processed.escalation_reason),
+                    processed.failed_stage,
+                    processed.latency_ms,
+                    processed.input_tokens,
+                    processed.output_tokens,
+                    processed.embedding_tokens,
+                    processed.judge_input_tokens,
+                    processed.judge_output_tokens,
+                    processed.retrieval_input_tokens,
+                    processed.retrieval_output_tokens,
+                    processed.retrieval_fallback_reason,
+                    processed.verification_method,
+                    processed.phone_last4_hmac,
+                    processed.inquiry_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("선점한 확인 대기 문의만 갱신할 수 있다")
+        else:
+            _insert_inquiry(conn=conn, processed=processed)
+
+        _save_children(conn=conn, processed=processed)
+
+
+def _insert_inquiry(*, conn: psycopg.Connection[DictRow], processed: ProcessedInquiry) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -73,8 +116,9 @@ def save_inquiry(*, conn: psycopg.Connection[DictRow], processed: ProcessedInqui
                  escalation_reason, failed_stage, latency_ms,
                  input_tokens, output_tokens, embedding_tokens,
                  judge_input_tokens, judge_output_tokens,
-                 retrieval_input_tokens, retrieval_output_tokens, retrieval_fallback_reason)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 retrieval_input_tokens, retrieval_output_tokens, retrieval_fallback_reason,
+                 verification_method, phone_last4_hmac)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 processed.inquiry_id,
@@ -95,9 +139,14 @@ def save_inquiry(*, conn: psycopg.Connection[DictRow], processed: ProcessedInqui
                 processed.retrieval_input_tokens,
                 processed.retrieval_output_tokens,
                 processed.retrieval_fallback_reason,
+                processed.verification_method,
+                processed.phone_last4_hmac,
             ),
         )
 
+
+def _save_children(*, conn: psycopg.Connection[DictRow], processed: ProcessedInquiry) -> None:
+    with conn.cursor() as cur:
         for attempt in processed.attempts:
             cur.execute(
                 """
@@ -201,6 +250,8 @@ def load_inquiry(*, conn: psycopg.Connection[DictRow], inquiry_id: str) -> Proce
         retrieval_input_tokens=row["retrieval_input_tokens"],
         retrieval_output_tokens=row["retrieval_output_tokens"],
         retrieval_fallback_reason=row["retrieval_fallback_reason"],
+        verification_method=row["verification_method"],
+        phone_last4_hmac=row["phone_last4_hmac"],
     )
 
 

@@ -251,6 +251,8 @@ def _skip_reason(
             "않으므로 측정 2·3 을 시작하지 않는다 (판정을 빼고 재보려면 L2_ENABLED=false 로 "
             "명시한다 — 그 실행은 꺼짐 기준선이다)"
         )
+    if not settings.phone_hmac_secret:
+        return "PHONE_HMAC_SECRET 가 없다 — 문의 처리 전에 서버 HMAC 키를 설정해야 한다"
     return database_unavailable_reason(settings=settings)
 
 

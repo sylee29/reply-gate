@@ -9,7 +9,9 @@
 -- (조용히 넘어간다). 컬럼을 바꾸는 변경은 `docker compose down -v && docker compose up -d`
 -- 로 볼륨째 재생성하는 것이 기본이다.
 --
--- **예외는 컬럼 추가뿐이다.** 추가는 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 로 살아 있는
+-- 컬럼 추가와 제약 교체는 기존 볼륨에 멱등 적용한다. 제약은 DROP CONSTRAINT IF EXISTS
+-- 뒤 ADD CONSTRAINT로 같은 트랜잭션에서 교체한다. 추가는
+-- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 로 살아 있는
 -- 볼륨에 그대로 붙일 수 있고(PG11+ 에서 테이블 재작성 없는 메타데이터 연산), 그래야
 -- 보존하기로 한 처리 기록과 이미 과금한 정책 인덱스를 날리지 않는다. 새 볼륨에서는 위쪽
 -- CREATE TABLE 이 이미 만든 뒤라 아무 일도 하지 않는다 — **두 자리에 같은 정의를 적는
@@ -40,7 +42,7 @@ CREATE TABLE IF NOT EXISTS orders (
     CONSTRAINT orders_pkey PRIMARY KEY (order_no),
     -- 이 정규식은 `reply_gate.order_ref.ORDER_NO_REGEX` 와 **같은 문자열**이어야 한다.
     -- tests/test_db_schema.py 가 두 곳이 어긋나면 실패한다.
-    CONSTRAINT orders_order_no_format CHECK (order_no ~ '^ORD-\d{8}-\d{4}$'),
+    CONSTRAINT orders_order_no_format CHECK (order_no ~ '^ORD-[0-9]{8}-[0-9]{4}$'),
     CONSTRAINT orders_quantity_positive CHECK (quantity > 0),
     CONSTRAINT orders_unit_price_nonneg CHECK (unit_price_krw >= 0),
     CONSTRAINT orders_total_price_nonneg CHECK (total_price_krw >= 0),
@@ -138,7 +140,7 @@ CREATE TABLE IF NOT EXISTS inquiries (
 
     CONSTRAINT inquiries_pkey PRIMARY KEY (id),
     CONSTRAINT inquiries_order_no_format CHECK (
-        order_no IS NULL OR order_no ~ '^ORD-\d{8}-\d{4}$'
+        order_no IS NULL OR order_no ~ '^ORD-[0-9]{8}-[0-9]{4}$'
     ),
     -- `reply_gate.contracts.IntentSource`
     CONSTRAINT inquiries_intent_source_enum CHECK (
@@ -184,6 +186,50 @@ CREATE TABLE IF NOT EXISTS inquiries (
 ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS retrieval_input_tokens  integer NOT NULL DEFAULT 0;
 ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS retrieval_output_tokens integer NOT NULL DEFAULT 0;
 ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS retrieval_fallback_reason text;
+ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS verification_method text NOT NULL DEFAULT 'none';
+ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS phone_last4_hmac text;
+ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS confirmation_claimed_at timestamptz;
+
+ALTER TABLE inquiries DROP CONSTRAINT IF EXISTS inquiries_status_enum;
+ALTER TABLE inquiries ADD CONSTRAINT inquiries_status_enum
+    CHECK (status IN ('answered', 'escalated', 'awaiting_confirmation'));
+ALTER TABLE inquiries DROP CONSTRAINT IF EXISTS inquiries_escalation_reason_enum;
+ALTER TABLE inquiries ADD CONSTRAINT inquiries_escalation_reason_enum CHECK (
+    escalation_reason IS NULL OR escalation_reason IN (
+        'no_evidence', 'missing_order_ref', 'order_not_found', 'sql_failed',
+        'llm_call_failed', 'rejected_twice', 'order_unconfirmed'
+    )
+);
+ALTER TABLE inquiries DROP CONSTRAINT IF EXISTS inquiries_terminal_shape;
+ALTER TABLE inquiries ADD CONSTRAINT inquiries_terminal_shape CHECK (
+    (status = 'answered' AND answer IS NOT NULL AND escalation_reason IS NULL)
+    OR (status = 'escalated' AND answer IS NULL AND escalation_reason IS NOT NULL)
+    OR (status = 'awaiting_confirmation' AND answer IS NOT NULL
+        AND escalation_reason IS NULL AND intent_source IS NULL AND claims = '[]'::jsonb
+        AND order_no IS NOT NULL AND input_tokens = 0 AND output_tokens = 0
+        AND embedding_tokens = 0 AND judge_input_tokens = 0 AND judge_output_tokens = 0
+        AND retrieval_input_tokens = 0 AND retrieval_output_tokens = 0)
+);
+ALTER TABLE inquiries DROP CONSTRAINT IF EXISTS inquiries_verification_method_enum;
+ALTER TABLE inquiries ADD CONSTRAINT inquiries_verification_method_enum
+    CHECK (verification_method IN ('none', 'phone', 'product_confirm'));
+ALTER TABLE inquiries DROP CONSTRAINT IF EXISTS inquiries_phone_hmac_shape;
+ALTER TABLE inquiries ADD CONSTRAINT inquiries_phone_hmac_shape
+    CHECK (phone_last4_hmac IS NULL OR phone_last4_hmac ~ '^[0-9a-f]{64}$');
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_order_no_format;
+ALTER TABLE orders ADD CONSTRAINT orders_order_no_format
+    CHECK (order_no ~ '^ORD-[0-9]{8}-[0-9]{4}$');
+ALTER TABLE inquiries DROP CONSTRAINT IF EXISTS inquiries_order_no_format;
+ALTER TABLE inquiries ADD CONSTRAINT inquiries_order_no_format
+    CHECK (order_no IS NULL OR order_no ~ '^ORD-[0-9]{8}-[0-9]{4}$');
+
+-- 앱 계정만 접근한다. RO 권한·화이트리스트를 넓히지 않는다.
+CREATE TABLE IF NOT EXISTS order_verification_attempts (
+    order_no text PRIMARY KEY,
+    failures integer NOT NULL DEFAULT 0 CHECK (failures >= 0),
+    locked_until timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
 
 DO $$
 BEGIN
@@ -303,6 +349,16 @@ CREATE TABLE IF NOT EXISTS inquiry_attempts (
 );
 
 CREATE INDEX IF NOT EXISTS inquiry_attempts_inquiry_idx ON inquiry_attempts (inquiry_id);
+
+-- CHECK의 NULL은 통과다. verdict NULL + 비NULL 사유도 명시적으로 거부한다.
+ALTER TABLE inquiry_attempts DROP CONSTRAINT IF EXISTS inquiry_attempts_l1_reasons_match_verdict;
+ALTER TABLE inquiry_attempts ADD CONSTRAINT inquiry_attempts_l1_reasons_match_verdict CHECK (
+    (l1_verdict IS NULL AND l1_reject_reasons IS NULL)
+    OR (l1_verdict IS NOT NULL AND l1_reject_reasons IS NOT NULL AND (
+        (l1_verdict = 'pass' AND cardinality(l1_reject_reasons) = 0)
+        OR (l1_verdict = 'reject' AND cardinality(l1_reject_reasons) > 0)
+    ))
+);
 
 -- ── 처리 기록 3 — 근거 스냅샷 ────────────────────────────────────────────────
 -- SQL 근거는 **실행된 쿼리문과 결과 행 전체**를 영속화한다 (docs/contracts.md "답변 계약").
