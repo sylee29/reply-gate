@@ -65,6 +65,9 @@ def service_client(
     ro_conn: psycopg.Connection[DictRow],
 ) -> Iterator[TestClient]:
     del app_conn, ro_conn
+    settings = pipeline._settings
+    if settings is None:
+        raise AssertionError("HTTP 대역은 파이프라인과 같은 명시적 설정을 사용해야 한다")
 
     @contextmanager
     def opened() -> Iterator[InquiryService]:
@@ -82,8 +85,10 @@ def service_client(
 
     app.dependency_overrides[get_service] = opener
     try:
-        with TestClient(app) as client:
-            yield client
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("reply_gate.api.get_settings", lambda: settings)
+            with TestClient(app) as client:
+                yield client
     finally:
         app.dependency_overrides.pop(get_service, None)
 
@@ -152,14 +157,18 @@ def test_확인대기_조회_동일ID_거절_재확인409(
     assert row is not None
     client = scripted_client({})
     with service_client(pipeline=live_pipeline(client), app_conn=app_conn, ro_conn=ro_conn) as http:
-        pending = http.post(
+        response = http.post(
             "/inquiries", json={"content": "원래 문의", "order_no": row["order_no"]}
-        ).json()
+        )
+        assert response.status_code == 200, response.text
+        pending = response.json()
         assert pending["status"] == "awaiting_confirmation"
         key = pending["inquiry_id"]
-        assert http.get(f"/inquiries/{key}").json() == pending
+        fetched = http.get(f"/inquiries/{key}")
+        assert fetched.status_code == 200, fetched.text
+        assert fetched.json() == pending
         rejected = http.post(f"/inquiries/{key}/confirm", json={"confirmed": False})
-        assert rejected.status_code == 200
+        assert rejected.status_code == 200, rejected.text
         assert rejected.json()["inquiry_id"] == key
         assert rejected.json()["escalation_reason"] == "order_unconfirmed"
         assert rejected.json()["answer"] is None
@@ -346,16 +355,18 @@ def test_확인기한은_생성시각부터이며_만료도_대기로_조회된�
     assert row is not None
     pipe = live_pipeline(scripted_client({}))
     with service_client(pipeline=pipe, app_conn=app_conn, ro_conn=ro_conn) as http:
-        result = http.post(
-            "/inquiries", json={"content": "문의", "order_no": row["order_no"]}
-        ).json()
+        response = http.post("/inquiries", json={"content": "문의", "order_no": row["order_no"]})
+        assert response.status_code == 200, response.text
+        result = response.json()
         key = result["inquiry_id"]
         with connect() as state_conn:
             state_conn.execute(
                 "UPDATE inquiries SET created_at=now()-interval '31 minutes' WHERE id=%s", (key,)
             )
         assert http.post(f"/inquiries/{key}/confirm", json={"confirmed": True}).status_code == 409
-        assert http.get(f"/inquiries/{key}").json()["status"] == "awaiting_confirmation"
+        fetched = http.get(f"/inquiries/{key}")
+        assert fetched.status_code == 200, fetched.text
+        assert fetched.json()["status"] == "awaiting_confirmation"
 
 
 @pytest.mark.db
