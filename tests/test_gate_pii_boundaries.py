@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
@@ -283,7 +284,10 @@ def test_완전한_단위와_허용한_조사서술어만_수량_에코로_대�
         "-10000000",
         "- 10000000",
         "- 10000000원",
-        "10000000.0",
+        "10000000.1",
+        "10000000.0000000000000001",
+        "10000000.1원",
+        "-10000000.00",
         "10000000@example.com",
     ],
 )
@@ -325,24 +329,72 @@ def test_표시용_content의_수량은_빈_evidence_text를_대신하지_않는
 
 
 @pytest.mark.parametrize(
-    "evidence", ["10000000", "10,000,000", "10,000,000개", "1) total_price_krw= 10000000"]
+    "evidence",
+    [
+        "10000000",
+        "10,000,000",
+        "10,000,000개",
+        "1) total_price_krw= 10000000",
+        "10000000.0",
+        "10000000.00",
+        "10,000,000.0000",
+        "10,000,000.00원",
+    ],
 )
 def test_같은_독립된_정수의_수량_표현은_단위_의미까지_판정하지_않는다(evidence: str) -> None:
     assert _judge("+10000000원입니다.", evidence).verdict is Verdict.PASS
     assert RejectReason.PII_DETECTED in _judge("연락처 +10000000", evidence).reject_reasons
 
 
-def test_실제_SQL_금액의_독립된_정수는_양수_금액으로_에코한다() -> None:
+@pytest.mark.parametrize("value", [10000000, Decimal("10000000.0"), Decimal("10000000.00")])
+def test_실제_SQL_금액의_독립된_정수는_양수_금액으로_에코한다(value: int | Decimal) -> None:
     order_no = "ORD-20260201-0001"
     sql = f"SELECT total_price_krw FROM orders WHERE order_no = '{order_no}'"
     query = validate_sql(sql, order_no=order_no, max_rows=50)
     _, evidence_text = _sql_evidence_texts(
         sql=sql,
-        rows=({"total_price_krw": 10000000},),
+        rows=({"total_price_krw": value},),
         pii_safe_output_columns=query.pii_safe_output_columns,
     )
-    assert evidence_text == "1) total_price_krw= 10000000"
+    assert evidence_text == f"1) total_price_krw= {value}"
     assert _judge("+10000000원입니다.", evidence_text).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "10000000@example.com",
+        "+10000000@example.com",
+        '"+10000000"@example.com',
+        '"10000000"@example.com',
+        '"10000000 alias"@example.com',
+        "홍10000000@example.com",
+        '"a=10000000 alias"@example.com',
+        '"10000000원 alias"@example.com',
+        '"1000\u200b0000"@example.com',
+        '"\uff11\uff10\uff10\uff10\uff10\uff10\uff10\uff10"\uff20example.com',
+    ],
+)
+def test_이메일_전체토큰_안의_숫자는_독립된_수량_근거가_아니다(address: str) -> None:
+    evidence = f"customer_email= {address}"
+    assert RejectReason.PII_DETECTED in _judge("+10000000원입니다.", evidence).reject_reasons
+    assert _judge(f"<{address}>", evidence).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "address", ['"10000000 alias"@example.com', '"1000\u200b0000"@example.com']
+)
+def test_이메일을_제외해도_같은_문면의_독립된_금액은_보존한다(address: str) -> None:
+    evidence = f"customer_email= {address}, total_price_krw= 10000000.00"
+    assert _judge("+10000000원입니다.", evidence).verdict is Verdict.PASS
+
+
+def test_0인_소수부의_비교는_float_반올림을_사용하지_않는다() -> None:
+    assert _judge("+10000000.00원입니다.", "10000000.0000").verdict is Verdict.PASS
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge("+10000000원입니다.", "10000000.0000000000000001").reject_reasons
+    )
 
 
 @pytest.mark.parametrize("local", ["customer's=a", "foo=a", "foo=b"])

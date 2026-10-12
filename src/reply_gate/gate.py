@@ -111,14 +111,17 @@ _FORMAT_CATEGORY = "Cf"
 _BLANK_CHARACTERS = frozenset(("\u115f", "\u1160", "\u2800", "\u3164", "\uffa0"))
 _QUANTITY_UNIT = r"(?:원|개|건|명)"
 _QUANTITY_END = r"(?:입니다|이에요|예요|으로|은|는|을|를|이|가|에|로)?(?=$|\s|[.,!?;:)\]}>])"
+_INTEGER_DIGITS = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
 _GROUPED_QUANTITY = re.compile(
     rf"(?<![0-9,])[0-9]{{1,3}}(?:,[0-9]{{3}})+(?= ?{_QUANTITY_UNIT}{_QUANTITY_END})"
 )
 _QUANTITY = re.compile(
-    rf"(?<![\w+\-.,@/])(?P<sign>\+?)(?P<number>[0-9]+) ?"
+    rf"(?<![\w+\-.,@/])(?P<sign>\+?)(?P<number>{_INTEGER_DIGITS})(?:\.0+)? ?"
     rf"(?P<unit>{_QUANTITY_UNIT}){_QUANTITY_END}"
 )
-_INTEGER_VALUE = re.compile(r"(?<![\w+\-.,@/])\+?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?![\w.,@/\-])")
+_INTEGER_VALUE = re.compile(
+    rf"(?<![\w+\-.,@/])\+?(?P<number>{_INTEGER_DIGITS})(?:\.0+)?(?![\w.,@/\-])"
+)
 _INTERNATIONAL_PHONE = re.compile(
     r"(?<![0-9])(?:\+|00)[1-9](?:[-. ()]*[0-9]){6,14}(?![-. ()]*[0-9])"
 )
@@ -145,6 +148,21 @@ def fold_for_detection(text: str) -> str:
     return "".join(ch for ch in folded if unicodedata.category(ch) != _FORMAT_CATEGORY)
 
 
+def _fold_numeric_characters(text: str) -> str:
+    """번호 문자만 접는다. 수의 소수점/국제전화 구분자 해석은 아직 하지 않는다."""
+    return "".join(
+        "-"
+        if ch in NUMERIC_SEPARATOR_VARIANTS
+        else str(unicodedata.decimal(ch))
+        if ch.isdecimal()
+        else ch
+        for ch in fold_for_detection(text)
+        if not unicodedata.category(ch).startswith(_COMBINING_MARK_CATEGORY_PREFIX)
+        and ch not in _BLANK_CHARACTERS
+        and not (unicodedata.category(ch) == "Cc" and not ch.isspace())
+    )
+
+
 def fold_numeric_for_detection(text: str) -> str:
     """번호 계열 접기 — 공통 접기 위에 구분자 변종과 결합 표식을 얹는다.
 
@@ -159,18 +177,7 @@ def fold_numeric_for_detection(text: str) -> str:
     접기는 **탐지에만** 쓴다. 근거 문면을 갈아 끼우지 않는다 — 바꾸면 정상 에코 계약과
     L2 근거가 함께 흔들린다.
     """
-    folded = fold_for_detection(text)
-    numeric = "".join(
-        "-"
-        if ch in NUMERIC_SEPARATOR_VARIANTS
-        else str(unicodedata.decimal(ch))
-        if ch.isdecimal()
-        else ch
-        for ch in folded
-        if not unicodedata.category(ch).startswith(_COMBINING_MARK_CATEGORY_PREFIX)
-        and ch not in _BLANK_CHARACTERS
-        and not (unicodedata.category(ch) == "Cc" and not ch.isspace())
-    )
+    numeric = _fold_numeric_characters(text)
     # 단위가 붙은 올바른 천 단위 묶음만 접는다. 쉼표를 임의 구분자로 받지 않는다.
     numeric = _GROUPED_QUANTITY.sub(lambda match: match.group().replace(",", ""), numeric)
     # 국제번호 안의 국내형 조각을 별도 번호로 뽑으면 +1 1588 1234와 +115881234의
@@ -597,6 +604,13 @@ def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
     return []
 
 
+def _without_email_tokens(text: str) -> str:
+    """이메일과 같은 접기 버퍼에서 주소 전체를 제외한다. 원문 span을 재사용하지 않는다."""
+    folded = _fold_email_for_detection(text)
+    # no-@의 빈 반환값은 이메일 후보가 없다는 뜻이지, 근거 전체가 없다는 뜻이 아니다.
+    return _EMAIL_REGEX.sub(" ", folded) if folded else text
+
+
 def _normalized_matches(
     *,
     texts: Sequence[str],
@@ -606,18 +620,19 @@ def _normalized_matches(
     """패턴 하나가 텍스트들에서 뽑은 **정규화된 값** 집합. 접기는 그 패턴의 것을 쓴다."""
     values: set[str] = set()
     for text in texts:
-        folded = pattern.fold(text)
+        candidate = text if pattern.name == "email" else _without_email_tokens(text)
         if pattern.name != "email" and sourced_numbers:
             # 같은 완전한 정수가 근거에 있는 수량 토큰에서만 '+'를 대조용으로 접는다.
             # 단위 없는 전화까지 전역 allowlist에 넣거나 pii_shaped의 탐지를 끄지 않는다.
-            folded = _QUANTITY.sub(
+            candidate = _QUANTITY.sub(
                 lambda match: (
                     match.group()[1:]
-                    if match["sign"] == "+" and match["number"] in sourced_numbers
+                    if match["sign"] == "+" and normalize_digits(match["number"]) in sourced_numbers
                     else match.group()
                 ),
-                folded,
+                _fold_numeric_characters(candidate),
             )
+        folded = pattern.fold(candidate)
         values.update(pattern.normalize(match) for match in pattern.regex.findall(folded))
     return values
 
@@ -647,17 +662,18 @@ def _has_unsourced_pii(
     한쪽만 넓혀져 기준이 갈린다.
     """
     # 값의 표기 차이만 대조한다. SQL의 단위 없는 정수도 근거이며 단위 의미는 L2다.
-    # 긴 ID의 조각·소수·음수·이메일 일부는 독립된 양수 정수로 채택하지 않는다.
+    # 0인 소수부만 정수부와 정확히 비교한다. float 반올림이나 소수점 제거는 하지 않는다.
+    # 긴 ID의 조각·비정수·음수·이메일 일부는 독립된 양수 정수로 채택하지 않는다.
     sourced_numbers: set[str] = set()
     for text in evidence_texts:
-        numeric = fold_numeric_for_detection(text)
+        numeric = _fold_numeric_characters(_without_email_tokens(text))
         sourced_numbers.update(
-            match["number"]
+            normalize_digits(match["number"])
             for match in _QUANTITY.finditer(numeric)
             if not numeric[: match.start()].rstrip().endswith("-")
         )
         sourced_numbers.update(
-            normalize_digits(match.group())
+            normalize_digits(match["number"])
             for match in _INTEGER_VALUE.finditer(numeric)
             if not numeric[: match.start()].rstrip().endswith("-")
         )
