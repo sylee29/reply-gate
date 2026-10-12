@@ -1574,6 +1574,7 @@ _PII_RULE_PROBE: Final = (
     "+82-10-1234-5678 0082 2 123 4567 1588-1234 900101-1234567  A_B@Example.COM "
     "메일은 hong@example.com입니다. customer_email=hong@example.com입니다 "
     "<hong@example.com입니다> hong@example.com입니다.evil support@쇼핑몰.한국 "
+    "국제 연락처 +1-202-555-0123 끝"
 )
 
 #: 조회 가드 탐침이 쓰는 주문번호. **선검사를 통과한 형식**이어야 한다(아니면 호출 측
@@ -1779,6 +1780,36 @@ def _email_boundary_probe() -> str:
     return "|".join(observed)
 
 
+def _draft_content_boundary_probe() -> str:
+    """빈 내용, 수량 에코, 이메일 내부 숫자의 채택 경계를 실제 판정으로 읽는다."""
+    evidence_id = "policy:probe:content"
+    observed: list[str] = []
+    for source, text in (
+        ("일반 안내", "\u200b"),
+        ("일반 안내", "\u115f"),
+        ("일반 안내", "+12025550123 개인 연락처"),
+        ("amount= 15,881,234.00", "+15881234원"),
+        ("amount= 10000000.0", "+10000000원"),
+        ('email= "10000000"@example.com', "+10000000원"),
+        ("일반 안내", "+10000000원"),
+        ("amount= 10000000.0", "+10000000원, 연락처 +10000000"),
+        ("email= user@example.com", "010 user@example.com 1234 5678"),
+        ("email= user@example.com", "changed+user@example.com"),
+        ("email= changed+user@example.com", "changed+user@example.com"),
+    ):
+        evidence = Evidence(
+            id=evidence_id, source=EvidenceSource.POLICY, content=source, evidence_text=source
+        )
+        result = evaluate_draft(
+            raw_draft={"claims": [{"text": text, "citation_ids": [evidence_id]}]},
+            evidences=(evidence,),
+        )
+        observed.append(
+            result.verdict.value + ":" + ",".join(r.value for r in result.reject_reasons)
+        )
+    return "|".join(observed)
+
+
 def _draft_rule_version() -> str:
     """초안 판정 규칙의 판 — **접기·패턴·claim 연결 검사**의 내용 지문.
 
@@ -1795,6 +1826,7 @@ def _draft_rule_version() -> str:
         "fold_numeric=" + fold_numeric_for_detection(_PII_RULE_PROBE),
         "cross_claim_pii=" + _cross_claim_pii_probe(),
         "email_boundary=" + _email_boundary_probe(),
+        "content_boundary=" + _draft_content_boundary_probe(),
     ]
     parts.extend(
         f"pattern={pattern.name}|regex={pattern.regex.pattern}|flags={pattern.regex.flags}"

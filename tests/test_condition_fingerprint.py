@@ -23,6 +23,7 @@ import ast
 import inspect
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -284,10 +285,60 @@ def test_이메일_지문_탐침은_산문과_명시_주소를_함께_태운다(
     folded = email.fold(evaluation._PII_RULE_PROBE)
 
     assert "메일은 hong@example.com 입니다." in folded
-    assert "customer_email=hong@example.com입니다" in folded
+    assert "customer_email= hong@example.com입니다" in folded
     assert "<hong@example.com입니다>" in folded
     assert "hong@example.com입니다.evil" in folded
     assert "support@쇼핑몰.한국" in folded
+
+
+def test_보이지_않는_claim을_허용하면_초안_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """패턴 선언만으로는 빈 내용 판정 변경이 드러나지 않는다."""
+    before = _draft_rule_version()
+    inspect_schema = gate._inspect_schema
+
+    def allow_invisible(raw: object) -> gate._SchemaInspection:
+        inspection = inspect_schema(raw)
+        return replace(inspection, ok=True)
+
+    monkeypatch.setattr(gate, "_inspect_schema", allow_invisible)
+    assert _draft_rule_version() != before
+
+
+@pytest.mark.parametrize("boundary", ["_QUANTITY", "_INTEGER_VALUE"])
+def test_같은_수량의_에코_경계를_빼면_초안_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    """실제 판정에 쓰이는 수량 문맥과 근거 정수 채택을 각각 뒤집는다."""
+    before = _draft_rule_version()
+    monkeypatch.setattr(gate, boundary, re.compile(r"(?!)"))
+    assert _draft_rule_version() != before
+
+
+def test_이메일을_숫자_근거에서_빼지_않으면_초안_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """주소 안 숫자가 별도 수량의 허용 출처로 승격되는 변경을 잡는다."""
+    before = _draft_rule_version()
+    monkeypatch.setattr(gate, "_without_email_tokens", lambda text: text)
+    assert _draft_rule_version() != before
+
+
+def test_초안_내용_탐침은_승인과_기각_양쪽을_포함한다() -> None:
+    assert evaluation._draft_content_boundary_probe().split("|") == [
+        "reject:schema_violation",
+        "reject:schema_violation",
+        "reject:pii_detected",
+        "pass:",
+        "pass:",
+        "reject:pii_detected",
+        "reject:pii_detected",
+        "reject:pii_detected",
+        "pass:",
+        "reject:pii_detected",
+        "pass:",
+    ]
 
 
 def test_이메일을_claim별로_접으면_판정_지문도_바뀐다(monkeypatch: pytest.MonkeyPatch) -> None:

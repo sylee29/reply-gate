@@ -23,6 +23,7 @@ venv/
 .dryforge/
 .dryforge/worktrees/
 .dryforge/backup/
+.scratch/
 
 # 산출물 — 라이브 실측 리포트만 추적한다.
 # 문서가 인용하는 수치의 근거이고, 재생성하려면 과금되는 재실행이 필요하다.
