@@ -88,3 +88,8 @@ def test_로컬_임베딩도_영벡터와_잘못된_수치를_거부한다(vecto
     client = llm.BgeM3EmbeddingClient(model=_LocalEmbeddingModel([vector]))
     with pytest.raises(ValueError):
         client.embed(stage="query", texts=["문의"])
+
+
+def test_float_범위를_넘는_정수_벡터도_형식_오류로_거부한다() -> None:
+    with pytest.raises(ValueError):
+        llm.validate_embedding_vectors([[10**400, 1.0]], count=1, dimensions=2)

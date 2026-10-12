@@ -58,6 +58,12 @@ _BASE_FINGERPRINT: Mapping[str, str] = {
     "embedding_dimensions": "1536",
     "top_k": "5",
     "generation_model": "gpt-5.6-terra",
+    "intent_prompt_version": "intent-prompt-synthetic",
+    "sql_prompt_version": "sql-prompt-synthetic",
+    "draft_prompt_version": "draft-prompt-synthetic",
+    "rewrite_prompt_version": "rewrite-prompt-synthetic",
+    "policy_data_version": "policy-db-synthetic",
+    "order_data_version": "orders-db-synthetic",
     "judge_model": "claude-sonnet-5",
     "judge_effort": "기본값",
     "judge_thinking": "미전송(계열 기본)",
@@ -353,7 +359,7 @@ def _missing_registered_fields(promotion: PromotedBaseline, expected_fields: set
     }
 
 
-def test_등재된_참조는_등록당시_칸을_보존하고_새_L2규칙만_모른다() -> None:
+def test_등재된_참조는_등록당시_칸을_보존하고_추가된_규칙과_입력은_모른다() -> None:
     """역사적 등록을 새 규칙으로 채우지 않되, 원래 알고 있던 칸의 누락은 계속 잡는다."""
     promotion = load_promoted_baseline()
     assert isinstance(promotion, PromotedBaseline)
@@ -363,7 +369,15 @@ def test_등재된_참조는_등록당시_칸을_보존하고_새_L2규칙만_�
         assert registered_fields
         assert _missing_registered_fields(promotion, registered_fields) == set()
     unknown = {name for name, value in promotion.fingerprint.values.items() if value is None}
-    assert unknown == {"judge_rule_version"}, sorted(unknown)
+    assert unknown == {
+        "judge_rule_version",
+        "intent_prompt_version",
+        "sql_prompt_version",
+        "draft_prompt_version",
+        "rewrite_prompt_version",
+        "policy_data_version",
+        "order_data_version",
+    }, sorted(unknown)
 
 
 @pytest.mark.parametrize("removed", ["judge_prompt_version", "generation_effort"])
@@ -1479,7 +1493,15 @@ def test_세트_편입은_옛_산출물을_끌어오지_않는다() -> None:
         run = run_summary_from_payload(payload, stem=stem, source=stem)
         assert _fingerprint_conflicts(run.fingerprint, promoted.fingerprint) == [], stem
         unknown = [n for n, v in run.fingerprint.values.items() if v is None]
-        assert unknown == ["judge_rule_version"], (stem, unknown)
+        assert set(unknown) == {
+            "judge_rule_version",
+            "intent_prompt_version",
+            "sql_prompt_version",
+            "draft_prompt_version",
+            "rewrite_prompt_version",
+            "policy_data_version",
+            "order_data_version",
+        }, (stem, unknown)
 
     # ③ 제외된 옛 산출물이 **이름으로** 남는다 — 조용히 빠지지 않는다.
     assert any("evaluation-live-l2-2" in item for item in guard.candidate_exclusions)

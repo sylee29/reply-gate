@@ -138,7 +138,15 @@ def _conditions(
         measurement2_is_real=True,
         measurement3_is_real=True,
         billed=True,
-        condition_fingerprint=_script_fingerprint() if fingerprint is None else fingerprint,
+        condition_fingerprint=(
+            {
+                **_script_fingerprint(),
+                "policy_data_version": "policy-db-synthetic",
+                "order_data_version": "orders-db-synthetic",
+            }
+            if fingerprint is None
+            else fingerprint
+        ),
         declared_experiment_fields=declared,
         aborted_measurements=aborted,
     )
@@ -718,7 +726,16 @@ def test_옛_산출물과의_대조는_미상을_관용한다() -> None:
     comparison = _extended_legacy().compare(_legacy())
 
     assert comparison.comparable is True
-    assert set(comparison.unknown_fields) == {*NEW_FINGERPRINT_FIELDS, "judge_rule_version"}
+    assert set(comparison.unknown_fields) == {
+        *NEW_FINGERPRINT_FIELDS,
+        "judge_rule_version",
+        "intent_prompt_version",
+        "sql_prompt_version",
+        "draft_prompt_version",
+        "rewrite_prompt_version",
+        "policy_data_version",
+        "order_data_version",
+    }
 
 
 def test_세트_편입은_미상을_인정하지_않는다() -> None:
@@ -1090,10 +1107,23 @@ def test_기존_실측의_L2_규칙은_미상이고_새_세트에는_편입되�
     assert old.values["judge_rule_version"] is None
     values = dict(old.values)
     values["judge_rule_version"] = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    # 새 실행 대역은 추가된 입력도 실제로 안다는 조건을 명시한다. 옛 산출물은 그대로 미상이다.
+    values.update(evaluation._generation_prompt_versions())
+    values.update(
+        {"policy_data_version": "policy-db-synthetic", "order_data_version": "orders-db-synthetic"}
+    )
     new = ConditionFingerprint.from_values(values)
     comparison = new.compare(old)
     assert comparison.comparable is True
-    assert comparison.unknown_fields == ("judge_rule_version",)
+    assert set(comparison.unknown_fields) == {
+        "judge_rule_version",
+        "intent_prompt_version",
+        "sql_prompt_version",
+        "draft_prompt_version",
+        "rewrite_prompt_version",
+        "policy_data_version",
+        "order_data_version",
+    }
     assert new.same_condition(old)[0] is False
     assert old.same_condition(old)[0] is False
     assert new.same_condition(new) == (True, None)
@@ -1161,3 +1191,21 @@ def test_L2_규칙_지문은_새_리포트_JSON과_문면에_함께_실린다() 
         report_to_json(report)["conditions"]["condition_fingerprint"]["judge_rule_version"] == value
     )
     assert value in render_markdown(report)
+
+
+def test_중복_JSON_키_허용으로_되돌리면_L2_규칙_지문이_바뀐다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    monkeypatch.setattr(llm, "_unique_json_object", dict)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_초안_근거_포맷의_변경도_사용자_프롬프트_지문이_잡는다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from reply_gate import draft
+
+    before = evaluation.code_condition_fingerprint()["draft_prompt_version"]
+    monkeypatch.setattr(draft, "_format_evidence", lambda evidence: "변경된 근거 문면")
+    assert evaluation.code_condition_fingerprint()["draft_prompt_version"] != before

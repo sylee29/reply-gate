@@ -44,9 +44,13 @@ from typing import Any, Final, Protocol, cast
 import psycopg
 from psycopg.rows import DictRow
 
+from reply_gate import draft as draft_module
+from reply_gate import evidence as evidence_module
 from reply_gate import judge as judge_module
 from reply_gate import llm, policy_index, retrieval_strategies, sql_guard
+from reply_gate import query_rewrite as rewrite_module
 from reply_gate.contracts import (
+    DRAFT_JSON_SCHEMA,
     Claim,
     Draft,
     EscalationReason,
@@ -130,6 +134,7 @@ __all__ = [
     "build_report",
     "code_condition_fingerprint",
     "display_path",
+    "load_fixture_phone_inputs",
     "load_golden_set",
     "load_judge_fixtures",
     "load_l1_fixtures",
@@ -589,7 +594,7 @@ class GoldenOutcome:
 
     @property
     def gate_never_ran(self) -> bool:
-        """L2 판정 호출이 무너져 **판정 자체가 없었던** 케이스인가.
+        """의도·초안·L2 호출 실패로 **판정 자체가 없었던** 케이스인가.
 
         판정 호출이 실패한 시도의 종합 verdict 는 `pass` 다(docs/contracts.md "층별 판정 키"
         ③ — 그 시도의 진실은 `escalation_reason` 이 들고 있다). 그래서 `attempt_verdicts`
@@ -597,12 +602,13 @@ class GoldenOutcome:
         미실행이 관측 실패로 접혀 지표에 0 으로 채워진다
         (`scripts/AGENTS.md` 불변식 5 — 미실행을 0 으로 채우지 않는다).
 
-        contracts.md 가 지정한 신호를 그대로 쓴다: 인계 사유 `llm_call_failed` +
-        실패 단계 `l2_judge`. 단, 앞선 시도에서 이미 기각했다면 재현은 관측된 것이다.
+        인계 사유 `llm_call_failed` 이고 L2 호출이 실패했거나 시도 자체가 없는 경우다.
+        업무상 `no_evidence` 종료는 기술적 실패가 아니다. 앞선 시도에서 이미 기각했다면
+        재현은 관측됐으므로 마지막 호출 실패가 이를 지우지 않는다.
         """
         return (
             self.escalation_reason is EscalationReason.LLM_CALL_FAILED
-            and self.failed_stage == L2_JUDGE_STAGE
+            and (self.failed_stage == L2_JUDGE_STAGE or not self.attempt_verdicts)
             and not self.rejected_at_least_once
         )
 
@@ -653,12 +659,8 @@ def _span_aggregate(span: str, values: Sequence[float | None]) -> SpanAggregate:
 
 
 def _percentile_ms(values: Sequence[float], percent: int) -> float | None:
-    """nearest-rank 백분위 — 정수 지연(`_percentile`)과 **같은 규칙**의 실수판이다."""
-    if not values:
-        return None
-    ordered = sorted(values)
-    rank = max(1, min(len(ordered), _ceil_div(percent * len(ordered), 100)))
-    return ordered[rank - 1]
+    """실수 지연도 같은 nearest-rank 규칙을 따른다."""
+    return _percentile(values, percent)
 
 
 @dataclass(frozen=True)
@@ -714,6 +716,8 @@ class PipelineAgreement:
     #: 구간 아홉의 세트 집계. **미측정 케이스는 각 구간의 분모에서 빠진다.**
     #: 순서는 `evidence.SPAN_NAMES`(파이프라인 실행 순서)와 같다.
     stage_durations: tuple[SpanAggregate, ...] = ()
+    #: 측정 동안 잠근 실제 DB 입력의 지문. 파일 지문으로 추정하지 않는다.
+    input_fingerprint: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def match_rate(self) -> float | None:
@@ -889,17 +893,29 @@ def _compare(case: GoldenCase, processed: ProcessedInquiry) -> tuple[bool, tuple
     return not mismatches, tuple(mismatches)
 
 
+def load_fixture_phone_inputs(
+    path: Path = _ROOT / "db" / "fixtures" / "orders.jsonl",
+) -> tuple[dict[str, str], str]:
+    """같은 한 번의 읽기에서 확인 입력과 전체 픽스처 판을 함께 고정한다.
+
+    전화 뒷자리 맵만 해시하지 않는다. 실제 DB 주문 판과 이 전체 입력 판을 함께 지문에 싣는다.
+    """
+    content = path.read_text(encoding="utf-8")
+    inputs: dict[str, str] = {}
+    for line in content.splitlines():
+        row = json.loads(line)
+        inputs[row["order_no"]] = "".join(c for c in row["customer_phone"] if c in "0123456789")[
+            -4:
+        ]
+    return inputs, text_digest(content, prefix="order-fixture-")
+
+
 def fixture_phone_last4(order_no: str | None) -> str | None:
     """평가자는 커밋된 합성 주문의 정당한 주문자로 요청한다. 골든셋은 불변이다."""
     if order_no is None:
         return None
-    for line in (
-        (_ROOT / "db" / "fixtures" / "orders.jsonl").read_text(encoding="utf-8").splitlines()
-    ):
-        row = json.loads(line)
-        if row["order_no"] == order_no:
-            return "".join(c for c in row["customer_phone"] if c in "0123456789")[-4:]
-    return None
+    inputs, _version = load_fixture_phone_inputs()
+    return inputs.get(order_no)
 
 
 def evaluate_case(
@@ -908,6 +924,7 @@ def evaluate_case(
     pipeline: PipelineRunning,
     app_conn: psycopg.Connection[DictRow],
     readonly_conn: psycopg.Connection[DictRow],
+    phone_last4_by_order: Mapping[str, str | None] | None = None,
 ) -> GoldenOutcome:
     """골든셋 1건을 접수 → 파이프라인 → 라벨 대조까지 돌린다.
 
@@ -943,7 +960,11 @@ def evaluate_case(
         order_no=accepted.order_no,
         app_conn=app_conn,
         readonly_conn=readonly_conn,
-        phone_last4=fixture_phone_last4(accepted.order_no),
+        phone_last4=(
+            fixture_phone_last4(accepted.order_no)
+            if phone_last4_by_order is None
+            else phone_last4_by_order.get(accepted.order_no or "")
+        ),
     )
     matched, mismatches = _compare(case, processed)
     return GoldenOutcome(
@@ -991,6 +1012,7 @@ def measure_pipeline_agreement(
     app_conn: psycopg.Connection[DictRow],
     readonly_conn: psycopg.Connection[DictRow],
     on_outcome: Callable[[GoldenOutcome], None] | None = None,
+    phone_last4_by_order: Mapping[str, str | None] | None = None,
 ) -> PipelineAgreement:
     """측정 2 — 골든셋 전체를 **끝까지** 흘린다.
 
@@ -1001,7 +1023,11 @@ def measure_pipeline_agreement(
     outcomes: list[GoldenOutcome] = []
     for case in cases:
         outcome = evaluate_case(
-            case=case, pipeline=pipeline, app_conn=app_conn, readonly_conn=readonly_conn
+            case=case,
+            pipeline=pipeline,
+            app_conn=app_conn,
+            readonly_conn=readonly_conn,
+            phone_last4_by_order=phone_last4_by_order,
         )
         outcomes.append(outcome)
         if on_outcome is not None:
@@ -1110,7 +1136,7 @@ def _aggregate_stage_durations(outcomes: Sequence[GoldenOutcome]) -> tuple[SpanA
     )
 
 
-def _percentile(values: Sequence[int], percent: int) -> int | None:
+def _percentile[T: (int, float)](values: Sequence[T], percent: int) -> T | None:
     """nearest-rank 백분위. 30건 규모에서 보간은 없는 정밀도를 가장한다."""
     if not values:
         return None
@@ -1894,6 +1920,8 @@ def _judge_rule_probe_outcomes() -> dict[str, str]:
         "normal": '{"text":"한국어 안내", "values":[0,1.25,1e100]}',
         "literal_words": '{"text":"NaN Infinity 1e999"}',
         "surrogate_pair": r'{"text":"\ud83d\ude00"}',
+        "duplicate_key": '{"verdict":"reject","verdict":"pass"}',
+        "nested_duplicate_key": '{"nested":{"ok":false,"ok":true}}',
         "malformed": '{"text":',
         "nan": '{"value":NaN}',
         "infinity": '{"value":Infinity}',
@@ -2026,6 +2054,90 @@ def _judge_rule_version() -> str:
     )
 
 
+def _generation_prompt_versions() -> dict[str, str]:
+    """실제 호출 모듈의 시스템 문면·사용자 템플릿·스키마에 묶인 판.
+
+    사용자 템플릿은 소스 전체를 포함해 재시도/재생성 분기도 빠뜨리지 않는다.
+    소스와 무관한 데이터 변경은 별도의 실제 입력 지문이 맡는다.
+    """
+    inquiry = "배송 상태와 환불 규정을 알려 주세요."
+    order_no = "ORD-20260101-0001"
+    evidence = (
+        Evidence(
+            id="policy:prompt:1",
+            source=EvidenceSource.POLICY,
+            content="환불 기간은 7일입니다.",
+            evidence_text="환불 기간은 7일입니다.",
+        ),
+    )
+    user_probes = {
+        "intent": [
+            evidence_module.build_intent_user_prompt(inquiry=inquiry),
+            evidence_module.build_intent_user_prompt(
+                inquiry=inquiry,
+                order_no=order_no,
+                previous_output="invalid",
+                previous_error="형식 오류",
+            ),
+        ],
+        "sql": [
+            evidence_module.build_sql_user_prompt(inquiry=inquiry, order_no=order_no, max_rows=50),
+            evidence_module.build_sql_user_prompt(
+                inquiry=inquiry,
+                order_no=order_no,
+                max_rows=50,
+                previous_sql="SELECT 1",
+                previous_error="화이트리스트 밖",
+            ),
+        ],
+        "draft": [
+            draft_module.build_draft_user_prompt(inquiry=inquiry, evidence=evidence),
+            draft_module.build_draft_user_prompt(
+                inquiry=inquiry, evidence=evidence, reject_reasons=tuple(RejectReason)
+            ),
+            inspect.getsource(draft_module._format_judge_detail),
+        ],
+        "rewrite": [rewrite_module.build_rewrite_user_prompt(inquiry=inquiry)],
+    }
+    specs = (
+        (
+            "intent",
+            evidence_module.INTENT_SYSTEM_PROMPT,
+            evidence_module.build_intent_user_prompt,
+            evidence_module.INTENT_JSON_SCHEMA,
+        ),
+        (
+            "sql",
+            evidence_module.SQL_SYSTEM_PROMPT,
+            evidence_module.build_sql_user_prompt,
+            evidence_module.SQL_JSON_SCHEMA,
+        ),
+        (
+            "draft",
+            draft_module.DRAFT_SYSTEM_PROMPT,
+            draft_module.build_draft_user_prompt,
+            DRAFT_JSON_SCHEMA,
+        ),
+        (
+            "rewrite",
+            rewrite_module.REWRITE_SYSTEM_PROMPT,
+            rewrite_module.build_rewrite_user_prompt,
+            rewrite_module.REWRITE_JSON_SCHEMA,
+        ),
+    )
+    return {
+        f"{name}_prompt_version": text_digest(
+            json.dumps(
+                [system, inspect.getsource(builder), schema, user_probes[name]],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            prefix=f"{name}-prompt-",
+        )
+        for name, system, builder, schema in specs
+    }
+
+
 def code_condition_fingerprint() -> dict[str, str]:
     """**코드가 결정하는** 조건 지문 항목. 실행 인자·설정·시각을 보지 않는다.
 
@@ -2033,6 +2145,7 @@ def code_condition_fingerprint() -> dict[str, str]:
     싣고, 명시가 이긴다 — 여기 값과 이름이 겹치면 진입점 쪽이 남는다.
     """
     return {
+        **_generation_prompt_versions(),
         "judge_thinking": JUDGE_THINKING,
         "judge_rule_version": _judge_rule_version(),
         "draft_rule_version": _draft_rule_version(),
@@ -2338,6 +2451,7 @@ def build_report(
     pipeline: PipelineAgreement | SkippedMeasurement,
     judge_accuracy: JudgeAccuracy | SkippedMeasurement,
     retrieval_labels_path: Path | None = None,
+    golden_set_path: Path = DEFAULT_GOLDEN_SET_PATH,
 ) -> EvaluationReport:
     """리포트를 조립한다. **측정 3 도 명시해야 한다** — 기본값으로 비워 두면 미실행이
     조용히 "사유 없는 미실행"으로 찍힌다.
@@ -2348,6 +2462,7 @@ def build_report(
     failure_attribution = _build_failure_attribution(
         pipeline=pipeline,
         retrieval_labels_path=retrieval_labels_path,
+        golden_set_path=golden_set_path,
     )
     return EvaluationReport(
         conditions=conditions,
@@ -2390,6 +2505,7 @@ def _build_failure_attribution(
     *,
     pipeline: PipelineAgreement | SkippedMeasurement,
     retrieval_labels_path: Path | None,
+    golden_set_path: Path,
 ) -> FailureAttribution | UnavailableBreakdown:
     # 지연 import: retrieval_labels 는 골든셋 검증을 위해 evaluation 로더를 쓴다.
     # 보고서 조립 시점에만 반대 방향을 열어 모듈 순환 import 를 피한다.
@@ -2405,7 +2521,7 @@ def _build_failure_attribution(
 
     path = DEFAULT_RETRIEVAL_LABELS_PATH if retrieval_labels_path is None else retrieval_labels_path
     try:
-        labels = load_retrieval_labels(path)
+        labels = load_retrieval_labels(path, golden_set_path=golden_set_path)
     except (KeyError, OSError, TypeError, ValueError) as exc:
         return UnavailableBreakdown(reason=f"검색 정답 라벨 로드 실패({type(exc).__name__}): {exc}")
 

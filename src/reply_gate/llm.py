@@ -282,10 +282,14 @@ def validate_embedding_vectors(
     for vector in vectors:
         if len(vector) != dimensions:
             raise ValueError("임베딩 차원이 구성과 다르다")
-        if any(
-            isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value)
-            for value in vector
-        ):
+        try:
+            invalid = any(
+                isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value)
+                for value in vector
+            )
+        except OverflowError:
+            invalid = True
+        if invalid:
             raise ValueError("임베딩 값은 유한한 숫자여야 한다")
         if not any(value != 0 for value in vector):
             raise ValueError("임베딩은 영벡터일 수 없다")
