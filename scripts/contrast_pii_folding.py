@@ -8,10 +8,9 @@ uv run python -m scripts.contrast_pii_folding
 채택 전에 **양방향**을 같은 대조에서 낸다 — 새로 잡히는 값(미탐이 닫힌 건수)과 사라지는
 값(정상 에코가 기각될 건수)을 함께 센다. 오탐이 늘면 채택하지 않는다.
 
-**전/후를 어떻게 재나.** 수정 전 접기는 지금도 모듈에 살아 있다 — 이메일 패턴이 쓰는
-공통 접기(`gate.fold_for_detection`)가 그것이다. 그래서 이 대조는 옛 코드를 재현하지
-않고, 같은 패턴 집합에 **접기만 갈아 끼워** 두 판정을 나란히 낸다. 병합 뒤에도 그대로
-재현된다.
+**전/후를 어떻게 재나.** 번호 계열의 공통 접기(`gate.fold_for_detection`)와 현재 번호
+접기를 같은 패턴 집합에 적용한다. 이메일 전용 경계는 양쪽에서 그대로 유지한다.
+옛 코드 전체를 재현하는 대조가 아니므로 정규식 변경 전/후의 효과로 해석하지 않는다.
 
 **모집단.**
 
@@ -83,10 +82,14 @@ class Contrast:
 
 
 def _detect(text: str, *, fold_all_as_email: bool) -> set[Detection]:
-    """`fold_all_as_email=True` 면 **수정 전** 동작이다 — 전 패턴이 공통 접기를 쓴다."""
+    """True일 때 번호 패턴만 공통 접기로 되돌린다. 이메일 경계는 고정한다."""
 
     def fold(pattern: PiiPattern) -> str:
-        return fold_for_detection(text) if fold_all_as_email else pattern.fold(text)
+        return (
+            fold_for_detection(text)
+            if fold_all_as_email and pattern.name != "email"
+            else pattern.fold(text)
+        )
 
     return {
         (pattern.name, pattern.normalize(match))

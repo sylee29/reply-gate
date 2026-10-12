@@ -224,8 +224,10 @@ def test_구분자_12자는_범주로_유도할_수_없는_열거_집합이다()
     구두점·연결선 세 범주에 흩어져 있다. 범주로 구현하면 열거된 절반이 통과한 채
     문서는 닫혔다고 적게 된다.
     """
-    assert set(SEPARATOR_VARIANTS) == set(NUMERIC_SEPARATOR_VARIANTS)
-    assert len(NUMERIC_SEPARATOR_VARIANTS) == 12
+    assert set(SEPARATOR_VARIANTS) | {"\u00b7", "\u318d", "\u119e", "~"} == set(
+        NUMERIC_SEPARATOR_VARIANTS
+    )
+    assert len(SEPARATOR_VARIANTS) == 12
 
     dashes = {ch for ch in SEPARATOR_VARIANTS if unicodedata.category(ch) == "Pd"}
     assert len(dashes) == 6
@@ -286,7 +288,7 @@ def test_패턴마다_접기가_따로_붙어_있다() -> None:
 
     assert folds["email"]("hong@example.com입니다.") == "hong@example.com 입니다."
     assert folds["email"]("customer_email=hong@example.com입니다") == (
-        "customer_email=hong@example.com입니다"
+        "customer_email= hong@example.com입니다"
     )
     assert {name for name, _template in NUMBER_FAMILIES} <= set(folds)
     for name, _template in NUMBER_FAMILIES:
@@ -372,7 +374,23 @@ def _committed_texts() -> list[str]:
         _ROOT / "data" / "golden_set.jsonl",
         _ROOT / "data" / "judge_fixtures.jsonl",
     ):
-        texts.extend(line for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        # JSON 구분자까지 산문으로 읽으면 이메일 필드를 명시된 주소로 오해한다.
+        # 실제 게이트가 받는 디코딩된 문자열들을 전수로 꺼낸다.
+        def strings(value: object) -> list[str]:
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, dict):
+                return [text for key, item in value.items() for text in strings((key, item))]
+            if isinstance(value, list | tuple):
+                return [text for item in value for text in strings(item)]
+            return []
+
+        texts.extend(
+            text
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+            for text in strings(json.loads(line))
+        )
     return texts
 
 

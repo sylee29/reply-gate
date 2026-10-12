@@ -20,9 +20,19 @@ import pytest
 from scripts.contrast_pii_folding import (
     Case,
     VerdictContrast,
+    _detect,
     l1_fixture_cases,
     verdict_contrast,
 )
+
+
+def test_번호_접기_대조는_이메일_전용_경계를_양쪽에서_유지한다() -> None:
+    """이메일 추출 경계까지 바꾸면 정상 에코 회복을 번호 접기의 성과로 잘못 센다."""
+    text = "customer_email=hong@example.com"
+    expected = {("email", "hong@example.com")}
+    assert _detect(text, fold_all_as_email=True) == expected
+    assert _detect(text, fold_all_as_email=False) == expected
+
 
 #: 근거에 없는 정상 문자열. 밑줄이 번호 구분자로 접히면서 대표번호 모양이 된다 —
 #: 이 저장소의 사유 코드·근거 ID·컬럼명이 밑줄을 쓰므로 실제로 있을 수 있는 모양이다.
