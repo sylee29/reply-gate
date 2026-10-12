@@ -1588,6 +1588,11 @@ _SQL_GUARD_PROBE_ORDER_NO: Final = "ORD-20260201-0001"
 #: 계산 컬럼), 그리고 거부 쪽 셋(목록 밖 캐스트 대상 타입 · 목록 밖 함수 · 주문 범위 미한정)을
 #: 함께 든다. **양쪽을 다 담아야** 규칙이 어느 방향으로 움직여도 값이 따라간다.
 _SQL_GUARD_PROBES: Final[tuple[str, ...]] = (
+    # 입력 AST는 통과하지만 직렬화 뒤 리터럴 경계가 달라지는 재현과 정상 대조다.
+    f"SELECT order_no FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"
+    r" AND status <> E'\\' AND status <> ' OR 1=1 --'",
+    f"SELECT order_no FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"
+    " AND status <> E'CaseSensitive'",
     f"SELECT customer_phone FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
     "WITH scoped AS ("
     f"SELECT order_no, customer_phone FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"

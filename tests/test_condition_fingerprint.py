@@ -23,10 +23,11 @@ import ast
 import inspect
 import json
 import os
+import secrets
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final, cast
@@ -35,6 +36,7 @@ import psycopg
 import pytest
 from psycopg.rows import DictRow
 from scripts import evaluate
+from sqlglot import exp
 
 from reply_gate import evaluation, gate, llm, retrieval_strategies, sql_guard
 from reply_gate.config import Settings
@@ -461,6 +463,39 @@ def test_조회_가드_탐침이_실제로_유래를_가른다() -> None:
     assert any(item.startswith("reject|") for item in outcomes), outcomes
 
 
+def test_실행_문자열_재검사를_빼면_조회_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """정상 조회만 재면 새 직렬화 방어가 빠져도 같은 판으로 남는다."""
+    before = _sql_guard_version()
+    validate = sql_guard.validate_sql
+    parse = sql_guard._parse_single_statement
+
+    def without_output_check(
+        sql: str,
+        *,
+        order_no: str,
+        max_rows: int,
+        whitelist: Mapping[str, tuple[str, ...]] = sql_guard.SCHEMA_WHITELIST,
+    ) -> sql_guard.ValidatedQuery:
+        input_tree: exp.Expr | None = None
+
+        def reuse_input(text: str) -> exp.Expr:
+            nonlocal input_tree
+            if input_tree is None:
+                input_tree = parse(text)
+                return input_tree
+            assert isinstance(input_tree, exp.Select)
+            return input_tree.limit(max_rows)
+
+        with monkeypatch.context() as mutation:
+            mutation.setattr(sql_guard, "_parse_single_statement", reuse_input)
+            return validate(sql, order_no=order_no, max_rows=max_rows, whitelist=whitelist)
+
+    monkeypatch.setattr(sql_guard, "validate_sql", without_output_check)
+    assert _sql_guard_version() != before
+
+
 def test_조회_출력명_경계의_판정도_지문에_실린다() -> None:
     """DB 출력명 충돌과 quoted 유래가 바뀌면 같은 조건으로 비교해서는 안 된다."""
     assert evaluation.sql_guard_probe_outcomes()[-7:] == (
@@ -758,6 +793,7 @@ def _run_with(reason: AbstentionUndefined | None) -> ProcessedInquiry:
         drafter=cast(Any, None),
         judge=None,
         l2_enabled=False,
+        settings=declared_settings(phone_hmac_secret=secrets.token_hex(32)),
     )
     return pipeline.run(
         inquiry_id=new_inquiry_id(),
