@@ -356,7 +356,7 @@ def _public_evidence(
             columns = private_columns[item.id]
             rows = tuple(
                 {
-                    mask(key): (
+                    key: (
                         value
                         if key not in columns
                         and (value is None or isinstance(value, bool | int | float))
@@ -368,7 +368,7 @@ def _public_evidence(
                 }
                 for row in snapshot.result_rows
             )
-            content = render_sql_rows(rows)
+            content = render_sql_rows(rows, mask_key=mask)
         citations.append(CitationOut(id=item.id, source=item.source.value, content=content))
     # 상품 확인의 오래된 분석 불가 기록은 L2 설명의 비패턴 값을 증명할 수 없다.
     if unknown_sql and processed.verification_method == "product_confirm":

@@ -147,10 +147,19 @@ def test_깨진_저장_SQL은_근거전체를_가리고_예외문자열을_반�
 
 
 @pytest.mark.db
+@pytest.mark.parametrize("alias_collision", [False, True])
 def test_jsonb가_열순서를_바꿔도_POST와_GET의_가림_응답은_같다(
     app_conn: psycopg.Connection[DictRow],
+    alias_collision: bool,
 ) -> None:
     processed = privacy_processed()
+    if alias_collision:
+        snapshot = replace(
+            processed.sql_snapshots[0],
+            query_sql='SELECT status AS "a@example.com", product_name AS "b@example.com" FROM orders',
+            result_rows=({"a@example.com": "배송완료", "b@example.com": "등산가방"},),
+        )
+        processed = replace(processed, sql_snapshots=(snapshot,))
     before = InquiryResponse.of(processed)
     save_inquiry(conn=app_conn, processed=processed)
     loaded = load_inquiry(conn=app_conn, inquiry_id=processed.inquiry_id)
@@ -181,3 +190,17 @@ def test_SQL_이메일_값의_literal_문맥을_응답_가림에서도_보존한
         replace(processed, answer="<" + email_value + ">", sql_snapshots=(snapshot,))
     )
     assert "email= " + email_value in response.citations[0].content
+
+
+def test_서로다른_개인정보_별칭을_가려도_정상_출력값을_덮어쓰지_않는다() -> None:
+    processed = privacy_processed()
+    snapshot = replace(
+        processed.sql_snapshots[0],
+        query_sql='SELECT status AS "a@example.com", product_name AS "b@example.com" FROM orders',
+        result_rows=({"a@example.com": "배송완료", "b@example.com": "등산가방"},),
+    )
+    response = InquiryResponse.of(replace(processed, sql_snapshots=(snapshot,)))
+    content = response.citations[0].content
+    assert "a@example.com" not in content and "b@example.com" not in content
+    assert "배송완료" in content and "등산가방" in content
+    assert snapshot.result_rows == ({"a@example.com": "배송완료", "b@example.com": "등산가방"},)

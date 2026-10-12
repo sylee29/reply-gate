@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from decimal import Decimal
 from enum import StrEnum
@@ -646,10 +646,16 @@ def _render_value(value: Any) -> str:
     return "(없음)" if value is None else str(value)
 
 
-def _render_rows(rows: Sequence[Mapping[str, Any]], *, limit: int | None = None) -> str:
+def _render_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    limit: int | None = None,
+    mask_key: Callable[[str], str] = str,
+) -> str:
     shown = rows if limit is None else rows[:limit]
     lines = [
-        f"{index}) " + ", ".join(f"{key}= {_render_value(value)}" for key, value in row.items())
+        f"{index}) "
+        + ", ".join(f"{mask_key(key)}= {_render_value(value)}" for key, value in row.items())
         for index, row in enumerate(shown, start=1)
     ]
     if limit is not None and len(rows) > limit:
@@ -657,9 +663,11 @@ def _render_rows(rows: Sequence[Mapping[str, Any]], *, limit: int | None = None)
     return "\n".join(lines)
 
 
-def render_sql_rows(rows: Sequence[Mapping[str, Any]]) -> str:
+def render_sql_rows(
+    rows: Sequence[Mapping[str, Any]], *, mask_key: Callable[[str], str] = str
+) -> str:
     """실행 SQL 없는 응답용 결과 요약. 저장용 content/evidence_text와 별개다."""
-    return f"결과 {len(rows)}건\n{_render_rows(rows, limit=CONTENT_ROW_LIMIT)}"
+    return f"결과 {len(rows)}건\n{_render_rows(rows, limit=CONTENT_ROW_LIMIT, mask_key=mask_key)}"
 
 
 def _sql_evidence_texts(
