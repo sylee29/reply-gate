@@ -34,8 +34,8 @@ citations 에 남긴다).
 
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from decimal import Decimal
@@ -64,9 +64,10 @@ from reply_gate.llm import (
     LLMFormatError,
     accumulate_optional_ms,
     accumulate_optional_tokens,
+    validate_embedding_vectors,
 )
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
-from reply_gate.policy_index import PolicySearchHit, search_policy_chunks
+from reply_gate.policy_index import PolicySearchHit, search_policy_rankings
 from reply_gate.query_rewrite import QUERY_REWRITE_STAGE, rewrite_query
 from reply_gate.retrieval_strategies import (
     AbstentionGate,
@@ -78,6 +79,7 @@ from reply_gate.retrieval_strategies import (
     truncate_for_gate,
 )
 from reply_gate.sql_guard import (
+    PRIVATE_ORDER_COLUMNS,
     SCHEMA_WHITELIST,
     SqlGuardRejection,
     SqlGuardRule,
@@ -610,6 +612,10 @@ def order_exists(*, conn: psycopg.Connection[DictRow], order_no: str) -> bool:
 
 def _jsonable(value: object) -> Any:
     """스냅샷을 그대로 jsonb 로 넣을 수 있게 원시 타입으로 낮춘다."""
+    if isinstance(value, float) and not math.isfinite(value):
+        # PostgreSQL float는 이 값들을 허용하지만 JSON 숫자는 허용하지 않는다.
+        # Decimal 비유한 값과 같은 명시적 문자열로 근거/스냅샷을 함께 보존한다.
+        return "NaN" if math.isnan(value) else "Infinity" if value > 0 else "-Infinity"
     if value is None or isinstance(value, bool | int | float | str):
         return value
     if isinstance(value, dt.datetime | dt.date | dt.time):
@@ -649,6 +655,11 @@ def _render_rows(rows: Sequence[Mapping[str, Any]], *, limit: int | None = None)
     if limit is not None and len(rows) > limit:
         lines.append(f"... (이하 {len(rows) - limit}건 생략)")
     return "\n".join(lines)
+
+
+def render_sql_rows(rows: Sequence[Mapping[str, Any]]) -> str:
+    """실행 SQL 없는 응답용 결과 요약. 저장용 content/evidence_text와 별개다."""
+    return f"결과 {len(rows)}건\n{_render_rows(rows, limit=CONTENT_ROW_LIMIT)}"
 
 
 def _sql_evidence_texts(
@@ -1104,25 +1115,21 @@ class EvidenceCollector:
             raise
         ledger.spans.add(INQUIRY_EMBEDDING_STAGE, embedding.elapsed_ms)
         ledger.embedding_tokens += embedding.total_tokens
-        if not embedding.vectors:
-            return
+        validate_embedding_vectors(
+            embedding.vectors, count=len(queries), dimensions=self._embedder.dimensions
+        )
 
         # 벡터 검색은 밖으로 나가지 않는 구간이라 래퍼가 볼 수 없다 — **부르는 쪽이 잰다.**
         # 질의가 둘이면(원문·재작성) 두 번의 왕복이 한 구간으로 합산된다.
         search_started = perf_counter()
         try:
-            rankings = [
-                search_policy_chunks(
-                    conn=conn,
-                    query_vector=vector,
-                    top_k=self._settings.vector_top_k,
-                    embedding_model=self._embedder.model,
-                    embedding_dimensions=self._embedder.dimensions,
-                )
-                # 임베딩 대역이 질의 수보다 적게 돌려주는 경우까지 여기서 감당한다 —
-                # 없는 벡터로 검색하지 않고, 있는 만큼만 합친다.
-                for vector in embedding.vectors[: len(queries)]
-            ]
+            rankings = search_policy_rankings(
+                conn=conn,
+                query_vectors=embedding.vectors,
+                top_k=self._settings.vector_top_k,
+                embedding_model=self._embedder.model,
+                embedding_dimensions=self._embedder.dimensions,
+            )
         finally:
             ledger.spans.add(SPAN_POLICY_SEARCH, _span_ms(search_started))
         candidates = merge_policy_rankings(
@@ -1230,10 +1237,9 @@ class EvidenceCollector:
     ) -> EscalationReason | None:
         """생성 → 검증 → 실행. 실패는 피드백을 실어 **1회만** 재시도한다(코드가 상한 강제)."""
         max_rows = self._settings.sql_max_rows
-        personal_columns = {"customer_name", "customer_phone", "customer_email", "shipping_address"}
         whitelist = (
             {
-                table: tuple(c for c in columns if c not in personal_columns)
+                table: tuple(c for c in columns if c not in PRIVATE_ORDER_COLUMNS)
                 for table, columns in SCHEMA_WHITELIST.items()
             }
             if exclude_personal_columns
@@ -1328,6 +1334,14 @@ class EvidenceCollector:
             try:
                 rows = execute_validated_query(conn=readonly_conn, query=query)
             except psycopg.Error as exc:
+                # 연결·서버·권한 장애는 SQL을 다시 생성해도 고칠 수 없다.
+                # 문장/값 오류와 실행 시간 상한만 기존 제한 재시도를 탄다.
+                if not isinstance(
+                    exc, (psycopg.DataError, psycopg.ProgrammingError, psycopg.errors.QueryCanceled)
+                ) or isinstance(
+                    exc, (psycopg.errors.InsufficientPrivilege, psycopg.errors.UndefinedTable)
+                ):
+                    raise
                 _reset_after_error(readonly_conn)
                 previous_sql = query.sql
                 previous_error = _first_line(exc)
@@ -1433,6 +1447,5 @@ def _reset_after_error(conn: psycopg.Connection[DictRow]) -> None:
     read-only 커넥션은 기본이 autocommit 이라 대개 할 일이 없지만, 호출자가 트랜잭션
     커넥션을 넘겼을 때 재시도 쿼리가 "current transaction is aborted" 로 죽는 것을 막는다.
     """
-    # 커넥션 자체가 끊긴 경우까지 여기서 살릴 수는 없다 — 다음 시도가 같은 오류를 낸다.
-    with contextlib.suppress(psycopg.Error):
-        conn.rollback()
+    # 연결/서버 오류는 호출자가 전파하며 이 함수는 재시도 가능한 SQL 오류만 받는다.
+    conn.rollback()

@@ -26,6 +26,7 @@ import re
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from reply_gate.contracts import Claim, Draft, Evidence, GateResult, RejectReason, Verdict
 
@@ -41,6 +42,7 @@ __all__ = [
     "normalize_email",
     "normalize_phone",
     "pii_shaped",
+    "redact_pii",
     "to_draft",
 ]
 
@@ -612,6 +614,25 @@ def _without_email_tokens(text: str) -> str:
     return _EMAIL_REGEX.sub("[email]", folded) if folded else text
 
 
+def _pii_candidate(text: str, pattern: PiiPattern, sourced_numbers: frozenset[str]) -> str:
+    candidate = text if pattern.name == "email" else _without_email_tokens(text)
+    if pattern.name != "email" and sourced_numbers:
+        # 같은 완전한 정수가 근거에 있는 수량 토큰만 숫자형 대조 복사본에서 뺀다.
+        # 부호 유무/PII 종류와 무관한 경계이며 실제 답변·근거·이메일 입력은 보존한다.
+        candidate = _fold_numeric_characters(candidate)
+
+        def omit_quantity(match: re.Match[str], original: str = candidate) -> str:
+            return (
+                "[quantity]"
+                if normalize_digits(match["number"]) in sourced_numbers
+                and not original[: match.start()].rstrip().endswith("-")
+                else match.group()
+            )
+
+        candidate = _QUANTITY.sub(omit_quantity, candidate)
+    return candidate
+
+
 def _normalized_matches(
     *,
     texts: Sequence[str],
@@ -621,24 +642,27 @@ def _normalized_matches(
     """패턴 하나가 텍스트들에서 뽑은 **정규화된 값** 집합. 접기는 그 패턴의 것을 쓴다."""
     values: set[str] = set()
     for text in texts:
-        candidate = text if pattern.name == "email" else _without_email_tokens(text)
-        if pattern.name != "email" and sourced_numbers:
-            # 같은 완전한 정수가 근거에 있는 수량 토큰만 숫자형 대조 복사본에서 뺀다.
-            # 부호 유무/PII 종류와 무관한 경계이며 실제 답변·근거·이메일 입력은 보존한다.
-            candidate = _fold_numeric_characters(candidate)
-
-            def omit_quantity(match: re.Match[str], original: str = candidate) -> str:
-                return (
-                    "[quantity]"
-                    if normalize_digits(match["number"]) in sourced_numbers
-                    and not original[: match.start()].rstrip().endswith("-")
-                    else match.group()
-                )
-
-            candidate = _QUANTITY.sub(omit_quantity, candidate)
+        candidate = _pii_candidate(text, pattern, sourced_numbers)
         folded = pattern.fold(candidate)
         values.update(pattern.normalize(match) for match in pattern.regex.findall(folded))
     return values
+
+
+def _quantity_references(evidence_texts: Sequence[str]) -> frozenset[str]:
+    sourced_numbers: set[str] = set()
+    for text in evidence_texts:
+        numeric = _fold_numeric_characters(_without_email_tokens(text))
+        sourced_numbers.update(
+            normalize_digits(match["number"])
+            for match in _QUANTITY.finditer(numeric)
+            if not numeric[: match.start()].rstrip().endswith("-")
+        )
+        sourced_numbers.update(
+            normalize_digits(match["number"])
+            for match in _INTEGER_VALUE.finditer(numeric)
+            if not numeric[: match.start()].rstrip().endswith("-")
+        )
+    return frozenset(sourced_numbers)
 
 
 def _has_unsourced_pii(
@@ -668,20 +692,7 @@ def _has_unsourced_pii(
     # 값의 표기 차이만 대조한다. SQL의 단위 없는 정수도 근거이며 단위 의미는 L2다.
     # 0인 소수부만 정수부와 정확히 비교한다. float 반올림이나 소수점 제거는 하지 않는다.
     # 긴 ID의 조각·비정수·음수·이메일 일부는 독립된 양수 정수로 채택하지 않는다.
-    sourced_numbers: set[str] = set()
-    for text in evidence_texts:
-        numeric = _fold_numeric_characters(_without_email_tokens(text))
-        sourced_numbers.update(
-            normalize_digits(match["number"])
-            for match in _QUANTITY.finditer(numeric)
-            if not numeric[: match.start()].rstrip().endswith("-")
-        )
-        sourced_numbers.update(
-            normalize_digits(match["number"])
-            for match in _INTEGER_VALUE.finditer(numeric)
-            if not numeric[: match.start()].rstrip().endswith("-")
-        )
-    quantity_references = frozenset(sourced_numbers)
+    quantity_references = _quantity_references(evidence_texts)
     found: set[str] = set()
     for pattern in DEFAULT_PII_PATTERNS:
         # 이메일 접미사는 열린 구분자 문맥에 의존한다. 정상 초안은 최종 답변만 읽어야
@@ -704,3 +715,78 @@ def _has_unsourced_pii(
         )
 
     return bool(found - allowed)
+
+
+def _source_spans(original: str, folded: str) -> list[tuple[int, int]]:
+    """접기 버퍼의 각 글자를 원문 범위로 잇는다. 변환 묶음은 넓게 가린다.
+
+    접기 정의는 기존 함수 그대로 두고 diff는 위치만 복원한다. NFKC 확장·삭제·
+    국제번호 구분자 제거가 있어도 원문 문장을 정규화해서 응답하지 않는다.
+    """
+    spans = [(0, len(original))] * len(folded)
+    for kind, a, b, c, d in SequenceMatcher(None, original, folded).get_opcodes():
+        if kind == "equal":
+            spans[c:d] = [(a + i, a + i + 1) for i in range(d - c)]
+        elif kind in ("replace", "insert"):
+            spans[c:d] = [(a, b)] * (d - c)
+    return spans
+
+
+def redact_pii(text: str, *, allowed_text: str = "", private_values: Sequence[str] = ()) -> str:
+    """응답용 사본에서 허용 답변에 없는 PII만 가린다. 판정/저장 원문은 바꾸지 않는다.
+
+    패턴형 값은 L1과 같은 완전 일치 정규화, 이름/주소는 호출자가 증명한 주문
+    private 출력 값만 다룬다. 임의 문장의 이름·주소를 추론하는 API가 아니다.
+    접기 위치가 여러 원문 글자에 대응하면 그 범위 전부를 가리는 보수적 경계다.
+    """
+    numbers = _quantity_references((allowed_text,))
+    allowed = set().union(
+        *(
+            _normalized_matches(texts=(allowed_text,), pattern=p, sourced_numbers=numbers)
+            for p in DEFAULT_PII_PATTERNS
+        )
+    )
+    ranges: list[tuple[int, int]] = []
+    for pattern in DEFAULT_PII_PATTERNS:
+        folded = pattern.fold(_pii_candidate(text, pattern, numbers))
+        matches = [
+            match
+            for match in pattern.regex.finditer(folded)
+            if pattern.normalize(match.group()) not in allowed
+        ]
+        if not matches:
+            continue
+        spans = _source_spans(text, folded)
+        for match in matches:
+            positions = spans[match.start() : match.end()]
+            if positions:
+                ranges.append((min(a for a, _ in positions), max(b for _, b in positions)))
+    folded = fold_for_detection(text)
+    literal_spans: list[tuple[int, int]] | None = None
+    allowed_literal = fold_for_detection(allowed_text)
+    for value in private_values:
+        literal = fold_for_detection(value)
+        if not literal or literal in allowed_literal:
+            continue
+        patterned = set().union(
+            *(_normalized_matches(texts=(value,), pattern=p) for p in DEFAULT_PII_PATTERNS)
+        )
+        if patterned and patterned <= allowed:
+            continue
+        for match in re.finditer(re.escape(literal), folded):
+            if literal_spans is None:
+                literal_spans = _source_spans(text, folded)
+            positions = literal_spans[match.start() : match.end()]
+            if positions:
+                ranges.append((min(a for a, _ in positions), max(b for _, b in positions)))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if start == end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    for start, end in reversed(merged):
+        text = text[:start] + "[가림]" + text[end:]
+    return text

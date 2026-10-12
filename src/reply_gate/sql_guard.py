@@ -43,7 +43,7 @@ data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다 — 둘 다
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from types import MappingProxyType
@@ -61,6 +61,7 @@ __all__ = [
     "ALLOWED_SCHEMAS",
     "ORDERS_TABLE",
     "ORDER_SCOPE_COLUMN",
+    "PRIVATE_ORDER_COLUMNS",
     "SCHEMA_WHITELIST",
     "SqlGuardRejection",
     "SqlGuardRule",
@@ -68,6 +69,7 @@ __all__ = [
     "describe_allowed_cast_types",
     "describe_allowed_functions",
     "describe_whitelist",
+    "private_output_columns",
     "validate_sql",
 ]
 
@@ -80,6 +82,11 @@ ORDERS_TABLE: Final = "orders"
 
 #: 조회 범위를 주문 1건으로 묶는 컬럼. 선검사(`evidence.order_exists`)가 쓰는 것과 같다.
 ORDER_SCOPE_COLUMN: Final = "order_no"
+
+#: 주문에서 개인정보를 담는 네 열. 상품 확인의 축소 조회와 응답 유래 가림이 공유한다.
+PRIVATE_ORDER_COLUMNS: Final = frozenset(
+    ("customer_name", "customer_phone", "customer_email", "shipping_address")
+)
 
 #: 조회 가능한 테이블·컬럼. **`db/schema.sql` 의 orders 컬럼과 같아야 한다**
 #: (`tests/test_sql_guard.py` 가 information_schema 와 대조한다).
@@ -456,6 +463,7 @@ class _Exported(NamedTuple):
     columns: frozenset[str]
     #: 그중 값이 `orders` 직접 컬럼에서 왔음이 증명된 이름들. `columns` 의 부분집합이다.
     pii_safe: frozenset[str]
+    private: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -474,6 +482,7 @@ class _Source:
     #: (그래서 유래 추적이 임시 테이블 한 겹을 건너도 끊기지 않는다), 컬럼 별칭 목록으로
     #: 이름을 갈아 끼운 소스는 자리 대응을 증명할 수 없으므로 비어 있다(fail-closed).
     pii_safe_columns: frozenset[str]
+    private_columns: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -641,7 +650,7 @@ class _Analyzer:
             env[name] = (
                 # 컬럼 별칭 목록은 자리로 이름을 갈아 끼운다 — 어느 안쪽 projection 이
                 # 어느 이름이 되는지 증명하지 않으므로 유래를 하나도 넘기지 않는다.
-                _Exported(frozenset(declared), frozenset()) if declared else _exports(inner)
+                _renamed_exports(declared, _exports(inner)) if declared else _exports(inner)
             )
 
     def _source(self, node: exp.Expr, env: Mapping[str, _Exported]) -> _Source:
@@ -656,12 +665,13 @@ class _Analyzer:
                 )
             inner = self.build(body, None, env)
             declared = _alias_columns(node)
-            exported = _Exported(frozenset(declared), frozenset()) if declared else _exports(inner)
+            exported = _renamed_exports(declared, _exports(inner)) if declared else _exports(inner)
             return _Source(
                 name=node.alias,
                 columns=exported.columns,
                 base_table=None,
                 pii_safe_columns=exported.pii_safe,
+                private_columns=exported.private,
             )
         raise _reject(
             SqlGuardRule.UNSUPPORTED_SOURCE,
@@ -683,12 +693,13 @@ class _Analyzer:
             )
         declared = _alias_columns(node)
         if name in env and not schema and not catalog:
-            exported = _Exported(frozenset(declared), frozenset()) if declared else env[name]
+            exported = _renamed_exports(declared, env[name]) if declared else env[name]
             return _Source(
                 name=(node.alias or name),
                 columns=exported.columns,
                 base_table=None,
                 pii_safe_columns=exported.pii_safe,
+                private_columns=exported.private,
             )
         if catalog:
             raise _reject(
@@ -719,6 +730,7 @@ class _Analyzer:
             base_table=name,
             # 기저 테이블의 컬럼은 정의상 직접 컬럼이다 — 유래 추적의 바닥이다.
             pii_safe_columns=self._whitelist[name],
+            private_columns=self._whitelist[name] & PRIVATE_ORDER_COLUMNS,
         )
 
     # ── 검사 ────────────────────────────────────────────────────────────────
@@ -997,6 +1009,36 @@ def _star_sources(projection: exp.Expr, scope: _Scope) -> tuple[_Source, ...] | 
     return None
 
 
+def _renamed_exports(names: Sequence[str], inner: _Exported) -> _Exported:
+    # 위치 대응을 증명하지 않는 기존 alias 목록 경계. 개인정보가 하나라도 있으면
+    # 새 이름 전부를 가림 대상으로 삼되 L1 allowlist 승인은 기존대로 비워 둔다.
+    columns = frozenset(names)
+    return _Exported(columns, frozenset(), columns if inner.private else frozenset())
+
+
+def _private_projection(value: exp.Expr, scope: _Scope) -> bool:
+    """표시용 가림의 보수적 유래. 계산해도 private 열에서 나온 값은 private다."""
+    if any(isinstance(node, exp.Select) for node in value.walk()):
+        return True  # scalar subquery의 값 유래를 여기서 별도로 추정하지 않는다.
+    for column in value.find_all(exp.Column):
+        if column.table:
+            source = _lookup_source(scope, column.table)
+            if source is None or column.name in source.private_columns:
+                return True
+        else:
+            current: _Scope | None = scope
+            while current is not None:
+                owners = [s for s in current.sources.values() if column.name in s.columns]
+                if owners:
+                    if any(column.name in source.private_columns for source in owners):
+                        return True
+                    break
+                current = current.parent
+            else:
+                return True
+    return False
+
+
 def _exports(scope: _Scope) -> _Exported:
     """스코프가 바깥에 내놓는 컬럼 이름들과, 그중 유래가 증명된 이름들.
 
@@ -1007,6 +1049,7 @@ def _exports(scope: _Scope) -> _Exported:
     columns: set[str] = set()
     proven: set[str] = set()
     unproven: set[str] = set()
+    private: set[str] = set()
 
     def record(name: str, *, is_direct: bool) -> None:
         columns.add(name)
@@ -1018,15 +1061,19 @@ def _exports(scope: _Scope) -> _Exported:
             for source in stars:
                 for column in source.columns:
                     record(column, is_direct=column in source.pii_safe_columns)
+                    if column in source.private_columns:
+                        private.add(column)
             continue
         output = _database_output_name(projection)
         value = projection.this if isinstance(projection, exp.Alias) else projection
+        if _private_projection(value, scope):
+            private.add(output)
         record(
             output,
             is_direct=_projection_provenance(value, scope) is _Provenance.DIRECT,
         )
 
-    return _Exported(frozenset(columns), frozenset(proven - unproven))
+    return _Exported(frozenset(columns), frozenset(proven - unproven), frozenset(private))
 
 
 # ── 3. 함수 허용 목록 ───────────────────────────────────────────────────────
@@ -1456,3 +1503,19 @@ def validate_sql(
         order_no=order_no,
         pii_safe_output_columns=_pii_safe_output_columns(root_scope),
     )
+
+
+def private_output_columns(sql: str) -> tuple[str, ...]:
+    """저장 SQL의 private 주문 열 유래 출력명. 분석 실패는 SqlGuardRejection이다.
+
+    실행 승인을 주는 API가 아니다. 응답 조립기는 실패하면 SQL 근거 전체를 가린다.
+    현재 주문 재조회 없이 저장된 결과 값의 별칭/CTE 유래를 복원한다.
+    """
+    statement = _require_read_only_select(_parse_single_statement(sql))
+    _normalize_identifiers(statement)
+    analyzer = _Analyzer(SCHEMA_WHITELIST)
+    root = analyzer.build(statement, None, {})
+    analyzer.verify_all_tables_resolved(statement)
+    analyzer.check_columns()
+    _check_unique_output_names(root)
+    return tuple(sorted(_exports(root).private))
