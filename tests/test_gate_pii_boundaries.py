@@ -1,0 +1,496 @@
+"""재감사에서 통과한 실제 표기를 고정한다. 새 사례는 고정 측정 픽스처와 분리한다."""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from unittest.mock import patch
+
+import pytest
+
+from reply_gate import gate
+from reply_gate.contracts import Evidence, EvidenceSource, GateResult, RejectReason, Verdict
+from reply_gate.evidence import _sql_evidence_texts
+from reply_gate.sql_guard import validate_sql
+
+
+def _judge(text: str, evidence: str = "일반 안내입니다.") -> GateResult:
+    return gate.evaluate_draft(
+        raw_draft={"claims": [{"text": text, "citation_ids": ["policy:audit:1"]}]},
+        evidences=[
+            Evidence(
+                id="policy:audit:1",
+                source=EvidenceSource.POLICY,
+                content=evidence,
+                evidence_text=evidence,
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize("number", ["010-1234-5678", "02-1234-5678", "1588-1234", "900101-1234567"])
+@pytest.mark.parametrize("separator", ["  ", "--", "__", "..", "( )", "\u00b7", "\u318d", "~"])
+def test_새_구분자는_무근거_번호를_막고_양방향_에코를_살린다(number: str, separator: str) -> None:
+    """대표번호와 주민번호의 반복 구분자 및 네 번호 계열의 미열거 표기가 샜다."""
+    variant = number.replace("-", separator)
+    assert RejectReason.PII_DETECTED in _judge(variant).reject_reasons
+    assert gate.pii_shaped(variant)
+    assert _judge(variant, number).verdict is Verdict.PASS
+    assert _judge(number, variant).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize("zero", [0x660, 0x6F0, 0x966, 0x9E6, 0xE50])
+@pytest.mark.parametrize("number", ["010-1234-5678", "02-1234-5678", "1588-1234", "900101-1234567"])
+def test_Unicode_십진수_번호를_정규화하되_긴_숫자의_부분은_승인하지_않는다(
+    zero: int, number: str
+) -> None:
+    variant = "".join(chr(zero + int(ch)) if ch.isdecimal() else ch for ch in number)
+    assert RejectReason.PII_DETECTED in _judge(variant).reject_reasons
+    assert _judge(number, variant).verdict is Verdict.PASS
+    assert _judge(variant, number).verdict is Verdict.PASS
+    assert not gate.pii_shaped("99999" + variant.replace("-", "") + "99999")
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge(number, "99999" + variant.replace("-", "") + "99999").reject_reasons
+    )
+
+
+@pytest.mark.parametrize(
+    "mark", ["\u115f", "\u1160", "\u3164", "\uffa0", "\u2800", "\b", "\x1b", "\u202e", "\u2066"]
+)
+def test_번호_내부_비가시문자와_양방향제어를_양쪽에서_같이_접는다(mark: str) -> None:
+    variant = f"010-1{mark}234-5678"
+    assert RejectReason.PII_DETECTED in _judge(variant).reject_reasons
+    assert _judge(variant, "010-1234-5678").verdict is Verdict.PASS
+    assert _judge("010-1234-5678", variant).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r", "\t"])
+def test_별도_줄과_탭의_숫자는_무조건_연결하지_않는다(separator: str) -> None:
+    assert not gate.pii_shaped(f"010{separator}1234{separator}5678")
+
+
+@pytest.mark.parametrize(
+    ("variant", "canonical"),
+    [
+        ("+82 (0)10-1234-5678", "010-1234-5678"),
+        ("0082 (0)10-1234-5678", "010-1234-5678"),
+        ("+82 11-123-4567", "011-123-4567"),
+        ("+82 16-123-4567", "016-123-4567"),
+        ("+82 (0)2-1234-5678", "02-1234-5678"),
+        ("+1-202-555-0123", "001 202 555 0123"),
+        ("+44 20 7946 0958", "0044-20-7946-0958"),
+        ("+81 90 1234 5678", "0081-90-1234-5678"),
+        ("+1 1588 1234", "+115881234"),
+        ("+82 1588 1234", "+8215881234"),
+    ],
+)
+def test_명시_국제형은_무근거를_거부하고_동일번호_에코를_허용한다(
+    variant: str, canonical: str
+) -> None:
+    assert RejectReason.PII_DETECTED in _judge(variant).reject_reasons
+    assert RejectReason.PII_DETECTED in _judge(canonical).reject_reasons
+    assert _judge(variant, canonical).verdict is Verdict.PASS
+    assert _judge(canonical, variant).verdict is Verdict.PASS
+
+
+def test_부호_없는_숫자를_국가번호로_추정하지_않는다() -> None:
+    assert not gate.pii_shaped("82 10 1234 5678")
+    assert not gate.pii_shaped("1 202 555 0123")
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "a'user@example.com",
+        "a/user@example.com",
+        "a!user@example.com",
+        "a#user@example.com",
+        "a$user@example.com",
+        "a&user@example.com",
+        "<a=user@example.com>",
+        "a?user@example.com",
+        "a^user@example.com",
+        "a`user@example.com",
+        "a{user}@example.com",
+        "a|user@example.com",
+        "a~user@example.com",
+        "홍user@example.com",
+        "홍길동@예시.한국",
+        "user@example.com\u034f.evil",
+        "user@exam\u034fple.com",
+        "user@example.हिन्दी",
+        "user@example.com\u0301.evil",
+        '"a user"@example.com',
+    ],
+)
+def test_이메일_전체토큰을_보존하여_다른주소의_접미사_승인을_막는다(address: str) -> None:
+    """ASCII 접미사와 결합표식 앞까지만 뽑으면 완전 일치 대조도 다른 주소를 승인한다."""
+    assert gate.pii_shaped(address)
+    assert RejectReason.PII_DETECTED in _judge(address, "user@example.com").reject_reasons
+    assert _judge(address, address).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("user@example.हिन्दी", "user@example.हन्दी"),
+        ("a\u034fuser@example.com", "auser@example.com"),
+        ("user@example.com\u034f.evil", "user@example.com.evil"),
+    ],
+)
+def test_이메일의_결합표식은_서로다른_주소를_합치지_않는다(left: str, right: str) -> None:
+    assert RejectReason.PII_DETECTED in _judge(left, right).reject_reasons
+    assert RejectReason.PII_DETECTED in _judge(right, left).reject_reasons
+
+
+@pytest.mark.parametrize("field", ["customer_email", "email", "contact", "연락처"])
+def test_이메일_필드명과_동일한_localpart도_명시된_주소에서는_자르지_않는다(field: str) -> None:
+    address = f"<{field}=user@example.com>"
+    assert RejectReason.PII_DETECTED in _judge(address, "user@example.com").reject_reasons
+    assert _judge(address, address).verdict is Verdict.PASS
+    assert _judge("user@example.com", f"{field}=user@example.com").verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "contact",
+        "연락처",
+        "user_address",
+        "contact(1)",
+        "contact[primary]",
+        "customer's",
+        "<contact>",
+        "[contact]",
+        "(contact)",
+        "a=b",
+        "contact primary",
+        '"contact"',
+        "x,y",
+    ],
+)
+@pytest.mark.parametrize("address", ["user@example.com", "a=user@example.com"])
+def test_실제_SQL_근거의_임의_별칭을_분리하되_이메일값은_한번만_분리한다(
+    alias: str, address: str
+) -> None:
+    """직접 컬럼의 별칭은 렌더가 key=value로 만든다. local part의 다음 '='는 값이다."""
+    order_no = "ORD-20260201-0001"
+    quoted_alias = alias.replace('"', '""')
+    sql = f"SELECT customer_email AS \"{quoted_alias}\" FROM orders WHERE order_no = '{order_no}'"
+    query = validate_sql(sql, order_no=order_no, max_rows=50)
+    content, evidence_text = _sql_evidence_texts(
+        sql=sql, rows=({alias: address},), pii_safe_output_columns=query.pii_safe_output_columns
+    )
+    result = gate.evaluate_draft(
+        raw_draft={"claims": [{"text": f"<{address}>", "citation_ids": ["sql:audit:1"]}]},
+        evidences=[
+            Evidence(
+                id="sql:audit:1",
+                source=EvidenceSource.SQL,
+                content=content,
+                evidence_text=evidence_text,
+            )
+        ],
+    )
+    assert result.verdict is Verdict.PASS
+    assert address in evidence_text
+    if "=" in address:
+        assert RejectReason.PII_DETECTED in _judge("user@example.com", evidence_text).reject_reasons
+
+
+@pytest.mark.parametrize(
+    "address", ["'user@example.com", "`user@example.com", "{user}@example.com"]
+)
+def test_명시_이메일의_첫_특수문자도_localpart에서_잘리지_않는다(address: str) -> None:
+    literal = f"<{address}>"
+    assert RejectReason.PII_DETECTED in _judge(literal, "user@example.com").reject_reasons
+    assert RejectReason.PII_DETECTED in _judge(literal, address[1:]).reject_reasons
+    assert _judge(literal, literal).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(("left", "right"), [("'", "'"), ("`", "`"), ("{", "}")])
+def test_주소_전체를_감싼_구분자는_localpart의_첫글자가_아니다(left: str, right: str) -> None:
+    assert _judge(f"{left}user@example.com{right}", "user@example.com").verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize("suffix", ["\u3002", "\u061b", "😊", "♥"])
+def test_Unicode_문장부호와_이모지는_도메인_꼬리가_아니다(suffix: str) -> None:
+    """M 표식을 보존하려고 모든 비ASCII 문자를 도메인에 넣으면 정상 산문이 기각된다."""
+    assert _judge("user@example.com" + suffix, "user@example.com").verdict is Verdict.PASS
+    assert (
+        RejectReason.PII_DETECTED in _judge("😊user@example.com", "user@example.com").reject_reasons
+    )
+
+
+@pytest.mark.parametrize("unit", ["원", "개", "건", "명"])
+@pytest.mark.parametrize("amount", ["15,881,234", "16,001,234"])
+def test_같은_금액과_수량의_쉼표_제거를_새_대표번호로_기각하지_않는다(
+    unit: str, amount: str
+) -> None:
+    canonical = amount.replace(",", "") + unit
+    assert _judge(canonical, amount + unit).verdict is Verdict.PASS
+    assert _judge(amount + unit, canonical).verdict is Verdict.PASS
+    assert RejectReason.PII_DETECTED in _judge(canonical, "다른 금액 123원").reject_reasons
+
+
+@pytest.mark.parametrize("unit", ["원", "개", "건", "명"])
+@pytest.mark.parametrize("amount", ["10,000,000", "82,000,000"])
+def test_연속된_양수_금액과_수량의_부호는_국가번호가_아니다(unit: str, amount: str) -> None:
+    unsigned = f"추가 수량은 {amount}{unit}입니다."
+    positive = f"추가 수량은 +{amount.replace(',', '')}{unit}입니다."
+    assert _judge(positive, unsigned).verdict is Verdict.PASS
+    assert _judge(unsigned, positive).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize("number", ["+01012345678", "+15881234", "+9001011234567"])
+def test_양수_단위_접기가_기존_국내전화나_주민번호를_지우지_않는다(number: str) -> None:
+    assert RejectReason.PII_DETECTED in _judge(number + "원").reject_reasons
+
+
+@pytest.mark.parametrize(
+    "number", ["+12025550123", "+442079460958", "+821012345678", "+1-202-555-0123원"]
+)
+def test_단위없는_국제번호와_구분된_국제번호는_계속_탐지한다(number: str) -> None:
+    assert RejectReason.PII_DETECTED in _judge(number).reject_reasons
+
+
+@pytest.mark.parametrize("number", ["+12025550123", "+442079460958", "+821012345678"])
+@pytest.mark.parametrize("word", ["개인", "원본", "건물", "명단"])
+@pytest.mark.parametrize("evidence", ["일반 안내", ""])
+def test_단위로_시작하는_단어는_전화번호의_국가번호를_지우지_않는다(
+    number: str, word: str, evidence: str
+) -> None:
+    text = f"국제전화 {number} {word} 연락처입니다."
+    assert gate.pii_shaped(text)
+    assert RejectReason.PII_DETECTED in _judge(text, evidence).reject_reasons
+
+
+@pytest.mark.parametrize("unit", ["원", "개", "건", "명"])
+@pytest.mark.parametrize("suffix", ["", "입니다.", "을 안내합니다.", "으로 안내합니다."])
+def test_완전한_단위와_허용한_조사서술어만_수량_에코로_대조한다(unit: str, suffix: str) -> None:
+    assert _judge(f"+10000000{unit}{suffix}", f"10,000,000{unit}").verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "",
+        "안내",
+        "10,000,001원",
+        "-10,000,000원",
+        "10,000,000원본",
+        "991000000099",
+        "ORD10000000원",
+        "-10000000",
+        "- 10000000",
+        "- 10000000원",
+        "10000000.1",
+        "10000000.0000000000000001",
+        "10000000.1원",
+        "-10000000.00",
+        "10000000@example.com",
+    ],
+)
+def test_같은_양수_수량_근거가_없으면_부호있는_숫자를_기각한다(evidence: str) -> None:
+    assert gate.pii_shaped("+10000000원입니다.")
+    assert RejectReason.PII_DETECTED in _judge("+10000000원입니다.", evidence).reject_reasons
+
+
+@pytest.mark.parametrize("evidence", ["10,000,000원", "+10,000,000원"])
+def test_수량_에코_허용이_별도로_쓴_전화번호까지_허용하지_않는다(evidence: str) -> None:
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge("+10000000원, 연락처 +10000000", evidence).reject_reasons
+    )
+    assert (
+        RejectReason.PII_DETECTED in _judge("+10000000 원본 연락처입니다.", evidence).reject_reasons
+    )
+
+
+@pytest.mark.parametrize("word", ["개인", "원본", "건물", "명단"])
+def test_쉼표_접기도_단어접두를_수량단위로_읽지_않는다(word: str) -> None:
+    assert gate.fold_numeric_for_detection("10,000,000" + word) == "10,000,000" + word
+    assert gate.fold_numeric_for_detection("10,000,000원입니다.") == "10000000원입니다."
+
+
+def test_표시용_content의_수량은_빈_evidence_text를_대신하지_않는다() -> None:
+    result = gate.evaluate_draft(
+        raw_draft={"claims": [{"text": "+10000000원입니다.", "citation_ids": ["policy:audit:1"]}]},
+        evidences=[
+            Evidence(
+                id="policy:audit:1",
+                source=EvidenceSource.POLICY,
+                content="10,000,000원",
+                evidence_text="",
+            )
+        ],
+    )
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "10000000",
+        "10,000,000",
+        "10,000,000개",
+        "1) total_price_krw= 10000000",
+        "10000000.0",
+        "10000000.00",
+        "10,000,000.0000",
+        "10,000,000.00원",
+    ],
+)
+def test_같은_독립된_정수의_수량_표현은_단위_의미까지_판정하지_않는다(evidence: str) -> None:
+    assert _judge("+10000000원입니다.", evidence).verdict is Verdict.PASS
+    assert RejectReason.PII_DETECTED in _judge("연락처 +10000000", evidence).reject_reasons
+
+
+@pytest.mark.parametrize("value", [10000000, Decimal("10000000.0"), Decimal("10000000.00")])
+def test_실제_SQL_금액의_독립된_정수는_양수_금액으로_에코한다(value: int | Decimal) -> None:
+    order_no = "ORD-20260201-0001"
+    sql = f"SELECT total_price_krw FROM orders WHERE order_no = '{order_no}'"
+    query = validate_sql(sql, order_no=order_no, max_rows=50)
+    _, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"total_price_krw": value},),
+        pii_safe_output_columns=query.pii_safe_output_columns,
+    )
+    assert evidence_text == f"1) total_price_krw= {value}"
+    assert _judge("+10000000원입니다.", evidence_text).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "10000000@example.com",
+        "+10000000@example.com",
+        '"+10000000"@example.com',
+        '"10000000"@example.com',
+        '"10000000 alias"@example.com',
+        "홍10000000@example.com",
+        '"a=10000000 alias"@example.com',
+        '"10000000원 alias"@example.com',
+        '"1000\u200b0000"@example.com',
+        '"\uff11\uff10\uff10\uff10\uff10\uff10\uff10\uff10"\uff20example.com',
+    ],
+)
+def test_이메일_전체토큰_안의_숫자는_독립된_수량_근거가_아니다(address: str) -> None:
+    evidence = f"customer_email= {address}"
+    assert RejectReason.PII_DETECTED in _judge("+10000000원입니다.", evidence).reject_reasons
+    assert _judge(f"<{address}>", evidence).verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "address", ['"10000000 alias"@example.com', '"1000\u200b0000"@example.com']
+)
+def test_이메일을_제외해도_같은_문면의_독립된_금액은_보존한다(address: str) -> None:
+    evidence = f"customer_email= {address}, total_price_krw= 10000000.00"
+    assert _judge("+10000000원입니다.", evidence).verdict is Verdict.PASS
+
+
+def test_0인_소수부의_비교는_float_반올림을_사용하지_않는다() -> None:
+    assert _judge("+10000000.00원입니다.", "10000000.0000").verdict is Verdict.PASS
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge("+10000000원입니다.", "10000000.0000000000000001").reject_reasons
+    )
+
+
+@pytest.mark.parametrize("evidence_text", ["15,881,234.00원", "15,881,234.00", "+15881234.0"])
+@pytest.mark.parametrize("answer", ["15881234원입니다", "+15881234원입니다"])
+def test_같은_수량의_표현은_대표번호_허용집합의_모양에_의존하지_않는다(
+    evidence_text: str, answer: str
+) -> None:
+    """부호만 지우면 서비스번호 검출값과 소수 표기 근거가 여전히 달라졌다."""
+    raw = {"claims": [{"text": answer, "citation_ids": ["policy:audit:1"]}]}
+    evidence = Evidence(
+        id="policy:audit:1",
+        source=EvidenceSource.POLICY,
+        content=evidence_text,
+        evidence_text=evidence_text,
+    )
+    assert gate.evaluate_draft(raw_draft=raw, evidences=[evidence]).verdict is Verdict.PASS
+    assert gate.to_draft(raw).answer_text == answer
+    assert evidence.evidence_text == evidence_text
+
+
+@pytest.mark.parametrize("number", ["15881234", "821012345678", "9001011234567"])
+def test_근거있는_수량의_예외는_이메일이나_별도_전화로_퍼지지_않는다(number: str) -> None:
+    evidence = f"{number}.00원"
+    assert _judge(f"+{number}원입니다.", evidence).verdict is Verdict.PASS
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge(f"+{number}원, 연락처 +{number}", evidence).reject_reasons
+    )
+    assert RejectReason.PII_DETECTED in _judge(f"{number}원@example.com", evidence).reject_reasons
+    assert RejectReason.PII_DETECTED in _judge(f"+{number}원입니다.", "").reject_reasons
+
+
+def test_수량_제외가_양옆의_숫자를_새_전화번호로_이어붙이지_않는다() -> None:
+    assert _judge("010 15881234원 1234 5678", "15,881,234.00원").verdict is Verdict.PASS
+
+
+def test_이메일_제외도_양옆의_숫자를_새_전화번호로_이어붙이지_않는다() -> None:
+    assert _judge("010 user@example.com 1234 5678", "user@example.com").verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize("local", ["customer's=a", "foo=a", "foo=b"])
+def test_필드명_괄호와_apostrophe_지원이_명시된_주소의_등호를_자르지_않는다(local: str) -> None:
+    address = f"<{local}@example.com>"
+    assert _judge(address, address).verdict is Verdict.PASS
+    assert RejectReason.PII_DETECTED in _judge(address, "a@example.com").reject_reasons
+    assert RejectReason.PII_DETECTED in _judge(address, "b@example.com").reject_reasons
+
+
+def test_공백으로_분리된_필드값의_등호는_두번째_필드경계가_아니다() -> None:
+    """별칭의 '='와 값의 '='를 렌더에서 구별한 문면을 다시 합치지 않는다."""
+    assert _judge("<b=user@example.com>", "1) a= b=user@example.com").verdict is Verdict.PASS
+    assert _judge("<user@example.com>", "1) a=b= user@example.com").verdict is Verdict.PASS
+    assert (
+        RejectReason.PII_DETECTED
+        in _judge("user@example.com", "1) a= b=user@example.com").reject_reasons
+    )
+
+
+def test_금액_보정이_임의_쉼표나_전화번호를_지우지_않는다() -> None:
+    assert RejectReason.PII_DETECTED in _judge("연락처 1588-1234", "금액 123원").reject_reasons
+    assert RejectReason.PII_DETECTED in _judge("15881234원", "15,88,1234원").reject_reasons
+    assert _judge("일자 2026-10-12, 주문 ORD-20261012-0001, 수량 12개").verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "blank",
+    [
+        "\u200b",
+        "\u2060\u202e",
+        "\u115f",
+        "\u1160",
+        "\u3164",
+        "\uffa0",
+        "\u2800",
+        "\x1b",
+        "\ufe0f",
+        " \u200b\u3164\n",
+    ],
+)
+def test_가시내용_없는_claim은_스키마위반이다(blank: str) -> None:
+    assert RejectReason.SCHEMA_VIOLATION in _judge(blank).reject_reasons
+    with pytest.raises(ValueError):
+        gate.to_draft({"claims": [{"text": blank, "citation_ids": ["policy:audit:1"]}]})
+
+
+@pytest.mark.parametrize(
+    "text", ["안내", "e\u0301", "확인\u200b", "👍", "👨\u200d👩\u200d👧", "!", "한"]
+)
+def test_정상_문자와_결합문자와_이모지는_빈_claim이_아니다(text: str) -> None:
+    assert _judge(text).verdict is Verdict.PASS
+
+
+def test_골뱅이_없는_긴_입력은_이메일_정규식을_반복탐색하지_않는다() -> None:
+    """시간 SLA 대신 병목이었던 regex 진입을 직접 센다. 전각 @ 대조도 유지한다."""
+    original = gate._EMAIL_REGEX
+    with patch.object(gate, "_EMAIL_REGEX", wraps=original) as regex:
+        assert _judge("a" * 32000).verdict is Verdict.PASS
+        regex.sub.assert_not_called()
+    assert RejectReason.PII_DETECTED in _judge("user\uff20example.com").reject_reasons
