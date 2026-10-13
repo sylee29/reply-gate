@@ -1257,3 +1257,177 @@ def test_초안_근거_포맷의_변경도_사용자_프롬프트_지문이_잡�
     before = evaluation.code_condition_fingerprint()["draft_prompt_version"]
     monkeypatch.setattr(draft, "_format_evidence", lambda evidence: "변경된 근거 문면")
     assert evaluation.code_condition_fingerprint()["draft_prompt_version"] != before
+
+
+@pytest.mark.parametrize("edit", ["comment", "docstring", "helper_name"])
+def test_생성_프롬프트의_설명과_내부이름은_실제_출력과_지문을_바꾸지_않는다(
+    monkeypatch: pytest.MonkeyPatch, edit: str
+) -> None:
+    """실제 LLM 입력이 같으면 설명만 고친 코드가 실측의 대조 계보를 끊지 않는다."""
+    from reply_gate import draft, evidence, query_rewrite
+    from reply_gate.contracts import JudgeResult, Verdict
+
+    calls = (
+        (evidence.build_intent_user_prompt, {"inquiry": "문의"}),
+        (
+            evidence.build_sql_user_prompt,
+            {"inquiry": "문의", "order_no": "ORD-20260101-0001", "max_rows": 50},
+        ),
+        (draft.build_draft_user_prompt, {"inquiry": "문의", "evidence": ()}),
+        (query_rewrite.build_rewrite_user_prompt, {"inquiry": "문의"}),
+        (draft._format_judge_detail, {"result": JudgeResult(verdict=Verdict.PASS)}),
+    )
+    before = evaluation._generation_prompt_versions()
+    outputs = [builder(**kwargs) for builder, kwargs in calls]
+    getsource = inspect.getsource
+    targets = {builder for builder, _ in calls}
+
+    def edited_source(obj: Any) -> str:
+        source = getsource(obj)
+        if obj not in targets:
+            return source
+        if edit == "comment":
+            return source + "\n# 설명만 추가했다.\n"
+        module = ast.parse(textwrap.dedent(source))
+        function = cast(ast.FunctionDef, module.body[0])
+        if edit == "docstring":
+            assert ast.get_docstring(function) is not None
+            function.body[0] = ast.Expr(value=ast.Constant(value="설명만 다듬었다."))
+        else:
+            function.name = "renamed_internal_helper"
+        return ast.unparse(module)
+
+    monkeypatch.setattr(inspect, "getsource", edited_source)
+    assert [builder(**kwargs) for builder, kwargs in calls] == outputs
+    assert evaluation._generation_prompt_versions() == before
+
+
+@pytest.mark.parametrize("name", ["intent", "sql", "draft", "rewrite"])
+@pytest.mark.parametrize("field", ["SYSTEM_PROMPT", "JSON_SCHEMA"])
+def test_생성_문면과_스키마의_실제_변경은_해당_지문만_바꾼다(
+    monkeypatch: pytest.MonkeyPatch, name: str, field: str
+) -> None:
+    from reply_gate import draft, evidence, query_rewrite
+
+    module = {"intent": evidence, "sql": evidence, "draft": draft, "rewrite": query_rewrite}[name]
+    before = evaluation._generation_prompt_versions()
+    attribute = f"{name.upper()}_{field}"
+    value = getattr(module, attribute)
+    changed = value + "\n변경된 안내" if field == "SYSTEM_PROMPT" else {**value, "title": "변경"}
+    monkeypatch.setattr(module, attribute, changed)
+    after = evaluation._generation_prompt_versions()
+    assert {key for key in before if before[key] != after[key]} == {f"{name}_prompt_version"}
+
+
+@pytest.mark.parametrize(
+    ("name", "branch"),
+    [
+        ("intent", "normal"),
+        ("intent", "order_ref"),
+        ("intent", "retry"),
+        ("intent", "retry_without_output"),
+        ("sql", "normal"),
+        ("sql", "retry"),
+        ("sql", "retry_without_output"),
+        ("draft", "normal"),
+        ("draft", "regenerate"),
+        ("draft", "judge_detail"),
+        ("rewrite", "normal"),
+    ],
+)
+def test_생성_사용자_문면의_각_실행_분기가_해당_지문을_바꾼다(
+    monkeypatch: pytest.MonkeyPatch, name: str, branch: str
+) -> None:
+    """소스만 바꾸는 대조가 아니라 실제 도달한 출력만 바꿔 탐침의 분기 누락을 잡는다."""
+    from reply_gate import draft, evidence, query_rewrite
+
+    module = {"intent": evidence, "sql": evidence, "draft": draft, "rewrite": query_rewrite}[name]
+    attribute = f"build_{name}_user_prompt"
+    original = getattr(module, attribute)
+    before = evaluation._generation_prompt_versions()
+    changed_outputs: list[str] = []
+
+    def changed(**kwargs: Any) -> str:
+        output = str(original(**kwargs))
+        matches = {
+            "normal": not any(
+                kwargs.get(key) for key in ("previous_error", "reject_reasons", "judge_result")
+            ),
+            "order_ref": bool(kwargs.get("order_no")) and not kwargs.get("previous_error"),
+            "retry": kwargs.get("previous_error") is not None,
+            "retry_without_output": kwargs.get("previous_error") is not None
+            and not kwargs.get("previous_sql")
+            and not kwargs.get("previous_output"),
+            "regenerate": bool(kwargs.get("reject_reasons")) and kwargs.get("judge_result") is None,
+            "judge_detail": kwargs.get("judge_result") is not None,
+        }
+        if matches[branch]:
+            changed_outputs.append(output)
+            return output + "\n변경된 사용자 안내"
+        return output
+
+    monkeypatch.setattr(module, attribute, changed)
+    after = evaluation._generation_prompt_versions()
+    assert changed_outputs
+    assert {key for key in before if before[key] != after[key]} == {f"{name}_prompt_version"}
+
+
+@pytest.mark.parametrize("part", ["rejected_claim", "contradiction", "passed_claim_filter"])
+def test_L2_재생성_세부의_실제_판정_포맷이_초안_지문에_실린다(
+    monkeypatch: pytest.MonkeyPatch, part: str
+) -> None:
+    from reply_gate import draft
+    from reply_gate.contracts import JudgeResult, Verdict
+
+    original = draft._format_judge_detail
+    before = evaluation._generation_prompt_versions()
+    seen: list[JudgeResult] = []
+
+    def changed(result: JudgeResult) -> str:
+        seen.append(result)
+        if part == "rejected_claim":
+            return original(replace(result, claim_judgments=()))
+        if part == "contradiction":
+            return original(replace(result, contradictions=()))
+        return original(result) + "\n".join(
+            item.explanation for item in result.claim_judgments if item.verdict is Verdict.PASS
+        )
+
+    monkeypatch.setattr(draft, "_format_judge_detail", changed)
+    after = evaluation._generation_prompt_versions()
+    assert seen
+    assert any(item.verdict is Verdict.REJECT for result in seen for item in result.claim_judgments)
+    assert any(item.verdict is Verdict.PASS for result in seen for item in result.claim_judgments)
+    assert any(result.contradictions for result in seen)
+    assert {key for key in before if before[key] != after[key]} == {"draft_prompt_version"}
+
+
+@pytest.mark.parametrize("formatter", ["describe_whitelist", "describe_allowed_functions"])
+def test_SQL_안내_포맷의_실제_출력_변경은_SQL_지문에_실린다(
+    monkeypatch: pytest.MonkeyPatch, formatter: str
+) -> None:
+    from reply_gate import evidence
+
+    before = evaluation._generation_prompt_versions()
+    original = getattr(evidence, formatter)
+
+    def changed(*args: Any, **kwargs: Any) -> str:
+        return str(original(*args, **kwargs)) + "\n변경된 SQL 안내"
+
+    monkeypatch.setattr(evidence, formatter, changed)
+    after = evaluation._generation_prompt_versions()
+    assert {key for key in before if before[key] != after[key]} == {"sql_prompt_version"}
+
+
+def test_모든_기각_사유의_재생성_지침이_초안_지문에_실린다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from reply_gate import draft
+    from reply_gate.contracts import RejectReason
+
+    before = evaluation._generation_prompt_versions()
+    for reason in RejectReason:
+        with monkeypatch.context() as patch:
+            patch.setitem(draft._REJECT_FEEDBACK, reason, "변경된 재생성 지침")
+            after = evaluation._generation_prompt_versions()
+            assert {key for key in before if before[key] != after[key]} == {"draft_prompt_version"}
