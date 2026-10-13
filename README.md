@@ -782,4 +782,4 @@ uv run uvicorn reply_gate.api:app --reload   # http://127.0.0.1:8000
 | [`data/promoted_baseline.json`](data/promoted_baseline.json) | **승격 기준선 참조** — 회귀 판정을 구속하는 유일한 기준선. **사람만 바꾼다**(구조 테스트가 쓰기 경로를 막는다) |
 | [`scripts/handcalc_adoption_axis.py`](scripts/handcalc_adoption_axis.py) | 채택 축 손계산 산출물 — **무과금·오프라인**, 커밋된 검색 리포트만 읽는다 |
 | [`scripts/seed_orders.py`](scripts/seed_orders.py) · [`scripts/index_policies.py`](scripts/index_policies.py) | 시딩 · 인덱싱 |
-| [`tests/`](tests/) | **1,823건** (그중 DB 통합 **241건**) |
+| [`tests/`](tests/) | **2,453건** (그중 DB 통합 **287건**) |
