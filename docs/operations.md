@@ -137,7 +137,7 @@ uv run ruff check .            # 0
 uv run ruff format --check .   # 201 files
 uv run mypy                    # strict — 99 files, 0 errors
 uv run pytest                  # DB 를 띄운 실행에서만 건수 대조가 선다
-uv run pytest -m db            # 287 passed, 2,166 deselected · skip 0 이어야 한다
+uv run pytest -m db            # 287 passed, 2,194 deselected · skip 0 이어야 한다
 ```
 
 `pytest` 는 DB 기동을 전제한다. DB 가 없으면 `db` 마커 테스트가 사유를 담아 skip 되므로,

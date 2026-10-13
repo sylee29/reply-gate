@@ -39,6 +39,27 @@ retrieval_order·draft_rule_version·l1_fixture_version·sql_guard_version 네 �
 가격 기준일 2026-08-19로 토큰을 환산한 총액은 **$1.70454030**(색인 포함)이며 실제 청구서가 아니다.
 비용의 분해·미확인 항목은 [pricing.md](pricing.md)에 있다.
 
+### 최종 검토 뒤의 지문 알고리즘 정정 — 같은 모델 입력, 다른 메타데이터
+
+위 3회는 코드 `819b40f`에서 측정한 그대로다. 최종 검토는 생성 builder의 소스 원문을
+지문에 넣어 주석·docstring만 바꿔도 회귀 계보가 끊기는 결함을 발견했다. `45bb953`은 소스
+원문 대신 시스템 문면·스키마·정상/재시도/재생성 실제 출력 탐침을 지문화한다.
+실제 생성 모듈과 계약 AST, 대표 사용자 프롬프트 14건 및 시스템 문면/스키마 바이트는
+전후 동일했다. 생성·검색·게이트·파이프라인 동작이나 모델 설정은 바꾸지 않았다.
+
+| 항목 | 위 실측에 기록된 값 | 정정 후 값 |
+|---|---|---|
+| draft_prompt_version | `draft-prompt-2aab1f6d4c9a` | `draft-prompt-e4acfc7d899e` |
+| intent_prompt_version | `intent-prompt-defc2de7dcf8` | `intent-prompt-4f9e48fb0fd7` |
+| rewrite_prompt_version | `rewrite-prompt-2280543ab235` | `rewrite-prompt-0b27f6262b61` |
+| sql_prompt_version | `sql-prompt-33ec381c5005` | `sql-prompt-b077679fbbd9` |
+
+다른 코드 지문은 같다. **새 코드로 위 실측을 다시 태깅하지 않았다.** 현재 지문으로 새 실행을
+하면 위 3회와도 이 네 칸 때문에 대조 불가이며, 비교의 의미와 메타데이터 알고리즘 변경을
+분리해야 한다. 유료 재측정은 추가하지 않았다. 위 수치는 실제 모델 입력을 바꾼 뒤의 측정으로
+포장하지 않는다. 고정 탐침은 모든 미래 입력을 증명하지 않으므로 새 입력 분기가 생기면
+해당 정상/재시도/피드백 탐침도 보강해야 한다.
+
 ## 한 줄 요약
 
 게이트 **2층**(결정론 L1 + 의미 검증 L2)이 실제로 동작하는 데까지 완성했다. 문의를 받아 근거를
