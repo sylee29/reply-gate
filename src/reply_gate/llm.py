@@ -293,6 +293,11 @@ def validate_embedding_vectors(
             raise ValueError("임베딩 값은 유한한 숫자여야 한다")
         if not any(value != 0 for value in vector):
             raise ValueError("임베딩은 영벡터일 수 없다")
+        # downstream 코사인은 제곱합을 쓴다. 좌표만 유한해도 overflow/underflow로
+        # 무효한 검색 점수가 될 수 있으므로 캐시·DB에 채택하기 전에 같은 연산을 검증한다.
+        squared_norm = sum(float(value) * float(value) for value in vector)
+        if not isfinite(squared_norm) or squared_norm == 0:
+            raise ValueError("임베딩 노름을 유한한 양수로 계산할 수 없다")
 
 
 class GenerationClient(Protocol):
@@ -900,8 +905,8 @@ class BgeM3EmbeddingClient:
                 isinstance(value, bool) or not isinstance(value, int | float) for value in vector
             ):
                 raise ValueError("BGE-M3 임베딩 값은 숫자여야 한다")
+            validate_embedding_vectors([vector], count=1, dimensions=self.DIMENSIONS)
             vectors.append([float(value) for value in vector])
-        validate_embedding_vectors(vectors, count=len(texts), dimensions=self.DIMENSIONS)
         # 로컬 추론은 provider 토큰 과금이 없으므로 기존 EmbeddingResult 계약에서 0이다.
         # **시간은 0 이 아니다** — 과금이 없다는 것과 시간을 쓰지 않았다는 것은 다르다.
         return EmbeddingResult(vectors=vectors, total_tokens=0, elapsed_ms=_elapsed_ms(started))
