@@ -50,7 +50,6 @@ from reply_gate import judge as judge_module
 from reply_gate import llm, policy_index, retrieval_strategies, sql_guard
 from reply_gate import query_rewrite as rewrite_module
 from reply_gate.contracts import (
-    DRAFT_JSON_SCHEMA,
     Claim,
     Draft,
     EscalationReason,
@@ -2054,7 +2053,7 @@ def _judge_rule_version() -> str:
     )
 
 
-def _generation_prompt_versions() -> dict[str, str]:
+def _generation_prompt_versions(*, sql_max_rows: int = 50) -> dict[str, str]:
     """실제 호출 모듈의 시스템 문면·사용자 템플릿·스키마에 묶인 판.
 
     사용자 템플릿은 소스 전체를 포함해 재시도/재생성 분기도 빠뜨리지 않는다.
@@ -2081,11 +2080,13 @@ def _generation_prompt_versions() -> dict[str, str]:
             ),
         ],
         "sql": [
-            evidence_module.build_sql_user_prompt(inquiry=inquiry, order_no=order_no, max_rows=50),
+            evidence_module.build_sql_user_prompt(
+                inquiry=inquiry, order_no=order_no, max_rows=sql_max_rows
+            ),
             evidence_module.build_sql_user_prompt(
                 inquiry=inquiry,
                 order_no=order_no,
-                max_rows=50,
+                max_rows=sql_max_rows,
                 previous_sql="SELECT 1",
                 previous_error="화이트리스트 밖",
             ),
@@ -2116,7 +2117,7 @@ def _generation_prompt_versions() -> dict[str, str]:
             "draft",
             draft_module.DRAFT_SYSTEM_PROMPT,
             draft_module.build_draft_user_prompt,
-            DRAFT_JSON_SCHEMA,
+            draft_module.DRAFT_JSON_SCHEMA,
         ),
         (
             "rewrite",
@@ -2138,14 +2139,14 @@ def _generation_prompt_versions() -> dict[str, str]:
     }
 
 
-def code_condition_fingerprint() -> dict[str, str]:
+def code_condition_fingerprint(*, sql_max_rows: int = 50) -> dict[str, str]:
     """**코드가 결정하는** 조건 지문 항목. 실행 인자·설정·시각을 보지 않는다.
 
     실행 인자에 묶인 항목(골든셋·판정 픽스처·L1 채점표의 판 등)은 진입점이 명시 지문으로
     싣고, 명시가 이긴다 — 여기 값과 이름이 겹치면 진입점 쪽이 남는다.
     """
     return {
-        **_generation_prompt_versions(),
+        **_generation_prompt_versions(sql_max_rows=sql_max_rows),
         "judge_thinking": JUDGE_THINKING,
         "judge_rule_version": _judge_rule_version(),
         "draft_rule_version": _draft_rule_version(),

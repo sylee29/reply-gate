@@ -694,6 +694,10 @@ def load_promoted_baseline(
                 "한다. 승격은 사람이 이 파일을 채우는 것뿐이고 하네스가 대신 채우지 않는다."
             ),
         )
+    if any(Path(stem).name != stem or "\\" in stem or stem in {".", ".."} for stem in stems):
+        return BaselineNotRegistered(
+            path=display, reason="승격 참조의 stem은 경로가 아닌 단일 파일 이름이어야 한다"
+        )
     if len(set(stems)) != len(stems):
         return BaselineNotRegistered(
             path=display, reason="승격 참조에 중복 회차가 있다 — 서로 다른 실측만 정족수를 채운다"
@@ -1382,12 +1386,19 @@ def _binding_line(
             baseline_source=promotion.path,
         )
     runs: list[RunSummary] = []
+    files_seen: set[tuple[int, int]] = set()
     missing: list[str] = []
     for stem in promotion.report_stems:
         path = reports_dir / f"{stem}.json"
         try:
+            identity = path.stat()
+            file_id = (identity.st_dev, identity.st_ino)
+            if file_id in files_seen:
+                missing.append(f"{stem}: 다른 stem과 같은 실제 파일을 가리킨다")
+                continue
+            files_seen.add(file_id)
             runs.append(load_run_summary(path))
-        except RunSummaryError as exc:
+        except (OSError, RunSummaryError) as exc:
             missing.append(f"{stem}: {exc}")
     if missing or not runs:
         return BaselineLine(

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Final
@@ -103,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"산출 경로를 만들 수 없다: {args.out} ({type(exc).__name__})", file=sys.stderr)
         return 2
     complete = False
+    reservation = os.fstat(output.fileno())
     try:
         client = OpenAIGenerationClient(
             api_key=settings.openai_api_key, model=settings.generation_model
@@ -137,12 +139,24 @@ def main(argv: list[str] | None = None) -> int:
         output.write("\n".join(lines) + "\n")
         output.flush()
         complete = True
-        print(f"\n{len(lines)}건 생성 완료 → {args.out}")
-        return 0
     finally:
-        output.close()
-        if not complete:
-            args.out.unlink(missing_ok=True)
+        try:
+            output.close()
+        except BaseException:
+            complete = False
+            raise
+        finally:
+            if not complete:
+                try:
+                    current = args.out.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    # 예약 이후 다른 작성자가 교체한 파일은 지우지 않는다.
+                    if (current.st_dev, current.st_ino) == (reservation.st_dev, reservation.st_ino):
+                        args.out.unlink()
+    print(f"\n{len(lines)}건 생성 완료 → {args.out}")
+    return 0
 
 
 if __name__ == "__main__":

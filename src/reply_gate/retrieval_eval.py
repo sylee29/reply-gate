@@ -354,6 +354,11 @@ class _IdentityRerankClient:
         return JsonCompletion(data={"evidence_ids": evidence_ids}, input_tokens=0, output_tokens=0)
 
 
+def _require_positive_integer(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name}는 bool이 아닌 양의 정수여야 한다")
+
+
 @dataclass(frozen=True)
 class RetrievalEvalConfig:
     """벡터 단독 비교의 재현 가능한 실행 조건."""
@@ -368,10 +373,8 @@ class RetrievalEvalConfig:
     def __post_init__(self) -> None:
         if not self.model.strip():
             raise ValueError("model은 비어 있지 않아야 한다")
-        if self.dimensions <= 0:
-            raise ValueError("dimensions는 1 이상이어야 한다")
-        if self.top_k <= 0:
-            raise ValueError("top_k는 1 이상이어야 한다")
+        _require_positive_integer("dimensions", self.dimensions)
+        _require_positive_integer("top_k", self.top_k)
         if not 0.0 <= self.cutoff <= 1.0:
             raise ValueError("cutoff는 0.0 이상 1.0 이하여야 한다")
         if not self.cutoff_sweep:
@@ -432,10 +435,8 @@ class StrategyCutoffs:
             raise ValueError("cosine_similarity는 0.0 이상 1.0 이하여야 한다")
         if not math.isfinite(self.rrf_score) or self.rrf_score < 0.0:
             raise ValueError("rrf_score는 0.0 이상이어야 한다")
-        if self.rerank_top_n <= 0:
-            raise ValueError("rerank_top_n은 1 이상이어야 한다")
-        if self.fusion_pool_size <= 0:
-            raise ValueError("fusion_pool_size는 1 이상이어야 한다")
+        _require_positive_integer("rerank_top_n", self.rerank_top_n)
+        _require_positive_integer("fusion_pool_size", self.fusion_pool_size)
 
 
 @dataclass(frozen=True)
@@ -1060,10 +1061,9 @@ def retrieve_strategy_ladder(
     uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
     uses_hybrid = any(RetrievalStage.HYBRID in strategy.stages for strategy in strategy_tuple)
     uses_rerank = any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple)
-    if uses_hybrid and (not math.isfinite(rrf_k) or rrf_k <= 0):
-        raise ValueError("rrf_k는 유한한 양수여야 한다")
-    if uses_hybrid and (not math.isfinite(ngram_size) or ngram_size <= 0):
-        raise ValueError("ngram_size는 유한한 양수여야 한다")
+    if uses_hybrid:
+        _require_positive_integer("rrf_k", rrf_k)
+        _require_positive_integer("ngram_size", ngram_size)
     injected_rewrites = _validate_rewritten_queries(
         queries=queries,
         rewritten_queries=rewritten_queries,
@@ -2643,10 +2643,9 @@ def run_retrieval_comparison(
         if uses_rewrite and rewritten_queries is None
         else rewritten_queries
     )
-    if uses_hybrid and (not math.isfinite(rrf_k) or rrf_k <= 0):
-        raise ValueError("rrf_k는 유한한 양수여야 한다")
-    if uses_hybrid and (not math.isfinite(ngram_size) or ngram_size <= 0):
-        raise ValueError("ngram_size는 유한한 양수여야 한다")
+    if uses_hybrid:
+        _require_positive_integer("rrf_k", rrf_k)
+        _require_positive_integer("ngram_size", ngram_size)
     injected_rewrites = _validate_rewritten_queries(
         queries=queries,
         rewritten_queries=rewrite_input,

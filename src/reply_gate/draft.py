@@ -33,6 +33,7 @@ from reply_gate.contracts import (
 from reply_gate.llm import GenerationClient, LLMFormatError
 
 __all__ = [
+    "DRAFT_JSON_SCHEMA",
     "DRAFT_STAGE",
     "DRAFT_SYSTEM_PROMPT",
     "DraftGeneration",

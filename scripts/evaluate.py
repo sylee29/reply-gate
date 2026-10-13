@@ -90,6 +90,7 @@ from reply_gate.evaluation import (
     assess_targets,
     attach_regression_guard,
     build_report,
+    code_condition_fingerprint,
     display_path,
     load_fixture_phone_inputs,
     load_golden_set,
@@ -307,8 +308,9 @@ def _run_settings(*, args: argparse.Namespace, settings: Settings) -> Settings:
         threshold = (
             STUB_SIMILARITY_THRESHOLD if args.stub_llm else settings.vector_similarity_threshold
         )
-    return settings.model_copy(
-        update={
+    return type(settings).model_validate(
+        {
+            **settings.model_dump(),
             "vector_similarity_threshold": float(threshold),
             "vector_top_k": int(args.top_k) if args.top_k is not None else settings.vector_top_k,
             "judge_model": (
@@ -549,6 +551,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
     selected = selected_measurements(args)
+    try:
+        run_settings = _run_settings(args=args, settings=settings)
+    except ValueError as error:
+        raise SystemExit(f"거부: 잘못된 실행 설정 — {error}") from error
     # 키·DB 선검사는 **측정 시작 전**이다 — 도중에 발견하면 과금만 하고 산출물이 없다.
     skip = _skip_reason(args=args, settings=settings, selected=selected)
     judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip, selected=selected)
@@ -582,7 +588,6 @@ def main(argv: list[str] | None = None) -> int:
             judge_fixture_error if judge_skip is None else f"{judge_skip} / {judge_fixture_error}"
         )
 
-    run_settings = _run_settings(args=args, settings=settings)
     # 측정 2 가 **실측으로 돌 조건이었는가**. 도중에 중단돼도 이 값은 True 로 남는다:
     # 이름은 이미 확정됐고(측정 시작 전 결정), 그 이름이 곧 "이 실행은 과금될 수 있었다"는
     # 저장소에 남는 기록이다.
@@ -859,6 +864,7 @@ def _condition_fingerprint(
         gate_statistic = gate.statistic.value if gate is not None else "꺼짐"
         gate_tau = f"{gate.tau:g}" if gate is not None else "꺼짐"
     return {
+        **code_condition_fingerprint(sql_max_rows=run_settings.sql_max_rows),
         # 라벨 버전 = 골든셋 내용 지문. 결정 0008 의 라벨 재정렬 전후가 여기서 갈린다.
         "label_version": content_digest(args.golden_set, prefix="golden-") or "미상",
         # **검색 정답 라벨은 근거 부분 손실 검사의 정답 입력이다.** 여기 없으면 라벨 한 줄
