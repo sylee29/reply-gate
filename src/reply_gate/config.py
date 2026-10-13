@@ -12,8 +12,9 @@
 **접속 문자열(`database_url`)도 같은 규칙 안이다.** 값을 조립한 새 문자열이라 비밀번호를
 그대로 담을 수밖에 없지만 — 담지 않으면 DB 에 접속할 수 없다 — 그 문자열을 **평문 `str` 로
 내놓을 이유는 없다.** 조립 결과를 `SecretStr` 로 감싸면 표시·덤프 경로가 필드와 같은
-자격으로 닫히고, 값이 필요한 psycopg 호출 한 줄만 `.get_secret_value()` 로 꺼낸다.
-로그·오류 메시지용 설명은 여전히 비밀번호를 빼고 따로 만든다(`db.describe_target`).
+자격으로 닫힌다. 실제 DB 연결은 URI 파싱 오류의 비밀 유출을 막기 위해 개별 인자를 쓰고,
+비밀번호만 psycopg 호출 직전에 꺼낸다. 로그·오류 메시지용 설명은 비밀번호를 빼고 따로
+만든다(`db.describe_target`).
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 from functools import lru_cache
 from urllib.parse import quote
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from reply_gate.retrieval_strategies import AbstentionGate, AbstentionStatistic
@@ -67,6 +68,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     # ── 외부 API 키 ─────────────────────────────────────────────────────────
@@ -140,14 +142,14 @@ class Settings(BaseSettings):
     query_rewrite_enabled: bool = True
 
     # ── 조정 가능 기본값 (docs/operations.md "환경 변수" 절) ────────────────────────
-    vector_top_k: int = 5
+    vector_top_k: int = Field(default=5, ge=1)
     #: 정책 근거 채택 컷. **사이클 3 T10 라이브 3회가 0.50 을 반증해 0.30 으로 되돌린 값이다**
     #: (`docs/tracking/status.md` "사이클 3 T10 라이브 재실측"). 0.50 은 무근거 4건(G21-G24)을
     #: 검색 단계에서 기권시켰지만 같은 컷이 G04 의 정답 조항(0.3571)과 G18 의 상충 조항
     #: (`policy:refund:2-4`, 0.4676)까지 잘라, 정상 문의가 인계되고 L2 의 모순 기각이
     #: 사라졌다. 두 조항 모두 0.30 위에 있다. **재작성은 유지한다** — G17 을 3/3 회 고쳤고
     #: 깎은 케이스가 없다(하드 게이트 9: 실측이 정당화하는 기본값만 남긴다).
-    vector_similarity_threshold: float = 0.3
+    vector_similarity_threshold: float = Field(default=0.3, ge=-1, le=1, allow_inf_nan=False)
     #: 질의 단위 기권 게이트 스위치 — 기본 켜짐(`docs/tracking/decisions/0014`).
     #: 끄면 채택은 절대 하한 하나로 돌아간다. **원복은 이 한 줄이다** — 컷·`top_k`·응답
     #: 계약은 애초에 건드리지 않았으므로 축별 원복(결정 0011)의 범위가 게이트 하나로 남는다.
@@ -161,11 +163,23 @@ class Settings(BaseSettings):
     #: (0.01 눈금), 채택 쪽 경계는 G15(0.0668, +0.0068) · 기권 쪽 경계는 G23(0.0521, -0.0079)이다.
     #: **설정값이지 데이터가 아니다** — 적재물도 캐시도 만들지 않는다. 조건이 바뀌면
     #: 자동으로 따라가지 않는다(위 `embedding_model` 주석).
-    abstention_tau: float = 0.06
-    sql_max_rows: int = 50
+    abstention_tau: float = Field(default=0.06, ge=0, allow_inf_nan=False)
+    sql_max_rows: int = Field(default=50, ge=1)
     #: text-to-SQL 실행 커넥션의 `statement_timeout`(ms). 0 이면 무제한이므로 0 을 두지 않는다 —
     #: 생성된 쿼리 하나가 워커를 몇 분씩 묶는 것을 코드가 막는 층이다.
-    sql_statement_timeout_ms: int = 5000
+    sql_statement_timeout_ms: int = Field(default=5000, ge=1)
+
+    @field_validator("postgres_app_user", "postgres_ro_user")
+    @classmethod
+    def separate_database_roles(cls, value: str, info: ValidationInfo) -> str:
+        """Postgres 의 식별자 잘림이나 동일 이름으로 권한 경계가 합쳐지지 않는다."""
+        if not value or "\x00" in value or len(value.encode("utf-8")) > 63:
+            raise ValueError("DB 계정 이름은 비어 있지 않은 63바이트 이내 식별자여야 한다")
+        if value == "reply_gate_readers":
+            raise ValueError("로그인 계정과 읽기전용 권한 그룹은 서로 달라야 한다")
+        if info.field_name == "postgres_ro_user" and value == info.data.get("postgres_app_user"):
+            raise ValueError("앱 계정과 읽기전용 계정은 서로 달라야 한다")
+        return value
 
     def abstention_gate(self) -> AbstentionGate | None:
         """실행 경로에 걸 기권 게이트. 스위치가 꺼져 있으면 `None`.
@@ -214,7 +228,7 @@ class Settings(BaseSettings):
         **평문 `str` 로 내놓는 것은 다른 문제**이고, 예전에는 뒤엣것까지 열려 있었다 — 이
         속성을 로그·오류·설정 덤프에 그대로 실으면 비밀번호가 따라갔다. 감싸 두면 그 경로가
         필드와 같은 자격으로 닫히고, 값이 필요한 자리는 `.get_secret_value()` 로 드러난다
-        (지금은 `db.connect` 한 줄뿐이다).
+        실제 `db.connect` 는 URI 대신 개별 연결 인자를 사용한다.
         """
         return SecretStr(
             self._dsn(self.postgres_app_user, self.postgres_app_password.get_secret_value())

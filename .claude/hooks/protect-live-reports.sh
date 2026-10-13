@@ -26,16 +26,11 @@
 #   codex             : Codex(.codex/config.toml). **스키마 미확인**이라 도구 이름으로
 #                       분기하지 않고 페이로드 전문에서 잠긴 경로와 변경 신호를 함께 찾는다.
 #                       거부는 JSON 과 exit 2 **양쪽**으로 낸다 — 어느 규약이든 걸리게.
-# 디버그: RG_HOOK_DEBUG=<파일경로> 를 주면 원본 페이로드를 그 파일에 덧붙인다(스키마 확인용).
 
 set -uo pipefail
 
 harness=${1:-claude}
 payload=$(cat)
-
-if [ -n "${RG_HOOK_DEBUG:-}" ]; then
-	printf '=== %s ===\n%s\n' "$harness" "$payload" >>"$RG_HOOK_DEBUG" 2>/dev/null || :
-fi
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || root="${CLAUDE_PROJECT_DIR:-$PWD}"
 

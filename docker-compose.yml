@@ -31,7 +31,7 @@ services:
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
       # 호스트 포트는 .env 의 POSTGRES_PORT (기본 5433 — 로컬 Postgres 5432 와 충돌 회피).
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
     volumes:
       # 최초 기동 시 1회만 실행된다. 볼륨이 남아 있으면 다시 돌지 않는다.
       - ./db/init:/docker-entrypoint-initdb.d:ro
