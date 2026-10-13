@@ -38,6 +38,7 @@ __all__ = [
     "evaluate_draft",
     "fold_for_detection",
     "fold_numeric_for_detection",
+    "is_quantity_echo",
     "normalize_digits",
     "normalize_email",
     "normalize_phone",
@@ -730,6 +731,28 @@ def _source_spans(original: str, folded: str) -> list[tuple[int, int]]:
         elif kind in ("replace", "insert"):
             spans[c:d] = [(a, b)] * (d - c)
     return spans
+
+
+def is_quantity_echo(scalar: str, *, answer_text: str) -> bool:
+    """SQL scalar가 확정 답변의 같은 부호 없는 정수 수량이면 True.
+
+    기존 수량 문법만 재사용한다. 0 소수부/천 단위 묶음은 허용하지만 부분 숫자,
+    비정수, 부호로 시작하는 전화 표기는 승인하지 않는다. 응답 가림 전용이며
+    L1의 판정·근거 허용 목록은 변경하지 않는다.
+    """
+    value = _fold_numeric_characters(scalar)
+    if value.startswith(("+", "-")):
+        return False
+    integer = _INTEGER_VALUE.fullmatch(value)
+    if integer is None:
+        return False
+    wanted = normalize_digits(integer["number"])
+    answer = _fold_numeric_characters(_without_email_tokens(answer_text))
+    return any(
+        normalize_digits(match["number"]) == wanted
+        and not answer[: match.start()].rstrip().endswith("-")
+        for match in _QUANTITY.finditer(answer)
+    )
 
 
 def redact_pii(text: str, *, allowed_text: str = "", private_values: Sequence[str] = ()) -> str:

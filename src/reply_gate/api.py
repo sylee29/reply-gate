@@ -69,7 +69,7 @@ from reply_gate.config import Settings, get_settings
 from reply_gate.contracts import EvidenceSource, GateResult, InquiryStatus, JudgeResult
 from reply_gate.db import connect, readonly_connect
 from reply_gate.evidence import render_sql_rows
-from reply_gate.gate import redact_pii
+from reply_gate.gate import is_quantity_echo, redact_pii
 from reply_gate.llm import (
     EmbeddingClient,
     EmbeddingResult,
@@ -358,8 +358,7 @@ def _public_evidence(
                 {
                     key: (
                         value
-                        if key not in columns
-                        and (value is None or isinstance(value, bool | int | float))
+                        if key not in columns and is_quantity_echo(str(value), answer_text=allowed)
                         else mask("= " + str(value)).removeprefix("= ")
                         if value is not None
                         else None
