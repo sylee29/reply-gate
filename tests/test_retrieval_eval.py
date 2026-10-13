@@ -74,7 +74,7 @@ class _IdentityReranker:
         )
 
 
-def test_score_retrieval_uses_documented_empty_label_and_zero_hit_denominators() -> None:
+def test_검색_채점은_빈_라벨과_검색0건의_문서상_분모를_쓴다() -> None:
     retrieved = (
         RetrievedCase(
             case_id="A",
@@ -116,7 +116,7 @@ def test_score_retrieval_uses_documented_empty_label_and_zero_hit_denominators()
     assert by_id["C"].accepted_recall == 0.0
 
 
-def test_retrieve_cases_ranks_all_policy_vectors_in_memory_without_labels(
+def test_메모리_검색은_라벨없이_모든_정책_벡터를_정렬한다(
     tmp_path: Path,
 ) -> None:
     embedder = _FixedEmbedder(
@@ -147,7 +147,7 @@ def test_retrieve_cases_ranks_all_policy_vectors_in_memory_without_labels(
     ]
 
 
-def test_embedding_cache_reuses_same_text_and_invalidates_changed_policy(
+def test_임베딩_캐시는_같은_문구를_재사용하고_변경된_정책을_무효화한다(
     tmp_path: Path,
 ) -> None:
     embedder = _FixedEmbedder(
@@ -371,7 +371,7 @@ def test_대역_리랭크_실행은_폴백_건수와_토큰을_리포트에_남�
     assert "## 리랭크 관측" in paths.markdown.read_text(encoding="utf-8")
 
 
-def test_run_retrieval_comparison_loads_committed_rewrites_for_default_ladder(
+def test_기본_검색_비교는_커밋된_재작성문을_읽는다(
     tmp_path: Path,
 ) -> None:
     paths = run_retrieval_comparison(
@@ -402,7 +402,7 @@ def test_run_retrieval_comparison_loads_committed_rewrites_for_default_ladder(
     assert "oracle" not in markdown
 
 
-def test_run_retrieval_comparison_can_report_oracle_upper_bound_condition(
+def test_검색_비교는_oracle_상한_조건을_보고할_수_있다(
     tmp_path: Path,
 ) -> None:
     paths = run_retrieval_comparison(
@@ -425,7 +425,7 @@ def test_run_retrieval_comparison_can_report_oracle_upper_bound_condition(
     assert "배포 가능 개선폭이 아님" in paths.markdown.read_text(encoding="utf-8")
 
 
-def test_fixture_and_rewrite_configuration_fail_before_any_embedding_call(tmp_path: Path) -> None:
+def test_픽스처와_재작성_설정_오류는_임베딩_전에_실패한다(tmp_path: Path) -> None:
     embedder = _FixedEmbedder({})
 
     with pytest.raises(FileNotFoundError):
@@ -496,7 +496,7 @@ def test_저장소_밖_재작성_입력은_조건_명시를_요구한다(tmp_pat
         )
 
 
-def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Path) -> None:
+def test_벡터_단독은_재작성_미사용을_보고한다(tmp_path: Path) -> None:
     paths = run_retrieval_comparison(
         live=False,
         dimensions=32,
@@ -517,7 +517,7 @@ def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Pat
     assert "질의 재작성: 미사용" in paths.markdown.read_text(encoding="utf-8")
 
 
-def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_cuts(
+def test_전략_사다리는_대역4종을_완주하고_별도_컷을_보고한다(
     tmp_path: Path,
 ) -> None:
     cases = load_golden_set()
@@ -584,7 +584,7 @@ def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_c
         ({"G": "   "}, "비어"),
     ],
 )
-def test_rewrite_input_is_validated_before_embedding(
+def test_재작성_입력은_임베딩_전에_검증한다(
     tmp_path: Path, rewritten_queries: dict[str, str], message: str
 ) -> None:
     embedder = _FixedEmbedder({"정책 A": [1.0, 0.0], "문의": [1.0, 0.0], "재작성": [0.0, 1.0]})
@@ -606,7 +606,7 @@ def test_rewrite_input_is_validated_before_embedding(
     assert embedder.calls == []
 
 
-def test_vector_rewrite_uses_distinct_injected_text(tmp_path: Path) -> None:
+def test_벡터_재작성은_별도로_주입된_문구를_쓴다(tmp_path: Path) -> None:
     embedder = _FixedEmbedder(
         {
             "정책 A": [1.0, 0.0],
@@ -648,7 +648,7 @@ def test_vector_rewrite_uses_distinct_injected_text(tmp_path: Path) -> None:
     assert ("retrieval_query", ("실제 재작성 문의",)) in embedder.calls
 
 
-def test_strategy_retrieval_boundary_does_not_accept_or_import_labels() -> None:
+def test_전략_검색_경계는_라벨을_받거나_import하지_않는다() -> None:
     assert "labels" not in inspect.signature(retrieve_strategy_ladder).parameters
     retrieval_eval_module = inspect.getmodule(retrieve_strategy_ladder)
     assert retrieval_eval_module is not None
@@ -808,7 +808,7 @@ class _CandidateEmbedder:
         return EmbeddingResult(vectors=[[0.0] * self._dimensions for _ in texts], total_tokens=0)
 
 
-def test_embedding_model_axis_has_four_documented_candidates() -> None:
+def test_임베딩_모델_축에는_문서화된_후보4종이_있다() -> None:
     assert [
         (candidate.model, candidate.dimensions, candidate.provider)
         for candidate in DEFAULT_EMBEDDING_CANDIDATES
@@ -820,7 +820,7 @@ def test_embedding_model_axis_has_four_documented_candidates() -> None:
     ]
 
 
-def test_missing_BGE_dependency_marks_only_that_axis_row_unmeasured(tmp_path: Path) -> None:
+def test_BGE_의존성_누락은_해당_축만_미측정으로_남긴다(tmp_path: Path) -> None:
     evaluated: list[str] = []
 
     def factory(candidate: EmbeddingCandidate, api_key: SecretStr) -> EmbeddingClient:

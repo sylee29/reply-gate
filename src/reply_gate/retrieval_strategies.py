@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Final, cast
 
 from reply_gate.llm import GenerationClient, LLMCallError, LLMFormatError
@@ -480,7 +481,7 @@ def _read_rerank_cache(
 ) -> tuple[str, ...] | None:
     try:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (OSError, ValueError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -498,12 +499,22 @@ def _write_rerank_cache(
         "input_hash": input_hash,
         "evidence_ids": list(evidence_ids),
     }
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _truncated(message: str, *, limit: int = 200) -> str:

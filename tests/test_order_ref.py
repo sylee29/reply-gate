@@ -51,23 +51,23 @@ INVALID = [
 
 
 @pytest.mark.parametrize("value", VALID)
-def test_valid_order_numbers_are_accepted(value: str) -> None:
+def test_유효한_주문번호는_허용한다(value: str) -> None:
     assert is_valid_order_no(value) is True
 
 
 @pytest.mark.parametrize(("value", "why"), INVALID, ids=[why for _, why in INVALID])
-def test_invalid_order_numbers_are_rejected(value: str, why: str) -> None:
+def test_잘못된_주문번호는_거부한다(value: str, why: str) -> None:
     assert is_valid_order_no(value) is False, why
     with pytest.raises(InvalidOrderNoError):
         parse_order_no(value)
 
 
-def test_parse_returns_date_and_sequence() -> None:
+def test_파싱은_날짜와_순번을_반환한다() -> None:
     ref = parse_order_no("ORD-20260315-0042")
     assert ref == OrderRef(ordered_on=date(2026, 3, 15), sequence=42)
 
 
-def test_format_and_parse_round_trip() -> None:
+def test_포맷과_파싱이_왕복한다() -> None:
     ordered_on = date(2026, 7, 31)
     order_no = format_order_no(ordered_on=ordered_on, sequence=34)
     assert order_no == "ORD-20260731-0034"
@@ -76,12 +76,12 @@ def test_format_and_parse_round_trip() -> None:
 
 
 @pytest.mark.parametrize("sequence", [ORDER_NO_MIN_SEQUENCE, 500, ORDER_NO_MAX_SEQUENCE])
-def test_format_accepts_sequence_range(sequence: int) -> None:
+def test_포맷은_유효한_순번_범위를_허용한다(sequence: int) -> None:
     assert is_valid_order_no(format_order_no(ordered_on=date(2026, 3, 15), sequence=sequence))
 
 
 @pytest.mark.parametrize("sequence", [-1, 0, ORDER_NO_MAX_SEQUENCE + 1, 100000])
-def test_format_rejects_out_of_range_sequence(sequence: int) -> None:
+def test_포맷은_범위밖_순번을_거부한다(sequence: int) -> None:
     with pytest.raises(InvalidOrderNoError):
         format_order_no(ordered_on=date(2026, 3, 15), sequence=sequence)
 
@@ -89,19 +89,19 @@ def test_format_rejects_out_of_range_sequence(sequence: int) -> None:
 @pytest.mark.parametrize(
     "raw", ["  ORD-20260315-0042  ", "ord-20260315-0042", "\tOrd-20260315-0042\n"]
 )
-def test_normalize_makes_sloppy_input_valid(raw: str) -> None:
+def test_정규화는_느슨한_입력을_유효하게_만든다(raw: str) -> None:
     """접수 폼의 공백·대소문자만 흡수한다 — 형식이 틀린 값을 고쳐주지는 않는다."""
     assert is_valid_order_no(raw) is False
     assert normalize_order_no(raw) == "ORD-20260315-0042"
     assert is_valid_order_no(normalize_order_no(raw)) is True
 
 
-def test_normalize_does_not_rescue_broken_values() -> None:
+def test_정규화도_깨진_값을_살리지_않는다() -> None:
     assert is_valid_order_no(normalize_order_no("  ORD-20260230-0001 ")) is False
     assert is_valid_order_no(normalize_order_no("주문번호 없음")) is False
 
 
-def test_regex_has_no_capture_groups() -> None:
+def test_정규식에는_캡처_그룹이_없다() -> None:
     """정규식 문자열은 Postgres CHECK 제약과 문자 단위로 같아야 한다.
 
     캡처 그룹이 생기면 두 곳이 어긋나기 시작한다 — `db/schema.sql` 과의 대조 테스트는

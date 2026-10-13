@@ -13,6 +13,7 @@ from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
 from statistics import fmean
+from tempfile import NamedTemporaryFile
 from typing import Any, Final, cast
 
 from pydantic import SecretStr
@@ -28,6 +29,7 @@ from reply_gate.llm import (
     OpenAIEmbeddingClient,
     OpenAIGenerationClient,
     OptionalEmbeddingDependencyError,
+    validate_embedding_vectors,
 )
 from reply_gate.policy_index import (
     DEFAULT_POLICY_DIR,
@@ -352,6 +354,11 @@ class _IdentityRerankClient:
         return JsonCompletion(data={"evidence_ids": evidence_ids}, input_tokens=0, output_tokens=0)
 
 
+def _require_positive_integer(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name}는 bool이 아닌 양의 정수여야 한다")
+
+
 @dataclass(frozen=True)
 class RetrievalEvalConfig:
     """벡터 단독 비교의 재현 가능한 실행 조건."""
@@ -366,10 +373,8 @@ class RetrievalEvalConfig:
     def __post_init__(self) -> None:
         if not self.model.strip():
             raise ValueError("model은 비어 있지 않아야 한다")
-        if self.dimensions <= 0:
-            raise ValueError("dimensions는 1 이상이어야 한다")
-        if self.top_k <= 0:
-            raise ValueError("top_k는 1 이상이어야 한다")
+        _require_positive_integer("dimensions", self.dimensions)
+        _require_positive_integer("top_k", self.top_k)
         if not 0.0 <= self.cutoff <= 1.0:
             raise ValueError("cutoff는 0.0 이상 1.0 이하여야 한다")
         if not self.cutoff_sweep:
@@ -428,12 +433,10 @@ class StrategyCutoffs:
     def __post_init__(self) -> None:
         if not 0.0 <= self.cosine_similarity <= 1.0:
             raise ValueError("cosine_similarity는 0.0 이상 1.0 이하여야 한다")
-        if self.rrf_score < 0.0:
+        if not math.isfinite(self.rrf_score) or self.rrf_score < 0.0:
             raise ValueError("rrf_score는 0.0 이상이어야 한다")
-        if self.rerank_top_n <= 0:
-            raise ValueError("rerank_top_n은 1 이상이어야 한다")
-        if self.fusion_pool_size <= 0:
-            raise ValueError("fusion_pool_size는 1 이상이어야 한다")
+        _require_positive_integer("rerank_top_n", self.rerank_top_n)
+        _require_positive_integer("fusion_pool_size", self.fusion_pool_size)
 
 
 @dataclass(frozen=True)
@@ -777,7 +780,7 @@ def _read_cached_vector(
 ) -> list[float] | None:
     try:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (OSError, ValueError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -791,6 +794,10 @@ def _read_cached_vector(
         or len(vector) != dimensions
         or any(not isinstance(value, int | float) for value in vector)
     ):
+        return None
+    try:
+        validate_embedding_vectors([vector], count=1, dimensions=dimensions)
+    except ValueError:
         return None
     return [float(value) for value in vector]
 
@@ -809,12 +816,22 @@ def _write_cached_vector(
         "text_hash": text_hash,
         "vector": list(vector),
     }
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 @dataclass
@@ -870,16 +887,10 @@ def _embed_with_cache(
         if stats is not None:
             stats.embedded_texts += len(missing_texts)
             stats.total_tokens += embedded.total_tokens
-        if len(embedded.vectors) != len(missing_texts):
-            raise ValueError(
-                "임베딩 개수가 대상 텍스트 수와 다르다: "
-                f"{len(embedded.vectors)} != {len(missing_texts)}"
-            )
+        validate_embedding_vectors(
+            embedded.vectors, count=len(missing_texts), dimensions=config.dimensions
+        )
         for target_text, vector in zip(missing_texts, embedded.vectors, strict=True):
-            if len(vector) != config.dimensions:
-                raise ValueError(
-                    f"임베딩 차원이 구성과 다르다: {len(vector)} != {config.dimensions}"
-                )
             text_hash = _text_hash(target_text)
             _write_cached_vector(
                 path=paths[target_text],
@@ -1050,6 +1061,9 @@ def retrieve_strategy_ladder(
     uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
     uses_hybrid = any(RetrievalStage.HYBRID in strategy.stages for strategy in strategy_tuple)
     uses_rerank = any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple)
+    if uses_hybrid:
+        _require_positive_integer("rrf_k", rrf_k)
+        _require_positive_integer("ngram_size", ngram_size)
     injected_rewrites = _validate_rewritten_queries(
         queries=queries,
         rewritten_queries=rewritten_queries,
@@ -1304,19 +1318,7 @@ def score_retrieval(
             )
         )
 
-    aggregate = AggregateMetrics(
-        recall_at_1=_mean([case.recall_at_1 for case in cases if case.recall_at_1 is not None]),
-        recall_at_3=_mean([case.recall_at_3 for case in cases if case.recall_at_3 is not None]),
-        recall_at_5=_mean([case.recall_at_5 for case in cases if case.recall_at_5 is not None]),
-        accepted_precision=_mean(
-            [case.accepted_precision for case in cases if case.accepted_precision is not None]
-        ),
-        accepted_recall=_mean(
-            [case.accepted_recall for case in cases if case.accepted_recall is not None]
-        ),
-        precision_case_count=sum(case.accepted_precision is not None for case in cases),
-        recall_case_count=sum(case.accepted_recall is not None for case in cases),
-    )
+    aggregate = _aggregate_cases(cases)
     return RetrievalScore(cutoff=cutoff, top_k=top_k, cases=tuple(cases), aggregate=aggregate)
 
 
@@ -1394,7 +1396,7 @@ def _score_cases(
     return tuple(cases)
 
 
-def _aggregate_cases(cases: Sequence[StrategyCaseScore]) -> AggregateMetrics:
+def _aggregate_cases(cases: Sequence[CaseScore | StrategyCaseScore]) -> AggregateMetrics:
     return AggregateMetrics(
         recall_at_1=_mean([case.recall_at_1 for case in cases if case.recall_at_1 is not None]),
         recall_at_3=_mean([case.recall_at_3 for case in cases if case.recall_at_3 is not None]),
@@ -1522,10 +1524,11 @@ def _boundary(
     rows: Sequence[GatedCaseRow], case_ids: Sequence[str], *, tightest: str
 ) -> BoundaryCase | None:
     """τ 경계에 가장 가까운 케이스. `tightest="min"` 은 채택 쪽, `"max"` 는 기권 쪽이다."""
+    selected_ids = set(case_ids)
     candidates = [
         row
         for row in rows
-        if row.case_id in set(case_ids) and row.statistic_value is not None
+        if row.case_id in selected_ids and row.statistic_value is not None
         if row.margin_to_tau is not None
     ]
     if not candidates:
@@ -2629,6 +2632,7 @@ def run_retrieval_comparison(
     cases = load_golden_set(golden_set_path)
     queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
     uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
+    uses_hybrid = any(RetrievalStage.HYBRID in strategy.stages for strategy in strategy_tuple)
     if not uses_rewrite and rewrite_condition is RewriteCondition.ORACLE:
         raise RetrievalConfigurationError("oracle 재작성과 벡터 단독 전략을 함께 요청할 수 없다")
     rewrite_input = (
@@ -2639,6 +2643,9 @@ def run_retrieval_comparison(
         if uses_rewrite and rewritten_queries is None
         else rewritten_queries
     )
+    if uses_hybrid:
+        _require_positive_integer("rrf_k", rrf_k)
+        _require_positive_integer("ngram_size", ngram_size)
     injected_rewrites = _validate_rewritten_queries(
         queries=queries,
         rewritten_queries=rewrite_input,

@@ -532,7 +532,7 @@ class _LocalEmbeddingModel:
 
 
 def test_BGE_M3_는_선택_모델_경계에서_1024차원_dense_벡터를_만든다() -> None:
-    model = _LocalEmbeddingModel([[0.0] * 1024, [1.0] * 1024])
+    model = _LocalEmbeddingModel([[1.0] + [0.0] * 1023, [1.0] * 1024])
     client = BgeM3EmbeddingClient(model=model)
 
     result = client.embed(stage="retrieval", texts=["문의", "정책"])

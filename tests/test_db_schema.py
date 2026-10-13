@@ -50,17 +50,15 @@ def _scalar(conn: psycopg.Connection[DictRow], sql: str, params: Any = None) -> 
 # ── 시딩 ─────────────────────────────────────────────────────────────────────
 
 
-def test_seeded_order_count_is_500(seeded_order_count: int) -> None:
+def test_시딩된_주문은_500건이다(seeded_order_count: int) -> None:
     assert seeded_order_count == ORDER_COUNT
 
 
-def test_orders_table_holds_exactly_500_rows(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_주문_테이블은_정확히_500행이다(app_conn: psycopg.Connection[DictRow]) -> None:
     assert _scalar(app_conn, "SELECT count(*) FROM orders") == ORDER_COUNT
 
 
-def test_reseeding_is_idempotent(
-    app_conn: psycopg.Connection[DictRow], seeded_order_count: int
-) -> None:
+def test_재시딩은_멱등이다(app_conn: psycopg.Connection[DictRow], seeded_order_count: int) -> None:
     """시딩을 한 번 더 돌려도 정확히 500건이다 (행위 계약: 재실행 가능)."""
     assert seeded_order_count == ORDER_COUNT
     assert seed_orders() == ORDER_COUNT
@@ -68,7 +66,7 @@ def test_reseeding_is_idempotent(
     assert _scalar(app_conn, "SELECT count(*) FROM orders") == ORDER_COUNT
 
 
-def test_reseeding_removes_rows_that_are_not_in_the_fixture(
+def test_재시딩은_픽스처_밖의_행을_지운다(
     seeded_order_count: int,
 ) -> None:
     """픽스처에 없는 행이 끼어들어도 재시딩이 정확히 픽스처 상태로 되돌린다."""
@@ -92,7 +90,7 @@ def test_reseeding_removes_rows_that_are_not_in_the_fixture(
         assert _scalar(conn, "SELECT count(*) FROM orders WHERE order_no = %s", (stray,)) == 0
 
 
-def test_every_seeded_order_no_passes_the_shared_format_definition(
+def test_모든_시딩_주문번호가_공통_형식을_통과한다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """시딩과 접수 검증이 같은 정의를 공유한다는 계약의 실증."""
@@ -101,7 +99,7 @@ def test_every_seeded_order_no_passes_the_shared_format_definition(
     assert bad == []
 
 
-def test_fixture_matches_the_database(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_픽스처와_DB_주문이_일치한다(app_conn: psycopg.Connection[DictRow]) -> None:
     """시딩은 픽스처 로드일 뿐이다 — DB 내용이 커밋된 픽스처와 정확히 같아야 한다."""
     fixture = {record.order_no: record for record in load_fixture()}
     assert len(fixture) == ORDER_COUNT
@@ -118,7 +116,7 @@ def test_fixture_matches_the_database(app_conn: psycopg.Connection[DictRow]) -> 
         )
 
 
-def test_orders_carry_the_fields_pii_and_text_to_sql_demos_need(
+def test_주문은_개인정보와_SQL_시연에_필요한_필드를_담는다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     rows = app_conn.execute(
@@ -137,7 +135,7 @@ def test_orders_carry_the_fields_pii_and_text_to_sql_demos_need(
         assert row["ordered_at"] is not None
 
 
-def test_all_order_statuses_appear_enough_for_a_demo(
+def test_모든_주문_상태가_시연에_충분히_나온다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     rows = app_conn.execute("SELECT status, count(*) AS n FROM orders GROUP BY status").fetchall()
@@ -146,7 +144,7 @@ def test_all_order_statuses_appear_enough_for_a_demo(
     assert min(counts.values()) >= 5, counts
 
 
-def test_shipping_timestamps_are_consistent_with_status(
+def test_배송_시각은_상태와_일치한다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     unshipped_with_tracking = _scalar(
@@ -168,7 +166,7 @@ def test_shipping_timestamps_are_consistent_with_status(
 
 
 @pytest.mark.parametrize("constraint", ["orders_order_no_format", "inquiries_order_no_format"])
-def test_db_order_no_check_uses_the_same_regex_as_order_ref(
+def test_DB_주문번호_제약은_공통_정규식을_쓴다(
     app_conn: psycopg.Connection[DictRow], constraint: str
 ) -> None:
     """DB CHECK 와 `order_ref.ORDER_NO_REGEX` 가 어긋나면 실패한다."""
@@ -180,7 +178,7 @@ def test_db_order_no_check_uses_the_same_regex_as_order_ref(
     assert ORDER_NO_REGEX in definition, definition
 
 
-def test_policy_chunk_vector_dimension_matches_settings(
+def test_정책_벡터_차원은_설정과_일치한다(
     app_conn: psycopg.Connection[DictRow], db_settings: Settings
 ) -> None:
     column_type = _scalar(
@@ -192,7 +190,7 @@ def test_policy_chunk_vector_dimension_matches_settings(
     assert column_type == f"vector({db_settings.embedding_dimensions})"
 
 
-def test_policy_chunk_embedding_provenance_is_not_optional(
+def test_정책_임베딩_출처는_생략할_수_없다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """출처 없는 벡터는 DB 가 받지 않는다 — 같은 차원의 다른 모델을 가릴 유일한 근거다."""
@@ -222,7 +220,7 @@ def test_policy_chunk_embedding_provenance_is_not_optional(
         )
 
 
-def test_policy_chunks_have_no_approximate_vector_index(
+def test_정책_청크는_근사_벡터_인덱스가_없다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """근사(HNSW) 인덱스는 **없어야 한다** — 있으면 검색이 조용히 짧아진다.
@@ -245,7 +243,7 @@ def test_policy_chunks_have_no_approximate_vector_index(
 
 
 @pytest.mark.parametrize("top_k", [2, 5])
-def test_policy_search_returns_exactly_top_k_rows(
+def test_정책_검색은_정확히_top_k행을_반환한다(
     app_conn: psycopg.Connection[DictRow], top_k: int
 ) -> None:
     """26행 코퍼스에서 `LIMIT k` 는 항상 k 행을 돌려줘야 한다.
@@ -272,7 +270,7 @@ def test_policy_search_returns_exactly_top_k_rows(
     assert len(hits) == top_k
 
 
-def test_policy_chunk_evidence_id_follows_the_contract(
+def test_정책_청크_근거ID는_계약을_따른다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """`contracts.policy_evidence_id()` 형식을 DB 가 강제한다."""
@@ -364,7 +362,7 @@ def _insert_attempt(
     )
 
 
-def test_retrieval_columns_default_to_no_fallback_and_zero_cost(
+def test_검색_컬럼_기본값은_폴백없음과_비용0이다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """검색 계열 컬럼은 **살아 있는 볼륨에 붙는다** — 기존 행이 기본값을 받아야 한다.
@@ -388,7 +386,7 @@ def test_retrieval_columns_default_to_no_fallback_and_zero_cost(
     assert row["retrieval_fallback_reason"] is None
 
 
-def test_retrieval_token_columns_reject_negative_values(
+def test_검색_토큰_컬럼은_음수를_거부한다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """판정·생성 계열과 같은 자격의 CHECK 다 — 조건부로 붙여도 실제로 걸려 있어야 한다."""
@@ -400,7 +398,7 @@ def test_retrieval_token_columns_reject_negative_values(
         )
 
 
-def test_processing_record_round_trip(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_처리_기록은_왕복_보존된다(app_conn: psycopg.Connection[DictRow]) -> None:
     """문의 1건 + 시도 2건 + 근거 스냅샷 2건 + SQL 실패 1건이 그대로 저장·복원된다."""
     inquiry_id = _insert_inquiry(app_conn)
 
@@ -495,7 +493,7 @@ def test_processing_record_round_trip(app_conn: psycopg.Connection[DictRow]) -> 
     assert "DELETE" in failures[0]["error"]
 
 
-def test_deleting_an_inquiry_cascades_to_its_record(
+def test_문의_삭제는_처리_기록도_지운다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     inquiry_id = _insert_inquiry(app_conn)
@@ -516,7 +514,7 @@ def test_deleting_an_inquiry_cascades_to_its_record(
 
 
 @pytest.mark.parametrize("reason", [reason.value for reason in EscalationReason])
-def test_every_escalation_reason_from_contracts_is_storable(
+def test_모든_계약상_인계_사유를_저장할_수_있다(
     app_conn: psycopg.Connection[DictRow], reason: str
 ) -> None:
     inquiry_id = _insert_inquiry(
@@ -532,7 +530,7 @@ def test_every_escalation_reason_from_contracts_is_storable(
 
 
 @pytest.mark.parametrize("intent", [intent.value for intent in IntentSource])
-def test_every_intent_source_from_contracts_is_storable(
+def test_모든_계약상_의도_소스를_저장할_수_있다(
     app_conn: psycopg.Connection[DictRow], intent: str
 ) -> None:
     inquiry_id = _insert_inquiry(app_conn, intent_source=intent)
@@ -543,7 +541,7 @@ def test_every_intent_source_from_contracts_is_storable(
 
 
 @pytest.mark.parametrize("reason", [reason.value for reason in RejectReason])
-def test_every_reject_reason_from_contracts_is_storable(
+def test_모든_계약상_기각_사유를_저장할_수_있다(
     app_conn: psycopg.Connection[DictRow], reason: str
 ) -> None:
     inquiry_id = _insert_inquiry(app_conn)
@@ -567,7 +565,7 @@ def test_every_reject_reason_from_contracts_is_storable(
         ("intent_source", "everything"),
     ],
 )
-def test_unknown_enum_values_are_rejected(
+def test_알수없는_열거값은_거부한다(
     app_conn: psycopg.Connection[DictRow], column: str, value: str
 ) -> None:
     kwargs: dict[str, Any] = {}
@@ -585,7 +583,7 @@ def test_unknown_enum_values_are_rejected(
         _insert_inquiry(app_conn, **kwargs)
 
 
-def test_unknown_reject_reason_is_rejected(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_알수없는_기각_사유는_거부한다(app_conn: psycopg.Connection[DictRow]) -> None:
     inquiry_id = _insert_inquiry(app_conn)
     with pytest.raises(psycopg.errors.CheckViolation):
         app_conn.execute(
@@ -595,7 +593,7 @@ def test_unknown_reject_reason_is_rejected(app_conn: psycopg.Connection[DictRow]
         )
 
 
-def test_layered_attempt_round_trip(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_층별_판정_시도는_왕복_보존된다(app_conn: psycopg.Connection[DictRow]) -> None:
     """L1 pass + L2 reject 를 층별 컬럼과 함께 저장하면 종합 사유는 두 층의 병합이다."""
     inquiry_id = _insert_inquiry(app_conn)
     _insert_attempt(
@@ -619,7 +617,7 @@ def test_layered_attempt_round_trip(app_conn: psycopg.Connection[DictRow]) -> No
     assert row["claim_verdicts"] == [{"claim_index": 0, "verdict": "unsupported"}]
 
 
-def test_attempt_without_layer_columns_leaves_them_null(
+def test_층별_판정이_없으면_NULL로_남는다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """층별 컬럼을 모르는 적재 코드의 INSERT 는 그대로 통과하고 전부 NULL 로 남는다."""
@@ -723,7 +721,7 @@ def test_attempt_without_layer_columns_leaves_them_null(
         ),
     ],
 )
-def test_contradictory_layer_states_are_rejected(
+def test_모순되는_층별_상태는_거부한다(
     app_conn: psycopg.Connection[DictRow], attempt_kwargs: dict[str, Any]
 ) -> None:
     """층별 판정의 모순 상태는 DB CHECK 가 막는다 (NULL 스코프 포함)."""
@@ -762,7 +760,7 @@ def test_contradictory_layer_states_are_rejected(
         ),
     ],
 )
-def test_layer_pass_with_reasons_is_rejected_by_its_own_constraint(
+def test_통과에_기각_사유가_있으면_층별_제약이_거부한다(
     app_conn: psycopg.Connection[DictRow],
     attempt_kwargs: dict[str, Any],
     constraint: str,
@@ -774,7 +772,7 @@ def test_layer_pass_with_reasons_is_rejected_by_its_own_constraint(
     assert excinfo.value.diag.constraint_name == constraint
 
 
-def test_attempt_count_is_capped_at_two(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_시도_횟수는_2회로_제한된다(app_conn: psycopg.Connection[DictRow]) -> None:
     """시도 기록은 최대 2건 (초안 + 재생성 1회) — DB 도 상한을 강제한다."""
     inquiry_id = _insert_inquiry(app_conn)
     with pytest.raises(psycopg.errors.CheckViolation):
@@ -785,17 +783,17 @@ def test_attempt_count_is_capped_at_two(app_conn: psycopg.Connection[DictRow]) -
         )
 
 
-def test_escalated_inquiry_must_carry_a_reason(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_인계된_문의는_사유가_필수다(app_conn: psycopg.Connection[DictRow]) -> None:
     with pytest.raises(psycopg.errors.CheckViolation):
         _insert_inquiry(app_conn, status=InquiryStatus.ESCALATED.value, answer=None)
 
 
-def test_answered_inquiry_must_carry_an_answer(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_답변된_문의는_답변이_필수다(app_conn: psycopg.Connection[DictRow]) -> None:
     with pytest.raises(psycopg.errors.CheckViolation):
         _insert_inquiry(app_conn, status=InquiryStatus.ANSWERED.value, answer=None)
 
 
-def test_sql_evidence_without_a_snapshot_is_rejected(
+def test_스냅샷_없는_SQL_근거는_거부한다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """근거로 채택된 SQL 은 쿼리문과 결과 행이 반드시 함께 남아야 한다."""
@@ -809,7 +807,7 @@ def test_sql_evidence_without_a_snapshot_is_rejected(
         )
 
 
-def test_inquiry_accepts_an_order_no_that_does_not_exist(
+def test_문의는_존재하지_않는_주문번호도_받는다(
     app_conn: psycopg.Connection[DictRow],
 ) -> None:
     """`order_not_found` 인계 경로가 처리 기록에 남아야 하므로 FK 를 두지 않는다."""
