@@ -392,6 +392,9 @@ with connect() as conn, conn.cursor() as cur:
 
 ## 스키마를 바꿨으면 볼륨째 지워야 한다 — **컬럼 추가만 예외다**
 
+**아래는 초기 사이클의 적용 방식이다.** 2026-10-13 확인·잠금·상태 제약 변경은 비파괴
+멱등 DDL로 적용한다. 아래 볼륨 삭제 명령을 이번 변경의 필수 단계로 실행하지 않는다.
+
 `db/schema.sql` 은 전부 `CREATE TABLE IF NOT EXISTS` 라 **기존 테이블의 컬럼은 바뀌지 않는다.**
 마이그레이션 도구는 이 사이클 범위 밖이므로, 스키마 변경 후에는
 `docker compose down -v && docker compose up -d --wait` 로 볼륨째 재생성한다.

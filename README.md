@@ -59,8 +59,8 @@
 
 기술 스택: Python 3.13 · FastAPI · **RAG**(정책 문서 조항 단위 청킹 + Postgres 17 + pgvector 코사인 + 질의 재작성) · **text-to-SQL**(read-only 계정 · sqlglot AST 검증) · OpenAI(생성 `gpt-5.6-terra`, 임베딩 `text-embedding-3-small`) · **Anthropic(L2 판정 `claude-sonnet-5`)** · 에이전트 루프 **자체 구현**(LangGraph 미사용 — [이유](#langgraph-로-짰다면)).
 
-판정 계열을 생성과 **다른 provider** 로 둔 것은 비용도 가용성도 아니다 — 같은 계열로 판정하면
-self-judging bias 로 검출률이 오염되기 때문이다.
+판정 계열을 생성과 **다른 provider**로 둔 것은 같은 생성기를 판정자로 쓸 때의 편향을
+줄이려는 설계 선택이다. 편향 제거를 따로 측정하거나 보장한 것은 아니다.
 
 ---
 
