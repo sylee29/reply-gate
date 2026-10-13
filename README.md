@@ -444,7 +444,7 @@ data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다. 둘 다 �
 |---|---|
 | **1층 — read-only 계정** | `db/init/01_roles.sh` 가 만든 NOLOGIN 그룹에 `orders` **SELECT 만** 부여. 프롬프트가 아니라 DB 권한이다 |
 | **2층 — 스키마 화이트리스트** | 읽을 수 있는 테이블·컬럼을 코드가 들고 있다 |
-| **3층 — 쿼리 검증** | sqlglot AST 로 거부 규칙 **18종**. 주문 1건 한정 · `LIMIT`·타임아웃 강제 |
+| **3층 — 쿼리 검증** | sqlglot AST 로 거부 규칙 **19종**. 주문 1건 한정 · `LIMIT`·타임아웃 강제 |
 
 3층의 전문 — 계정 분리 DDL, 화이트리스트의 소유 위치, 거부 규칙 전체와 **실제로 뚫렸던 경로
 3건** — 은 [보안 정책](docs/security.md#text-to-sql-안전장치--3층)이 정본이다.
@@ -758,7 +758,7 @@ uv run uvicorn reply_gate.api:app --reload   # http://127.0.0.1:8000
 | [`src/reply_gate/gate.py`](src/reply_gate/gate.py) | **L1 게이트** — 사유 4종 + PII allowlist. LLM 을 import 하지 않는다 |
 | [`src/reply_gate/judge.py`](src/reply_gate/judge.py) | **L2 판정** — claim 단위 뒷받침 + 근거쌍 모순, 시도당 1회 배치. 판정 산출 검증은 fail-closed. `gate.py` 를 부르지 않는다 |
 | [`src/reply_gate/evidence.py`](src/reply_gate/evidence.py) | 근거 수집 — 의도 해석 · 벡터 검색 · **근거 채택(기권 게이트 → 절대 하한)** · 존재성 선검사 · text-to-SQL 조율 |
-| [`src/reply_gate/sql_guard.py`](src/reply_gate/sql_guard.py) | 안전장치 2·3 — sqlglot AST 검증, 거부 규칙 **18종**, 캐스트 대상 타입 허용 목록 |
+| [`src/reply_gate/sql_guard.py`](src/reply_gate/sql_guard.py) | 안전장치 2·3 — sqlglot AST 검증, 거부 규칙 **19종**, 캐스트 대상 타입 허용 목록 |
 | [`src/reply_gate/draft.py`](src/reply_gate/draft.py) | 초안 생성 — 근거만 컨텍스트, 기각 사유를 피드백으로 재생성 |
 | [`src/reply_gate/contracts.py`](src/reply_gate/contracts.py) | 사이클 간 계약 — 답변 계약 JSON, 근거 ID 체계, 판정·상태 enum |
 | [`src/reply_gate/api.py`](src/reply_gate/api.py) | FastAPI 엔드포인트 5개 + 응답 스키마 |

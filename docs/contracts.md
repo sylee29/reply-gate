@@ -41,6 +41,9 @@ HTTP 엔드포인트 5개가 외부 표면의 전부다. 계정 인증은 없고
 | `order_no` | — | 주면 `ORD-YYYYMMDD-NNNN` 형식이어야 하고 날짜가 실재해야 한다. 빈 문자열·공백은 **미입력으로 취급**(HTML 폼이 빈 필드를 항상 보내기 때문) |
 | `phone_last4` | — | ASCII 숫자 정확히 4자리. 빈 문자열·공백만은 미입력, 그 밖의 오형식은 422. 입력값은 응답에 포함하지 않는다 |
 
+위 요청은 뒷자리를 생략했으므로 주문이 있으면 `awaiting_confirmation`을 반환한다.
+아래는 별도로 문의자 확인을 통과해 처리를 진행한 경우의 응답 구조 예시다.
+
 **응답 200** — 아래는 **L1 기각 → 재생성 → L2 기각**으로 인계된 장면이다(`answered` 면
 `answer`/`claims` 가 채워지고 `escalation_reason` 이 `null` 이다).
 
@@ -50,7 +53,7 @@ HTTP 엔드포인트 5개가 외부 표면의 전부다. 계정 인증은 없고
   "status": "escalated",
   "answer": null,
   "claims": [],
-  "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "조항 텍스트 또는 쿼리+결과 요약" },
+  "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "공개 가림을 거친 조항 텍스트" },
                  { "id": "policy:shipping:1-3", "source": "policy", "content": "조항 텍스트" },
                  { "id": "policy:shipping:1-4", "source": "policy", "content": "조항 텍스트" } ],
   "attempts": [

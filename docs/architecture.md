@@ -4,8 +4,8 @@
 
 단일 FastAPI 프로세스가 문의 1건을 **동기로** 끝까지 처리하고, 로컬 Docker Postgres 하나가
 주문 데이터·정책 벡터·처리 기록을 모두 담는다. 외부 의존은 **LLM provider 두 곳**이다 —
-OpenAI(생성·임베딩 공통)와 Anthropic(L2 판정 전용). 계열을 가른 것은 편의가 아니라
-self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
+OpenAI(생성·임베딩 공통)와 Anthropic(L2 판정 전용). 계열을 가른 것은 같은 생성기의 자기 판정 편향을 줄이려는 선택이다.
+독립적 진실성 보증은 아니다(`tracking/decisions/0004`).
 
 ```
 웹 폼 / HTTP 클라이언트
@@ -31,7 +31,9 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 **DB 커넥션은 위에서 아래로 인자로 전달된다.** `evidence.py`·`policy_index.py`·`records.py` 는
 `db.py` 를 부르지 않고 이미 열린 커넥션을 받는다 — 그래서 테스트가 롤백 커넥션을 끼워 넣을 수
 있고, text-to-SQL 이 실수로 앱 계정 커넥션을 집을 수 없다. 커넥션을 여는 곳은 `api.py` 와
-실행 스크립트뿐이다.
+실행 스크립트다. 예외로 pipeline의 뒷자리 실패 횟수 갱신과 상품 확인 선점은 별도의 짧은
+앱 연결을 열어 먼저 commit한다. 이후 모델 오류가 잠금 기록이나 선점을 되돌리지 않게 하기 위해서다.
+호출자가 넘긴 근거 수집용 앱 연결을 임의로 commit하지 않는다.
 
 `gate.py` 는 `contracts.py` 만 부르는 잎 노드이고, `contracts.py`·`llm.py`·`order_ref.py` 는
 이 패키지의 어떤 모듈도 부르지 않는다. `config.py` 가 `retrieval_strategies.py` 를 부르는 것은
