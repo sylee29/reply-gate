@@ -134,7 +134,7 @@ uv run uvicorn reply_gate.api:app --reload
 
 ```bash
 uv run ruff check .            # 0
-uv run ruff format --check .   # 198 files
+uv run ruff format --check .   # 201 files
 uv run mypy                    # strict — 99 files, 0 errors
 uv run pytest                  # DB 를 띄운 실행에서만 건수 대조가 선다
 uv run pytest -m db            # 287 passed, 2,166 deselected · skip 0 이어야 한다
@@ -147,7 +147,7 @@ uv run pytest -m db            # 287 passed, 2,166 deselected · skip 0 이어�
 링크 쪽은 따로도 돌릴 수 있다:
 
 ```bash
-uv run python -m scripts.check_links        # 문서 53개 · 링크 471개 · 깨짐 0건
+uv run python -m scripts.check_links        # 문서 53개 · 링크 448개 · 깨짐 0건
 ```
 
 **건수 대조는 전체 스위트에서만 성립한다.** 경로·`-k`·`-m` 을 주면 그 세션이 스위트가 아니므로
