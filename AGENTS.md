@@ -21,7 +21,7 @@
 │   ├── standards.md               → 검증 게이트, 소유권, 하드 게이트, 재시도 상한
 │   ├── engineering-notes.md       → 실제로 뚫렸던 경로와 걸렸던 함정
 │   ├── operations.md              → 설치부터 실행·검증·지표 산출까지의 순서
-│   ├── contracts.md               → HTTP 표면 4개와 답변 계약
+│   ├── contracts.md               → HTTP 표면 5개와 답변 계약
 │   ├── demo.md                    → README 데모 절의 나머지 네 장면
 │   ├── gates.md                   → README L1·L2 절의 세부. 판정 규칙 정본은 business-rules.md
 │   ├── retrieval.md               → README 검색 절의 사다리 이후. 실측 정본은 tracking/status.md

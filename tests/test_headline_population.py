@@ -18,7 +18,7 @@ import pytest
 from scripts.recount_headline import RULES_DOC, RULES_HEADING, main, parse_rules, recount
 
 #: 문서가 고정한 모집단 크기. 규칙이 조용히 넓어지면 여기서 먼저 걸린다.
-_모집단_크기 = {"미끼 기각 재현": 19, "G06 계보": 19, "G30 계보": 7}
+_모집단_크기 = {"미끼 기각 재현": 22, "G06 계보": 22, "G30 계보": 10}
 
 
 def _문서_사본(tmp_path: Path, *, 치환: tuple[str, str] | None = None) -> Path:
@@ -55,11 +55,11 @@ def test_규칙_표가_비어_있지_않고_모집단_크기가_고정돼_있다
     assert {항목.rule.name for 항목 in 항목들} == set(_모집단_크기)
     assert {항목.rule.name: len(항목.stems) for 항목 in 항목들} == _모집단_크기
     # 분모가 회차 수와 같은 규칙과 케이스-실행 수인 규칙이 함께 있다는 것이 이 표의 요점이다.
-    assert {항목.rule.documented[1] for 항목 in 항목들} == {95, 19, 7}
+    assert {항목.rule.documented[1] for 항목 in 항목들} == {110, 22, 10}
 
 
 def test_측정_2_를_돌리지_않은_회차는_모집단에_들지_않는다() -> None:
-    """`measurement_scope` 로는 안 갈린다 — `full` 은 10회뿐이고 아홉은 그 필드 이전이다."""
+    """`measurement_scope` 로는 안 갈린다 — `full` 은 13회뿐이고 아홉은 그 필드 이전이다."""
     미끼 = next(항목 for 항목 in recount() if 항목.rule.name == "미끼 기각 재현")
 
     assert "evaluation-live-l2-13" not in 미끼.stems, "측정 2 를 제외한 회차가 분모에 들었다"
@@ -71,17 +71,17 @@ def test_측정_2_를_돌리지_않은_회차는_모집단에_들지_않는다()
 
 def test_문서의_재집계_칸을_바꾸면_어긋남으로_잡힌다(tmp_path: Path) -> None:
     """**문서가 정본이라는 주장의 내용이다** — 문서를 고치면 판정이 따라 움직인다."""
-    사본 = _문서_사본(tmp_path, 치환=("| **12/95** |", "| **11/95** |"))
+    사본 = _문서_사본(tmp_path, 치환=("| **14/110** |", "| **13/110** |"))
 
     항목들 = recount(doc=사본)
     미끼 = next(항목 for 항목 in 항목들 if 항목.rule.name == "미끼 기각 재현")
 
     assert not 미끼.matches
-    assert (미끼.numerator, 미끼.denominator) == (12, 95), "재집계는 리포트에서 나온다"
+    assert (미끼.numerator, 미끼.denominator) == (14, 110), "재집계는 리포트에서 나온다"
 
 
 def test_술어를_지우면_모집단이_넓어지고_판정이_갈린다(tmp_path: Path) -> None:
-    """`G30` 계보의 판별자는 기권 게이트 배선 하나다 — 빼면 7회가 19회로 넓어진다."""
+    """`G30` 계보의 판별자는 기권 게이트 배선 하나다 — 빼면 10회가 22회로 넓어진다."""
     사본 = _문서_사본(
         tmp_path,
         치환=(
@@ -93,7 +93,7 @@ def test_술어를_지우면_모집단이_넓어지고_판정이_갈린다(tmp_p
 
     g30 = next(항목 for 항목 in recount(doc=사본) if 항목.rule.name == "G30 계보")
 
-    assert len(g30.stems) == 19
+    assert len(g30.stems) == 22
     assert not g30.matches
 
 
@@ -124,7 +124,7 @@ def test_진입점은_전부_일치하면_0_어긋나면_1_이다(
     assert main([]) == 0
     assert "일치" in capsys.readouterr().out
 
-    사본 = _문서_사본(tmp_path, 치환=("| **4/7** |", "| **7/7** |"))
+    사본 = _문서_사본(tmp_path, 치환=("| **5/10** |", "| **10/10** |"))
 
     assert main([], doc=사본) == 1
     assert "어긋남" in capsys.readouterr().out

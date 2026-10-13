@@ -41,8 +41,8 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 `pipeline.py` 뿐이다.
 
 **반대 방향은 있다 — 그리고 그것이 "개인정보 정의는 게이트가 단독 소유한다"의 구조적 증거다.**
-`gate.py` 를 import 하는 모듈은 넷이고(`pipeline.py`·`evidence.py`·`sql_guard.py`·
-`evaluation.py`), 그중 `evidence.py`·`sql_guard.py` 는 **`pii_shaped` 하나만** 가져간다.
+`pipeline.py`·`evidence.py`·`sql_guard.py`·`evaluation.py`·`api.py`가 `gate.py`의
+판정·PII 탐지·공개 가림 함수를 재사용한다. 응답 가림도 같은 개인정보 정의를 쓴다.
 패턴 집합의 사본은 어디에도 없다.
 
 ## 구성요소 지도
@@ -51,7 +51,7 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 | 모듈 | 역할 | 의존 |
 |---|---|---|
-| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙, **앱 연결 개방·POST 처리에서 RO 연결 개방** | config, contracts, db, llm, pipeline, policy_index, records |
+| `api.py` | HTTP 표면 5개, 응답 스키마 조립, 웹 폼 서빙, **앱 연결 개방·POST 처리에서 RO 연결 개방** | config, contracts, db, llm, pipeline, policy_index, records |
 | `pipeline.py` | 접수 검증 → 근거 수집 → 초안 → L1 → L2 → 종결. **재생성 상한과 층 결합을 강제하는 곳** | config, contracts, draft, evidence, gate, judge, llm, order_ref, retrieval_strategies |
 | `evidence.py` | 의도 분류(LLM) · 질의 재작성 조율 · 정책 검색 · **근거 채택(기권 게이트 → 절대 하한)** · 주문 존재성 선검사 · text-to-SQL 조율 | config, contracts, gate, llm, order_ref, policy_index, query_rewrite, retrieval_strategies, sql_guard |
 | `sql_guard.py` | 생성된 SQL 을 실행 전에 파싱·검증. 화이트리스트·주문 범위·함수·잠금절·**형변환 대상 타입 허용 목록**·**PII allowlist 출력 유래 판정**(패턴 집합은 `gate.pii_shaped` 를 부르기만 한다) | gate, order_ref |
@@ -72,7 +72,7 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 | `regression_guard.py` | 회귀 판정 — 이중 기준선 대조(승격=구속 / 직전 라이브=경보), 조건 지문, 비악화 두 겹 | (없음 — 입력은 리포트 JSON 그대로다) |
 | `evaluation.py` | 측정 1(픽스처)·측정 2(골든셋)·측정 3(판정 픽스처) 산출, 리포트 생성 | contracts, gate, judge, llm, pipeline, policy_index, query_rewrite, regression_guard, retrieval_labels, retrieval_strategies, sql_guard |
 | `testing.py` | 결정론 대역 — 어휘 임베딩·판정(`StubJudge`)·대역 파이프라인 조립기 | config, contracts, draft, evidence, judge, llm, pipeline |
-| `config.py` | 환경 변수 설정, DSN 조립, **채택 축 구성(컷·`top_k`·기권 게이트)** 소유 | retrieval_strategies |
+| `config.py` | 환경 변수 설정, 비밀 타입과 연결 인자 구성, **채택 축 구성(컷·`top_k`·기권 게이트)** 소유 | retrieval_strategies |
 
 `records.py` 가 `pipeline`·`evidence` 를 부르는 것은 **자료형 때문**이다 — 저장 대상인
 `ProcessedInquiry`·근거 스냅샷의 정의가 거기 있다. 반대 방향(파이프라인이 저장을 부르는 것)은
@@ -190,3 +190,12 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 두 provider 를 가른 이유는 비용도 가용성도 아니다: **생성과 같은 계열로 판정하면
 self-judging bias 로 검출률이 오염된다**(`tracking/decisions/0004`·`0007`).
+
+## 저장 기록과 평가 산출의 경계
+
+처리 기록은 문의별 원본 근거·SQL·초안·층별 판정의 감사 자료다. 평가 리포트 전체의 원천은
+아니다. 고정 L1/L2 픽스처·허용 라벨·검색 정답·조건 지문·구간별 지연·캐시 토큰은 별도의
+평가 입력과 실행 중 자료에서 나온다. API는 SQL 결과 행에서 공개 citations를 다시 렌더하고
+실행 SQL을 제외한다. DB 원본은 보존한다. 원문/재작성 검색은 출처 검사부터 반환까지 같은
+statement snapshot에서 수행한다. 평가만 orders/policy_chunks SHARE 잠금과 유한 lock_timeout으로
+조건을 고정하고 finally 해제한다. 정상 문의 처리 중 모델 호출에 이 평가 잠금을 걸지 않는다.
