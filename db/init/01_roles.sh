@@ -17,14 +17,53 @@ set -euo pipefail
 : "${POSTGRES_RO_USER:?POSTGRES_RO_USER 가 필요하다}"
 : "${POSTGRES_RO_PASSWORD:?POSTGRES_RO_PASSWORD 가 필요하다 (.env 에 채운다)}"
 
-psql -v ON_ERROR_STOP=1 \
+if [[ "$POSTGRES_APP_USER" == "$POSTGRES_RO_USER" ||
+      "$POSTGRES_APP_USER" == "$POSTGRES_USER" ||
+      "$POSTGRES_RO_USER" == "$POSTGRES_USER" ||
+      "$POSTGRES_APP_USER" == "reply_gate_readers" ||
+      "$POSTGRES_RO_USER" == "reply_gate_readers" ]]; then
+    printf '%s\n' 'DB 초기화 거부: 앱·읽기전용·관리자·권한 그룹의 이름이 충돌한다' >&2
+    exit 1
+fi
+# PostgreSQL 이 이름을 63바이트에서 자르면 서로 다른 설정도 같은 계정이 된다.
+for role in "$POSTGRES_APP_USER" "$POSTGRES_RO_USER"; do
+    if (( $(LC_ALL=C printf '%s' "$role" | wc -c) > 63 )); then
+        printf '%s\n' 'DB 초기화 거부: 계정 이름은 63바이트 이하여야 한다' >&2
+        exit 1
+    fi
+done
+
+# 비밀번호는 argv 나 SQL 원문에 확장하지 않는다. psql 내부에서 환경을 읽는다.
+# 오류 SQL 을 psql 또는 서버 로그가 되찍어 자격 증명을 남기지 않게 두 출력을 모두 닫는다.
+if ! psql -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=terse \
      --username "$POSTGRES_USER" \
-     --dbname "$POSTGRES_DB" \
-     --set=db_name="$POSTGRES_DB" \
-     --set=app_user="$POSTGRES_APP_USER" \
-     --set=app_password="$POSTGRES_APP_PASSWORD" \
-     --set=ro_user="$POSTGRES_RO_USER" \
-     --set=ro_password="$POSTGRES_RO_PASSWORD" <<'SQL'
+     --dbname "$POSTGRES_DB" >/dev/null 2>/dev/null <<'SQL'
+SET log_statement = 'none';
+SET log_min_error_statement = 'panic';
+-- 관리자 역할에 상속된 비기본 진단도 이 연결에서만 끈다. 문장 duration/sample 은
+-- log_statement 와 별개로 SQL 전체를 기록하며, debug 출력에는 파싱된 비밀도 들어간다.
+SET log_duration = off;
+SET log_min_duration_statement = -1;
+SET log_min_duration_sample = -1;
+SET log_statement_sample_rate = 0;
+SET log_transaction_sample_rate = 0;
+SET log_parameter_max_length = 0;
+SET log_parameter_max_length_on_error = 0;
+SET log_error_verbosity = 'terse';
+SET debug_print_parse = off;
+SET debug_print_rewritten = off;
+SET debug_print_plan = off;
+SET log_statement_stats = off;
+SET log_parser_stats = off;
+SET log_planner_stats = off;
+SET log_executor_stats = off;
+\set ECHO none
+\set ECHO_HIDDEN off
+\getenv db_name POSTGRES_DB
+\getenv app_user POSTGRES_APP_USER
+\getenv app_password POSTGRES_APP_PASSWORD
+\getenv ro_user POSTGRES_RO_USER
+\getenv ro_password POSTGRES_RO_PASSWORD
 
 -- read-only 그룹 (로그인 불가, 비밀 아님 → 이름 고정).
 SELECT 'CREATE ROLE reply_gate_readers NOLOGIN'
@@ -58,3 +97,7 @@ SELECT format('GRANT USAGE, CREATE ON SCHEMA public TO %I', :'app_user')
 \gexec
 
 SQL
+then
+    printf '%s\n' 'DB 계정 초기화 실패: 환경 설정과 계정 권한을 확인한다 (비밀 포함 진단 생략)' >&2
+    exit 1
+fi

@@ -14,17 +14,20 @@ import pytest
 from psycopg.rows import DictRow
 from scripts.seed_orders import ORDER_COUNT
 
+from reply_gate.config import Settings
+from reply_gate.db import readonly_connect
+
 pytestmark = pytest.mark.db
 
 
-def test_readonly_account_can_select_orders(ro_conn: psycopg.Connection[DictRow]) -> None:
+def test_읽기전용_계정이_주문을_조회한다(ro_conn: psycopg.Connection[DictRow]) -> None:
     """양성 대조 — 이게 실패하면 아래 거부 테스트들이 공허해진다."""
     row = ro_conn.execute("SELECT count(*) AS total FROM orders").fetchone()
     assert row is not None
     assert row["total"] == ORDER_COUNT
 
 
-def test_readonly_account_is_a_different_user_than_the_app(
+def test_읽기전용_계정과_앱_계정은_다르다(
     ro_conn: psycopg.Connection[DictRow], app_conn: psycopg.Connection[DictRow]
 ) -> None:
     ro_user = ro_conn.execute("SELECT current_user AS u").fetchone()
@@ -47,7 +50,9 @@ def test_readonly_account_is_a_different_user_than_the_app(
     ],
     ids=["INSERT", "UPDATE", "DELETE", "TRUNCATE"],
 )
-def test_readonly_account_cannot_write(ro_conn: psycopg.Connection[DictRow], sql: str) -> None:
+def test_읽기전용_계정은_주문을_변경하지_못한다(
+    ro_conn: psycopg.Connection[DictRow], sql: str
+) -> None:
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         ro_conn.execute(sql)
 
@@ -63,7 +68,9 @@ def test_readonly_account_cannot_write(ro_conn: psycopg.Connection[DictRow], sql
     ],
     ids=["CREATE TABLE", "CREATE TEMP TABLE", "DROP TABLE", "ALTER TABLE", "CREATE INDEX"],
 )
-def test_readonly_account_cannot_run_ddl(ro_conn: psycopg.Connection[DictRow], sql: str) -> None:
+def test_읽기전용_계정은_DDL을_실행하지_못한다(
+    ro_conn: psycopg.Connection[DictRow], sql: str
+) -> None:
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         ro_conn.execute(sql)
 
@@ -71,7 +78,7 @@ def test_readonly_account_cannot_run_ddl(ro_conn: psycopg.Connection[DictRow], s
 @pytest.mark.parametrize(
     "table", ["inquiries", "inquiry_attempts", "inquiry_evidence", "inquiry_sql_failures"]
 )
-def test_readonly_account_cannot_read_processing_records(
+def test_읽기전용_계정은_문의_처리_기록을_읽지_못한다(
     ro_conn: psycopg.Connection[DictRow], table: str
 ) -> None:
     """방어층 하나 더 — SQL 실행 계정에는 주문 외 테이블 권한 자체를 주지 않는다.
@@ -83,14 +90,14 @@ def test_readonly_account_cannot_read_processing_records(
         ro_conn.execute(f"SELECT * FROM {table}")
 
 
-def test_readonly_account_cannot_read_policy_chunks(
+def test_읽기전용_계정은_정책_청크를_읽지_못한다(
     ro_conn: psycopg.Connection[DictRow],
 ) -> None:
     with pytest.raises(psycopg.errors.InsufficientPrivilege):
         ro_conn.execute("SELECT * FROM policy_chunks")
 
 
-def test_readonly_account_has_no_table_privileges_beyond_select_on_orders(
+def test_읽기전용_계정의_테이블_권한은_주문_SELECT뿐이다(
     ro_conn: psycopg.Connection[DictRow], app_conn: psycopg.Connection[DictRow]
 ) -> None:
     """권한 목록을 직접 뒤져서 SELECT 외의 권한이 하나도 없는지 확인한다."""
@@ -104,3 +111,19 @@ def test_readonly_account_has_no_table_privileges_beyond_select_on_orders(
         (row["u"],),
     ).fetchall()
     assert {(g["table_name"], g["privilege_type"]) for g in grants} == {("orders", "SELECT")}
+
+
+def test_읽기전용_연결은_일반_문자열_해석을_고정한다(
+    db_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """libpq 환경이 off 를 요구해도 검증 SQL 과 실행 SQL 의 리터럴 의미는 같다."""
+    monkeypatch.setenv("PGOPTIONS", "-c standard_conforming_strings=off")
+    with readonly_connect(settings=db_settings, autocommit=False) as conn:
+        for reset in (False, True):
+            if reset:
+                conn.rollback()
+                conn.execute("RESET ALL")
+            row = conn.execute("SHOW standard_conforming_strings").fetchone()
+            literal = conn.execute(r"SELECT 'a\b' AS literal").fetchone()
+            assert row == {"standard_conforming_strings": "on"}
+            assert literal == {"literal": r"a\b"}
