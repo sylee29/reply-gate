@@ -76,8 +76,10 @@ def connect(
             options=" ".join(options) or None,
         )
     except psycopg.Error as exc:
-        # 드라이버 문면에는 conninfo 가 들어갈 수 있다. 타입은 보존하고 내용·연결은 감춘다.
-        raise type(exc)(f"Postgres 연결 실패 ({type(exc).__name__})") from None
+        # except 안에서 다시 던지면 from None 도 원본을 __context__ 에 남긴다.
+        # 오류 타입만 보존하고 원래 예외 문맥이 끝난 뒤 새 오류를 만든다.
+        error_type = type(exc)
+    raise error_type(f"Postgres 연결 실패 ({error_type.__name__})")
 
 
 def readonly_connect(

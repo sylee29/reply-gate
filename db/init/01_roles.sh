@@ -40,6 +40,23 @@ if ! psql -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=terse \
      --dbname "$POSTGRES_DB" >/dev/null 2>/dev/null <<'SQL'
 SET log_statement = 'none';
 SET log_min_error_statement = 'panic';
+-- 관리자 역할에 상속된 비기본 진단도 이 연결에서만 끈다. 문장 duration/sample 은
+-- log_statement 와 별개로 SQL 전체를 기록하며, debug 출력에는 파싱된 비밀도 들어간다.
+SET log_duration = off;
+SET log_min_duration_statement = -1;
+SET log_min_duration_sample = -1;
+SET log_statement_sample_rate = 0;
+SET log_transaction_sample_rate = 0;
+SET log_parameter_max_length = 0;
+SET log_parameter_max_length_on_error = 0;
+SET log_error_verbosity = 'terse';
+SET debug_print_parse = off;
+SET debug_print_rewritten = off;
+SET debug_print_plan = off;
+SET log_statement_stats = off;
+SET log_parser_stats = off;
+SET log_planner_stats = off;
+SET log_executor_stats = off;
 \set ECHO none
 \set ECHO_HIDDEN off
 \getenv db_name POSTGRES_DB

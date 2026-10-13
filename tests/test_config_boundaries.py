@@ -98,21 +98,40 @@ def test_잘못된_호스트_오류와_트레이스백과_skip에_비밀번호�
     assert reason is not None and "[" in reason and "docker compose" in reason
 
 
-def test_드라이버가_비밀을_예외에_넣어도_연결_경계가_감춘다(
+@pytest.mark.parametrize("readonly", [False, True])
+def test_드라이버의_비밀_예외는_원인과_문맥_연결까지_제거한다(
     monkeypatch: pytest.MonkeyPatch,
+    readonly: bool,
 ) -> None:
-    """음성 대조 — 드라이버가 앞으로 진단 형식을 바꿔도 오류 연결에 평문이 남지 않는다."""
+    """from None 은 표시만 숨긴다. 원래 오류를 순회하는 보고 도구에도 비밀이 없어야 한다."""
     secret = secrets.token_urlsafe(24)
-    settings = declared_settings(postgres_app_password=secret)
+    settings = declared_settings(postgres_app_password=secret, postgres_ro_password=secret)
 
     def fail(*args: Any, **kwargs: Any) -> None:
-        raise psycopg.OperationalError(secret)
+        try:
+            raise ValueError(secret)
+        except ValueError as original:
+            raise psycopg.OperationalError(secret) from original
 
     monkeypatch.setattr(psycopg, "connect", fail)
     with pytest.raises(psycopg.OperationalError) as caught:
-        connect(settings=settings)
-    leaked = secret in "".join(traceback.format_exception(caught.value))
+        connect(settings=settings, readonly=readonly)
+    pending: list[BaseException] = [caught.value]
+    observed: set[int] = set()
+    leaked = False
+    while pending:
+        error = pending.pop()
+        if id(error) in observed:
+            continue
+        observed.add(id(error))
+        leaked |= secret in str(error) or secret in "".join(traceback.format_exception(error))
+        pending.extend(x for x in (error.__cause__, error.__context__) if x is not None)
+    reason = database_unavailable_reason(settings=settings, readonly=readonly)
+    skip_leaked = secret in (reason or "")
     assert not leaked
+    assert not skip_leaked
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
 
 
 @pytest.mark.parametrize("timeout", [0, -1])
