@@ -210,15 +210,15 @@ def test_SQL_프롬프트의_최초와_재시도_모두_실제_행수상한을_�
     from reply_gate import evidence
 
     original = evidence.build_sql_user_prompt
-    seen: list[int] = []
+    seen: list[tuple[int, str | None, str | None]] = []
 
     def build(**kwargs: Any) -> str:
-        seen.append(kwargs["max_rows"])
+        seen.append((kwargs["max_rows"], kwargs.get("previous_sql"), kwargs.get("previous_error")))
         return original(**kwargs)
 
     monkeypatch.setattr(evidence, "build_sql_user_prompt", build)
     evaluation.code_condition_fingerprint(sql_max_rows=1)
-    assert seen == [1, 1]
+    assert seen == [(1, None, None), (1, "", "화이트리스트 밖"), (1, "SELECT 1", "화이트리스트 밖")]
 
 
 @pytest.mark.parametrize("alias", ["symlink", "hardlink"])

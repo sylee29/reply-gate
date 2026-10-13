@@ -51,12 +51,15 @@ from reply_gate import llm, policy_index, retrieval_strategies, sql_guard
 from reply_gate import query_rewrite as rewrite_module
 from reply_gate.contracts import (
     Claim,
+    ClaimJudgment,
     Draft,
     EscalationReason,
     Evidence,
+    EvidenceContradiction,
     EvidenceSource,
     InquiryStatus,
     IntentSource,
+    JudgeResult,
     RejectReason,
     Verdict,
     is_policy_evidence_id,
@@ -2056,8 +2059,8 @@ def _judge_rule_version() -> str:
 def _generation_prompt_versions(*, sql_max_rows: int = 50) -> dict[str, str]:
     """실제 호출 모듈의 시스템 문면·사용자 템플릿·스키마에 묶인 판.
 
-    사용자 템플릿은 소스 전체를 포함해 재시도/재생성 분기도 빠뜨리지 않는다.
-    소스와 무관한 데이터 변경은 별도의 실제 입력 지문이 맡는다.
+    고정 입력으로 최초·재시도·재생성 문면을 실행한다. 주석·docstring·내부 이름은
+    조건이 아니며, 실제 데이터 변경은 별도의 실제 입력 지문이 맡는다.
     """
     inquiry = "배송 상태와 환불 규정을 알려 주세요."
     order_no = "ORD-20260101-0001"
@@ -2068,10 +2071,37 @@ def _generation_prompt_versions(*, sql_max_rows: int = 50) -> dict[str, str]:
             content="환불 기간은 7일입니다.",
             evidence_text="환불 기간은 7일입니다.",
         ),
+        Evidence(
+            id="policy:prompt:2",
+            source=EvidenceSource.POLICY,
+            content="환불 기간은 14일입니다.",
+            evidence_text="환불 기간은 14일입니다.",
+        ),
+        Evidence(
+            id="sql:prompt:1",
+            source=EvidenceSource.SQL,
+            content="status=배송중",
+            evidence_text="status=배송중",
+        ),
+    )
+    judge_result = JudgeResult(
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.UNSUPPORTED_CLAIM, RejectReason.CONTRADICTORY_EVIDENCE),
+        claim_judgments=(
+            ClaimJudgment(
+                "환불 기간은 30일입니다.", Verdict.REJECT, "인용 근거에 없는 기간입니다."
+            ),
+            ClaimJudgment("배송 중입니다.", Verdict.PASS, "주문 근거와 일치합니다."),
+        ),
+        contradictions=(
+            EvidenceContradiction(evidence[0].id, evidence[1].id, "환불 기간이 서로 다릅니다."),
+        ),
     )
     user_probes = {
         "intent": [
             evidence_module.build_intent_user_prompt(inquiry=inquiry),
+            evidence_module.build_intent_user_prompt(inquiry=inquiry, order_no=order_no),
+            evidence_module.build_intent_user_prompt(inquiry=inquiry, previous_error="형식 오류"),
             evidence_module.build_intent_user_prompt(
                 inquiry=inquiry,
                 order_no=order_no,
@@ -2087,6 +2117,13 @@ def _generation_prompt_versions(*, sql_max_rows: int = 50) -> dict[str, str]:
                 inquiry=inquiry,
                 order_no=order_no,
                 max_rows=sql_max_rows,
+                previous_sql="",
+                previous_error="화이트리스트 밖",
+            ),
+            evidence_module.build_sql_user_prompt(
+                inquiry=inquiry,
+                order_no=order_no,
+                max_rows=sql_max_rows,
                 previous_sql="SELECT 1",
                 previous_error="화이트리스트 밖",
             ),
@@ -2096,7 +2133,12 @@ def _generation_prompt_versions(*, sql_max_rows: int = 50) -> dict[str, str]:
             draft_module.build_draft_user_prompt(
                 inquiry=inquiry, evidence=evidence, reject_reasons=tuple(RejectReason)
             ),
-            inspect.getsource(draft_module._format_judge_detail),
+            draft_module.build_draft_user_prompt(
+                inquiry=inquiry,
+                evidence=evidence,
+                reject_reasons=judge_result.reject_reasons,
+                judge_result=judge_result,
+            ),
         ],
         "rewrite": [rewrite_module.build_rewrite_user_prompt(inquiry=inquiry)],
     }
@@ -2104,38 +2146,34 @@ def _generation_prompt_versions(*, sql_max_rows: int = 50) -> dict[str, str]:
         (
             "intent",
             evidence_module.INTENT_SYSTEM_PROMPT,
-            evidence_module.build_intent_user_prompt,
             evidence_module.INTENT_JSON_SCHEMA,
         ),
         (
             "sql",
             evidence_module.SQL_SYSTEM_PROMPT,
-            evidence_module.build_sql_user_prompt,
             evidence_module.SQL_JSON_SCHEMA,
         ),
         (
             "draft",
             draft_module.DRAFT_SYSTEM_PROMPT,
-            draft_module.build_draft_user_prompt,
             draft_module.DRAFT_JSON_SCHEMA,
         ),
         (
             "rewrite",
             rewrite_module.REWRITE_SYSTEM_PROMPT,
-            rewrite_module.build_rewrite_user_prompt,
             rewrite_module.REWRITE_JSON_SCHEMA,
         ),
     )
     return {
         f"{name}_prompt_version": text_digest(
             json.dumps(
-                [system, inspect.getsource(builder), schema, user_probes[name]],
+                [system, schema, user_probes[name]],
                 ensure_ascii=False,
                 sort_keys=True,
             ),
             prefix=f"{name}-prompt-",
         )
-        for name, system, builder, schema in specs
+        for name, system, schema in specs
     }
 
 
