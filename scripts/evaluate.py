@@ -496,7 +496,7 @@ def _run_measurement_two(
                 phone_last4_by_order=phone_last4_by_order,
             )
     finally:
-        # 하네스는 처리 기록을 남기지 않는다 — 리포트가 산출물이고 DB 는 그대로 둔다.
+        # 처리 기록은 남기지 않는다. 전화 확인 상태는 pipeline의 별도 연결에서 확정될 수 있다.
         app_conn.rollback()
         app_conn.close()
 

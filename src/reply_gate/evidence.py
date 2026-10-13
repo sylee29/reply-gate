@@ -18,7 +18,7 @@ citations 에 남긴다).
 * 반면 선검사를 통과한 주문에 대해 **SQL 이 정상 실행되고 0건**인 것은 구조적 실패가 아니라
   "주문 소스 근거 0건"이다 — `order` 단독이면 `no_evidence`, `both` 면 정책 근거만으로 진행한다.
 
-실패 정책 (docs/standards.md "재시도 상한" / docs/business-rules.md "인계 사유 6종"):
+실패 정책 (docs/standards.md "재시도 상한" / docs/business-rules.md "인계 사유 7종"):
 
 * **전송 오류**는 래퍼가 이미 1회 재시도했다 — `LLMCallError` 가 오면 어느 단계에서 왔든
   `llm_call_failed` 인계이고, 실패한 단계 이름을 남긴다. SQL 생성의 전송 오류도 여기에 속한다.
@@ -507,7 +507,7 @@ class SqlGenerationResult:
     """SQL 생성 **1회** 호출의 결과. 재시도 여부는 호출자(수집기)가 정한다.
 
     `sql` 이 `None` 이면 유효한 SQL 을 얻지 못한 것이고 `error` 에 사유가 담긴다 —
-    `sql_failed`(생성 실패) 경로다 — docs/business-rules.md "인계 사유 6종".
+    `sql_failed`(생성 실패) 경로다 — docs/business-rules.md "인계 사유 7종".
     전송 오류는 `LLMCallError` 로 올라간다(그건 `sql_failed` 가 아니라 `llm_call_failed`다).
     """
 
@@ -883,7 +883,7 @@ class EvidenceCollection:
     intent: IntentSource | None
     evidence: tuple[Evidence, ...]
     escalation_reason: EscalationReason | None
-    #: `llm_call_failed` 일 때 실패한 단계 이름 (docs/business-rules.md "인계 사유 6종").
+    #: `llm_call_failed` 일 때 실패한 단계 이름 (docs/business-rules.md "인계 사유 7종").
     failed_stage: str | None
     sql_snapshots: tuple[SqlEvidenceSnapshot, ...]
     sql_failures: tuple[SqlFailure, ...]
@@ -1208,7 +1208,7 @@ class EvidenceCollector:
             return EscalationReason.MISSING_ORDER_REF
         normalized = normalize_order_no(order_no)
         # 형식이 깨진 값은 참조가 없는 것과 같다 — `order_not_found` 는 형식이 맞는
-        # 주문번호에만 쓴다(docs/business-rules.md "인계 사유 6종").
+        # 주문번호에만 쓴다(docs/business-rules.md "인계 사유 7종").
         # 정상 경로에서는 접수 단계가 먼저 막는다.
         if not is_valid_order_no(normalized):
             return EscalationReason.MISSING_ORDER_REF
