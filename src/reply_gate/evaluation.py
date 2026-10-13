@@ -1679,45 +1679,45 @@ _ABSTENTION_PROBES: Final[tuple[tuple[float, ...], ...]] = (
 #: 입력 순서대로 나오는 구현과 정렬하는 구현이 같은 답을 내면 탐침이 아무것도 못 가른다.
 _RETRIEVAL_TIE_PROBE: Final[tuple[str, ...]] = ("b", "a", "c")
 
-#: 정책 검색 SQL 의 정렬 절을 뽑는 패턴. **파일 전체가 아니라 이 절 하나만** 읽는다 —
+#: 정책 검색 SQL 의 정렬 절을 뽑는 패턴. **파일 전체가 아니라 정렬 절들만** 읽는다 —
 #: 함수 안 주석이 바뀌었다고 계보가 끊기면 안 된다.
-_ORDER_BY_PATTERN: Final = re.compile(r"ORDER BY\s+(.*)", re.DOTALL)
-
-#: `ORDER BY` 뒤에서 절을 끝내는 표기. 여기까지만 정렬 키로 읽는다.
-_ORDER_BY_TERMINATORS: Final[tuple[str, ...]] = ("LIMIT", "OFFSET", "FETCH")
+_ORDER_BY_PATTERN: Final = re.compile(
+    r"ORDER BY\s+(.*?)(?=\b(?:LIMIT|OFFSET|FETCH|ORDER BY)\b|$)", re.DOTALL
+)
 
 
 def order_by_clause(source: str) -> str:
-    """SQL 문면에서 `ORDER BY` 절만 뽑아 공백을 접는다. 없으면 `"정렬 없음"`.
+    """SQL 문면의 `ORDER BY` 절들을 순서대로 뽑는다. 없으면 `"정렬 없음"`.
 
     **없을 때 옛 값을 남기지 않는다** — 정렬 절이 사라진 것은 조용한 무변경이 아니라
-    행동 계약이 바뀐 것이고, 지문은 그것을 값으로 드러내야 한다.
+    행동 계약이 바뀐 것이고, 지문은 그것을 값으로 드러내야 한다. 일괄 검색은 안쪽의
+    top_k 선택과 바깥쪽의 반환 순서가 모두 결과에 관여하므로 둘 다 기록한다.
     """
-    match = _ORDER_BY_PATTERN.search(source)
-    if match is None:
-        return "정렬 없음"
-    clause = match.group(1)
-    for terminator in _ORDER_BY_TERMINATORS:
-        clause = clause.partition(terminator)[0]
-    return " ".join(clause.split())
+    clauses = [" ".join(match.group(1).split()) for match in _ORDER_BY_PATTERN.finditer(source)]
+    return " | ".join(clauses) if clauses else "정렬 없음"
 
 
 def _policy_search_sql() -> str:
     """정책 검색 함수가 **실제로 실행하는** SQL 문면.
 
-    소스를 문자열로 훑지 않고 AST 로 본다 — 주석은 애초에 없고 docstring 은 제외할 수 있다.
-    설명 문장에 `ORDER BY` 가 스치기만 해도 지문이 흔들리면, 문서를 고친 것이 계보를 끊는다.
+    execute 첫 인자에 속한 SQL 문자열만 AST로 읽는다. 주석·docstring·결과 행의 키나
+    실행하지 않는 문자열이 바뀐 것을 정렬 규칙 변경으로 기록하지 않는다.
     """
-    module = ast.parse(textwrap.dedent(inspect.getsource(policy_index.search_policy_chunks)))
+    module = ast.parse(textwrap.dedent(inspect.getsource(policy_index.search_policy_rankings)))
     function = module.body[0]
     if not isinstance(function, ast.FunctionDef):  # pragma: no cover - 방어
         return ""
-    body = function.body[1:] if ast.get_docstring(function) is not None else function.body
     return "\n".join(
         node.value
-        for statement in body
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "execute"
+        and call.args
+        for node in ast.walk(call.args[0])
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and re.match(r"\s*(?:SELECT|WITH)\b", node.value)
     )
 
 
@@ -1893,7 +1893,7 @@ def _abstention_undefined_policy() -> str:
 def _retrieval_order_rule() -> str:
     """검색 순서 규칙 — **tie-break 유무**를 두 자리에서 함께 읽는다.
 
-    DB 가 상위 `top_k` 를 자를 때의 정렬(`policy_index.search_policy_chunks`)과, 원문·재작성
+    DB 의 선택·반환 정렬(`policy_index.search_policy_rankings`)과, 원문·재작성
     합집합을 접는 파이썬 병합(`retrieval_strategies.merge_rewritten_rankings`)이다. **두
     자리가 갈리면 재작성 켜짐/꺼짐이 다른 순서를 낸다** — 그래서 한 칸에 함께 싣는다.
     병합 쪽은 동점 후보를 정본 순서와 반대로 넣어 결과 순서를 그대로 적는다.

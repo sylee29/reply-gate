@@ -39,7 +39,7 @@ from psycopg.rows import DictRow
 from scripts import evaluate
 from sqlglot import exp
 
-from reply_gate import evaluation, gate, llm, retrieval_strategies, sql_guard
+from reply_gate import evaluation, gate, llm, policy_index, retrieval_strategies, sql_guard
 from reply_gate.config import Settings
 from reply_gate.contracts import Claim, EscalationReason, InquiryStatus, IntentSource
 from reply_gate.evaluation import (
@@ -622,6 +622,51 @@ def test_검색_순서_지문이_DB_정렬_키를_그대로_싣는다() -> None:
     value = code_condition_fingerprint()["retrieval_order"]
 
     assert "evidence_id" in value, value
+    assert "queries.query_index, hits.distance, hits.evidence_id" in value, value
+
+
+@pytest.mark.parametrize(
+    ("before_sql", "after_sql"),
+    [
+        ("embedding <=> queries.query_vector, evidence_id", "embedding <=> queries.query_vector"),
+        (
+            "queries.query_index, hits.distance, hits.evidence_id",
+            "queries.query_index, hits.distance",
+        ),
+    ],
+)
+def test_일괄검색의_안쪽과_바깥쪽_정렬이_각각_지문에_반영된다(
+    monkeypatch: pytest.MonkeyPatch, before_sql: str, after_sql: str
+) -> None:
+    target = policy_index.search_policy_rankings
+    getsource = inspect.getsource
+    source = getsource(target)
+    assert source.count(before_sql) == 1
+    before = evaluation.code_condition_fingerprint()["retrieval_order"]
+    monkeypatch.setattr(
+        inspect,
+        "getsource",
+        lambda obj: source.replace(before_sql, after_sql) if obj is target else getsource(obj),
+    )
+    assert evaluation.code_condition_fingerprint()["retrieval_order"] != before
+
+
+def test_실행하지_않는_SQL문자열은_검색_정렬_지문을_바꾸지_않는다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = policy_index.search_policy_rankings
+    getsource = inspect.getsource
+    module = ast.parse(textwrap.dedent(getsource(target)))
+    function = module.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    function.body.insert(1, ast.Expr(value=ast.Constant(value="SELECT 1 ORDER BY unused_key")))
+    source = ast.unparse(module)
+    before = evaluation.code_condition_fingerprint()["retrieval_order"]
+    assert "hits.evidence_id" in before
+    monkeypatch.setattr(
+        inspect, "getsource", lambda obj: source if obj is target else getsource(obj)
+    )
+    assert evaluation.code_condition_fingerprint()["retrieval_order"] == before
 
 
 def test_정렬_절_추출이_정렬_없음을_구분한다() -> None:
@@ -633,6 +678,9 @@ def test_정렬_절_추출이_정렬_없음을_구분한다() -> None:
     )
     assert order_by_clause("ORDER BY embedding <=> %s\n") == "embedding <=> %s"
     assert order_by_clause("SELECT 1 FROM policy_chunks\n") == "정렬 없음"
+    assert order_by_clause("ORDER BY inner_key LIMIT 5) rows ORDER BY outer_key") == (
+        "inner_key | outer_key"
+    )
 
 
 def test_L1_채점표_한_바이트가_바뀌면_지문이_움직인다(tmp_path: Path) -> None:
