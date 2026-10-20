@@ -11,7 +11,7 @@ import re
 from collections.abc import Sequence
 from typing import Final
 
-from reply_gate.config import Settings
+from reply_gate.config import AbstentionGateWiringError, Settings
 from reply_gate.contracts import ClaimJudgment, Draft, Evidence, JudgeResult, RejectReason, Verdict
 from reply_gate.draft import DraftGenerator
 from reply_gate.evidence import EvidenceCollector
@@ -19,7 +19,7 @@ from reply_gate.judge import JudgeOutcome
 from reply_gate.llm import EmbeddingClient, EmbeddingResult, GenerationClient
 from reply_gate.pipeline import InquiryPipeline, Judging
 
-__all__ = ["LexicalEmbeddingClient", "StubJudge", "build_stub_pipeline"]
+__all__ = ["LexicalEmbeddingClient", "StubEvidenceCollector", "StubJudge", "build_stub_pipeline"]
 
 
 class LexicalEmbeddingClient:
@@ -41,10 +41,18 @@ class LexicalEmbeddingClient:
     #: 벡터 출처 이름. 대역도 출처를 밝혀야 실제 모델의 인덱스와 섞이지 않는다 —
     #: 대역으로 적재한 DB 를 실제 모델로 검색하면 그 자체가 불일치로 걸린다.
     MODEL = "stub:lexical-2gram"
+    #: 기존 오프라인 평가 캐시·리포트가 쓰던 대역 이름. 새 이름은 stub: 접두사를 쓴다.
+    LEGACY_MODEL = "lexical-2gram-v1"
 
     def __init__(self, *, dimensions: int = 1536, model: str = MODEL) -> None:
         if dimensions <= 0:
             raise ValueError("dimensions 는 1 이상이어야 한다")
+        if model != self.LEGACY_MODEL and not (
+            model.startswith("stub:") and model.removeprefix("stub:").strip()
+        ):
+            raise ValueError(
+                "어휘 대역의 출처는 비어 있지 않은 stub: 이름 또는 기존 평가 alias만 허용한다"
+            )
         self._dimensions = dimensions
         self._model = model
 
@@ -77,6 +85,21 @@ class LexicalEmbeddingClient:
         return [value / norm for value in counts]
 
 
+class StubEvidenceCollector(EvidenceCollector):
+    """어휘 임베딩으로 실제 수집·채택 배관을 검사한다. 모델 품질은 측정하지 않는다.
+
+    설정의 채택 축은 그대로 쓰되, 이 모듈의 결정론 대역만 조건 대조에서 제외한다.
+    실제 수집기에는 대역 스위치가 없고 임베더의 출처 이름도 바꾸지 않는다.
+    """
+
+    def _validate_embedding_condition(self) -> None:
+        if type(self._embedder) is not LexicalEmbeddingClient:
+            raise AbstentionGateWiringError(
+                "대역 수집기는 LexicalEmbeddingClient만 허용한다 — "
+                "실제 임베더의 우회 경로가 아니다."
+            )
+
+
 #: 숫자로 시작하는 토막(`3영업일`·`30,000원`·`1588-0000`·`ORD-20260720-0002` 의 숫자 구간).
 _NUMBER_RUN: Final = re.compile(r"[0-9][0-9,.\-~]*")
 #: 프롬프트 길이에서 유도하는 가짜 토큰 환산 비율(문자 → 토큰).
@@ -91,6 +114,12 @@ def _numbers(text: str) -> set[str]:
     """
     values: set[str] = set()
     for match in _NUMBER_RUN.findall(text):
+        # 천 단위 쉼표만 먼저 지운다. 범위(3~5)와 나열(3,5)의 경계는 유지한다.
+        match = re.sub(
+            r"(?<![0-9,])[0-9]{1,3}(?:,[0-9]{3})+(?![0-9,])",
+            lambda grouped: grouped[0].replace(",", ""),
+            match,
+        )
         for part in re.split(r"[.,\-~]", match):
             digits = part.strip()
             if digits:
@@ -173,20 +202,20 @@ def build_stub_pipeline(
     judge: Judging,
     settings: Settings,
 ) -> InquiryPipeline:
-    """대역 배관 검증용 파이프라인 — `pipeline.build_pipeline` 과 **같은 협력자**를 쓰되
-    판정자만 주입한다.
+    """대역 배관 검증용 파이프라인 — 어휘 임베딩 전용 수집기와 주입 판정자를 쓴다.
 
     `build_pipeline` 은 판정자를 설정에서 조립하므로(실제 Anthropic 클라이언트) 주입
     구멍이 없다. 그 구멍을 뚫는 것은 파이프라인 모듈의 결정이라, 여기서는 같은 조합을
     다시 적는다 — **조합이 어긋나면 대역 실행이 실제 실행과 다른 것을 잰다.**
-    `tests/test_testing_doubles.py` 가 두 조립의 협력자 종류를 대조해 드리프트를 잡는다.
+    수집기는 실제 수집 동작을 상속하고 임베딩 조건 검증만 대역 경계로 가른다.
+    `tests/test_testing_doubles.py` 가 실제 배선 거부와 대역 허용, 공유 동작을 대조한다.
 
     **채택 축(컷 · `top_k` · 기권 게이트)은 여기 다시 적지 않는다** — 수집기가 `settings`
     에서 직접 조립하므로 두 조립기가 같은 설정을 받으면 같은 축으로 돈다. 축을 여기에
     한 번 더 적으면 그 순간부터 대역이 제품과 다른 축을 재기 시작한다.
     """
     return InquiryPipeline(
-        collector=EvidenceCollector(
+        collector=StubEvidenceCollector(
             generation_client=generation_client,
             embedding_client=embedding_client,
             settings=settings,
@@ -198,4 +227,5 @@ def build_stub_pipeline(
         drafter=DraftGenerator(client=generation_client, effort=settings.generation_effort),
         judge=judge,
         l2_enabled=settings.l2_enabled,
+        settings=settings,
     )

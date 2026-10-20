@@ -57,6 +57,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Final, cast
 
@@ -88,7 +90,9 @@ from reply_gate.evaluation import (
     assess_targets,
     attach_regression_guard,
     build_report,
+    code_condition_fingerprint,
     display_path,
+    load_fixture_phone_inputs,
     load_golden_set,
     load_judge_fixtures,
     load_l1_fixtures,
@@ -251,6 +255,8 @@ def _skip_reason(
             "않으므로 측정 2·3 을 시작하지 않는다 (판정을 빼고 재보려면 L2_ENABLED=false 로 "
             "명시한다 — 그 실행은 꺼짐 기준선이다)"
         )
+    if not settings.phone_hmac_secret:
+        return "PHONE_HMAC_SECRET 가 없다 — 문의 처리 전에 서버 HMAC 키를 설정해야 한다"
     return database_unavailable_reason(settings=settings)
 
 
@@ -302,8 +308,9 @@ def _run_settings(*, args: argparse.Namespace, settings: Settings) -> Settings:
         threshold = (
             STUB_SIMILARITY_THRESHOLD if args.stub_llm else settings.vector_similarity_threshold
         )
-    return settings.model_copy(
-        update={
+    return type(settings).model_validate(
+        {
+            **settings.model_dump(),
             "vector_similarity_threshold": float(threshold),
             "vector_top_k": int(args.top_k) if args.top_k is not None else settings.vector_top_k,
             "judge_model": (
@@ -397,12 +404,50 @@ def _retrieval_strategy_label(settings: Settings) -> str:
     return "+".join(stages)
 
 
+def _lock_evaluation_inputs(
+    conn: psycopg.Connection[DictRow],
+    *,
+    timeout_ms: int,
+    verification_fixture_version: str | None = None,
+) -> dict[str, str]:
+    """평가 전용: 쓰기를 잠근 DB 행을 지문화한다. 호출자가 finally에서 rollback한다.
+
+    정책의 대리키·적재 시각은 검색 입력이 아니므로 제외하고 실제 벡터까지 포함한다.
+    잠금 대기는 유한하며 실패 시 모델 호출 전에 측정을 중단한다.
+    """
+    if timeout_ms <= 0:
+        raise ValueError("평가 입력 잠금 timeout은 양수여야 한다")
+    conn.execute("SELECT set_config('lock_timeout', %s, true)", (f"{timeout_ms}ms",))
+    conn.execute("SET LOCAL TIME ZONE 'UTC'")
+    conn.execute("LOCK TABLE orders, policy_chunks IN SHARE MODE")
+    orders = conn.execute("SELECT to_jsonb(o) AS row FROM orders AS o ORDER BY order_no").fetchall()
+    policies = conn.execute(
+        "SELECT to_jsonb(p) - 'id' - 'created_at' AS row "
+        "FROM policy_chunks AS p ORDER BY evidence_id"
+    ).fetchall()
+    return {
+        "order_data_version": text_digest(
+            json.dumps(
+                {"rows": orders, "verification_fixture_version": verification_fixture_version},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            prefix="orders-db-",
+        ),
+        "policy_data_version": text_digest(
+            json.dumps(policies, ensure_ascii=False, sort_keys=True), prefix="policy-db-"
+        ),
+    }
+
+
 def _run_measurement_two(
     *,
     cases: tuple[GoldenCase, ...],
     args: argparse.Namespace,
     settings: Settings,
 ) -> tuple[PipelineAgreement, str, str]:
+    # 요청자 확인 입력도 실행 시작에 고정한다. 케이스마다 파일을 재독해 지문과 갈리지 않는다.
+    phone_last4_by_order, verification_fixture_version = load_fixture_phone_inputs()
     generation_client, embedding_client, generation_label, embedding_label = _clients(
         args=args, settings=settings
     )
@@ -436,6 +481,11 @@ def _run_measurement_two(
             index_policy_documents(
                 conn=app_conn, documents=load_policy_documents(), embedder=embedding_client
             )
+        input_fingerprint = _lock_evaluation_inputs(
+            app_conn,
+            timeout_ms=settings.sql_statement_timeout_ms,
+            verification_fixture_version=verification_fixture_version,
+        )
         with readonly_connect(settings=settings) as ro_conn:
             agreement = measure_pipeline_agreement(
                 cases=cases,
@@ -443,13 +493,18 @@ def _run_measurement_two(
                 app_conn=app_conn,
                 readonly_conn=ro_conn,
                 on_outcome=progress,
+                phone_last4_by_order=phone_last4_by_order,
             )
     finally:
-        # 하네스는 처리 기록을 남기지 않는다 — 리포트가 산출물이고 DB 는 그대로 둔다.
+        # 처리 기록은 남기지 않는다. 전화 확인 상태는 pipeline의 별도 연결에서 확정될 수 있다.
         app_conn.rollback()
         app_conn.close()
 
-    return agreement, generation_label, embedding_label
+    return (
+        replace(agreement, input_fingerprint=input_fingerprint),
+        generation_label,
+        embedding_label,
+    )
 
 
 def _reasons(reasons: tuple[RejectReason, ...]) -> str:
@@ -496,6 +551,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
     selected = selected_measurements(args)
+    try:
+        run_settings = _run_settings(args=args, settings=settings)
+    except ValueError as error:
+        raise SystemExit(f"거부: 잘못된 실행 설정 — {error}") from error
     # 키·DB 선검사는 **측정 시작 전**이다 — 도중에 발견하면 과금만 하고 산출물이 없다.
     skip = _skip_reason(args=args, settings=settings, selected=selected)
     judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip, selected=selected)
@@ -506,7 +565,8 @@ def main(argv: list[str] | None = None) -> int:
     measurement3_was_due = bool(args.live) and judge_skip is None
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
-    cases = load_golden_set(args.golden_set)
+    # 측정 2 를 실행하지 않으면 골든셋은 입력이 아니다. 측정 3 단독은 판정 픽스처만 쓴다.
+    cases = load_golden_set(args.golden_set) if skip is None else ()
     # 판정 픽스처 로드 실패는 **측정 3 만** 접는다 — 키도 DB 도 필요 없는 측정 1 의 산출물을
     # 판정 픽스처 파일이 인질로 잡으면, 무료 실행이 트레이스백으로 죽으면서 아무것도 안 남는다.
     judge_fixtures: tuple[JudgeFixture, ...] = ()
@@ -528,7 +588,6 @@ def main(argv: list[str] | None = None) -> int:
             judge_fixture_error if judge_skip is None else f"{judge_skip} / {judge_fixture_error}"
         )
 
-    run_settings = _run_settings(args=args, settings=settings)
     # 측정 2 가 **실측으로 돌 조건이었는가**. 도중에 중단돼도 이 값은 True 로 남는다:
     # 이름은 이미 확정됐고(측정 시작 전 결정), 그 이름이 곧 "이 실행은 과금될 수 있었다"는
     # 저장소에 남는 기록이다.
@@ -661,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
         similarity_threshold=run_settings.vector_similarity_threshold,
         top_k=run_settings.vector_top_k,
         l1_fixture_count=len(fixtures),
-        golden_case_count=len(cases),
+        golden_case_count=len(cases) if skip is None else None,
         # 로드하지 못했으면 0 이 아니라 **미실행**이다.
         judge_fixture_count=None if judge_fixture_error is not None else len(judge_fixtures),
         # 커밋되는 라이브 리포트에 로컬 절대 경로(사용자명 포함)를 남기지 않는다.
@@ -677,9 +736,10 @@ def main(argv: list[str] | None = None) -> int:
         measurement3_is_real=measurement3_is_real,
         billed=billed,
         measurement_scope=_measurement_scope(selected=selected, skip=skip, judge_skip=judge_skip),
-        condition_fingerprint=_condition_fingerprint(
-            args=args, settings=settings, run_settings=run_settings
-        ),
+        condition_fingerprint={
+            **_condition_fingerprint(args=args, settings=settings, run_settings=run_settings),
+            **(pipeline.input_fingerprint if isinstance(pipeline, PipelineAgreement) else {}),
+        },
         # 선언된 실험 변인은 **실행이 명시**한다 — 코드가 추측하지 않는다. 선언되지 않은
         # 지문 불일치는 "대조 불가"로 남고, 그것이 조용한 조건 드리프트를 잡는 자리다.
         declared_experiment_fields=tuple(args.declare_experiment or ()),
@@ -693,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     report: EvaluationReport = build_report(
+        golden_set_path=args.golden_set,
         conditions=conditions,
         gate_accuracy=accuracy,
         pipeline=pipeline,
@@ -803,6 +864,7 @@ def _condition_fingerprint(
         gate_statistic = gate.statistic.value if gate is not None else "꺼짐"
         gate_tau = f"{gate.tau:g}" if gate is not None else "꺼짐"
     return {
+        **code_condition_fingerprint(sql_max_rows=run_settings.sql_max_rows),
         # 라벨 버전 = 골든셋 내용 지문. 결정 0008 의 라벨 재정렬 전후가 여기서 갈린다.
         "label_version": content_digest(args.golden_set, prefix="golden-") or "미상",
         # **검색 정답 라벨은 근거 부분 손실 검사의 정답 입력이다.** 여기 없으면 라벨 한 줄

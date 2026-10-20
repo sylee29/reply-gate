@@ -23,10 +23,12 @@ import ast
 import inspect
 import json
 import os
+import re
+import secrets
 import subprocess
 import sys
 import textwrap
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final, cast
@@ -35,8 +37,9 @@ import psycopg
 import pytest
 from psycopg.rows import DictRow
 from scripts import evaluate
+from sqlglot import exp
 
-from reply_gate import evaluation, gate, llm, retrieval_strategies, sql_guard
+from reply_gate import evaluation, gate, llm, policy_index, retrieval_strategies, sql_guard
 from reply_gate.config import Settings
 from reply_gate.contracts import Claim, EscalationReason, InquiryStatus, IntentSource
 from reply_gate.evaluation import (
@@ -135,7 +138,15 @@ def _conditions(
         measurement2_is_real=True,
         measurement3_is_real=True,
         billed=True,
-        condition_fingerprint=_script_fingerprint() if fingerprint is None else fingerprint,
+        condition_fingerprint=(
+            {
+                **_script_fingerprint(),
+                "policy_data_version": "policy-db-synthetic",
+                "order_data_version": "orders-db-synthetic",
+            }
+            if fingerprint is None
+            else fingerprint
+        ),
         declared_experiment_fields=declared,
         aborted_measurements=aborted,
     )
@@ -258,6 +269,97 @@ def test_접기_동작이_바뀌면_초안_판정_지문이_움직인다(monkeyp
     """접기는 **이름이 아니라 동작**으로 담는다 — 이름만 담으면 본문 변경이 안 보인다."""
     before = _draft_rule_version()
     monkeypatch.setattr(evaluation, "fold_numeric_for_detection", lambda text: text)
+
+    assert _draft_rule_version() != before
+
+
+def test_이메일_산문_경계를_빼면_초안_판정_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """공통 접기만으로 되돌리면 정상 에코가 다시 기각되는 동작 변경이다."""
+    before = _draft_rule_version()
+    mutated = tuple(
+        replace(pattern, fold=gate.fold_for_detection) if pattern.name == "email" else pattern
+        for pattern in gate.DEFAULT_PII_PATTERNS
+    )
+    monkeypatch.setattr(evaluation, "DEFAULT_PII_PATTERNS", mutated)
+
+    assert _draft_rule_version() != before
+
+
+def test_이메일_지문_탐침은_산문과_명시_주소를_함께_태운다() -> None:
+    """정상 에코만 태우면 literal 보호가 사라져도 같은 판으로 보일 수 있다."""
+    email = next(pattern for pattern in gate.DEFAULT_PII_PATTERNS if pattern.name == "email")
+    folded = email.fold(evaluation._PII_RULE_PROBE)
+
+    assert "메일은 hong@example.com 입니다." in folded
+    assert "customer_email= hong@example.com입니다" in folded
+    assert "<hong@example.com입니다>" in folded
+    assert "hong@example.com입니다.evil" in folded
+    assert "support@쇼핑몰.한국" in folded
+
+
+def test_보이지_않는_claim을_허용하면_초안_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """패턴 선언만으로는 빈 내용 판정 변경이 드러나지 않는다."""
+    before = _draft_rule_version()
+    inspect_schema = gate._inspect_schema
+
+    def allow_invisible(raw: object) -> gate._SchemaInspection:
+        inspection = inspect_schema(raw)
+        return replace(inspection, ok=True)
+
+    monkeypatch.setattr(gate, "_inspect_schema", allow_invisible)
+    assert _draft_rule_version() != before
+
+
+@pytest.mark.parametrize("boundary", ["_QUANTITY", "_INTEGER_VALUE"])
+def test_같은_수량의_에코_경계를_빼면_초안_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    """실제 판정에 쓰이는 수량 문맥과 근거 정수 채택을 각각 뒤집는다."""
+    before = _draft_rule_version()
+    monkeypatch.setattr(gate, boundary, re.compile(r"(?!)"))
+    assert _draft_rule_version() != before
+
+
+def test_이메일을_숫자_근거에서_빼지_않으면_초안_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """주소 안 숫자가 별도 수량의 허용 출처로 승격되는 변경을 잡는다."""
+    before = _draft_rule_version()
+    monkeypatch.setattr(gate, "_without_email_tokens", lambda text: text)
+    assert _draft_rule_version() != before
+
+
+def test_초안_내용_탐침은_승인과_기각_양쪽을_포함한다() -> None:
+    assert evaluation._draft_content_boundary_probe().split("|") == [
+        "reject:schema_violation",
+        "reject:schema_violation",
+        "reject:pii_detected",
+        "pass:",
+        "pass:",
+        "reject:pii_detected",
+        "reject:pii_detected",
+        "reject:pii_detected",
+        "pass:",
+        "reject:pii_detected",
+        "pass:",
+    ]
+
+
+def test_이메일을_claim별로_접으면_판정_지문도_바뀐다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """claim 연결 문맥을 잃는 변경을 접기 함수의 이름만으로는 감지할 수 없다."""
+    before = _draft_rule_version()
+    original = gate._has_unsourced_pii
+
+    def without_answer_context(
+        *, draft_texts: Sequence[str], evidence_texts: Sequence[str], answer_text: str | None
+    ) -> bool:
+        return original(draft_texts=draft_texts, evidence_texts=evidence_texts, answer_text=None)
+
+    monkeypatch.setattr(gate, "_has_unsourced_pii", without_answer_context)
 
     assert _draft_rule_version() != before
 
@@ -420,6 +522,59 @@ def test_조회_가드_탐침이_실제로_유래를_가른다() -> None:
     assert any(item.startswith("reject|") for item in outcomes), outcomes
 
 
+def test_실행_문자열_재검사를_빼면_조회_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """정상 조회만 재면 새 직렬화 방어가 빠져도 같은 판으로 남는다."""
+    before = _sql_guard_version()
+    validate = sql_guard.validate_sql
+    parse = sql_guard._parse_single_statement
+
+    def without_output_check(
+        sql: str,
+        *,
+        order_no: str,
+        max_rows: int,
+        whitelist: Mapping[str, tuple[str, ...]] = sql_guard.SCHEMA_WHITELIST,
+    ) -> sql_guard.ValidatedQuery:
+        input_tree: exp.Expr | None = None
+
+        def reuse_input(text: str) -> exp.Expr:
+            nonlocal input_tree
+            if input_tree is None:
+                input_tree = parse(text)
+                return input_tree
+            assert isinstance(input_tree, exp.Select)
+            return input_tree.limit(max_rows)
+
+        with monkeypatch.context() as mutation:
+            mutation.setattr(sql_guard, "_parse_single_statement", reuse_input)
+            return validate(sql, order_no=order_no, max_rows=max_rows, whitelist=whitelist)
+
+    monkeypatch.setattr(sql_guard, "validate_sql", without_output_check)
+    assert _sql_guard_version() != before
+
+
+def test_조회_출력명_경계의_판정도_지문에_실린다() -> None:
+    """DB 출력명 충돌과 quoted 유래가 바뀌면 같은 조건으로 비교해서는 안 된다."""
+    assert evaluation.sql_guard_probe_outcomes()[-7:] == (
+        "reject|unsupported_projection",
+        "reject|unsupported_projection",
+        "ok|Phone",
+        "ok|coalesce",
+        "ok|" + "a" * 63,
+        "ok|",
+        "reject|unsupported_projection",
+    )
+
+
+def test_식별자_절단을_빼면_조회_지문이_움직인다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """음성 대조: PostgreSQL 이름 절단을 지우는 실제 동작 변경을 탐침이 감지한다."""
+    before = _sql_guard_version()
+    monkeypatch.setattr(sql_guard, "_normalize_identifiers", lambda statement: None)
+    assert _sql_guard_version() != before
+
+
 def test_기권_미정의_처분을_뒤집으면_지문이_움직인다(monkeypatch: pytest.MonkeyPatch) -> None:
     """**미정의 처리를 바꿔도 기존 지문 값은 전혀 움직이지 않는다** — 이 칸이 그 자리다."""
     from reply_gate.evaluation import code_condition_fingerprint
@@ -467,6 +622,51 @@ def test_검색_순서_지문이_DB_정렬_키를_그대로_싣는다() -> None:
     value = code_condition_fingerprint()["retrieval_order"]
 
     assert "evidence_id" in value, value
+    assert "queries.query_index, hits.distance, hits.evidence_id" in value, value
+
+
+@pytest.mark.parametrize(
+    ("before_sql", "after_sql"),
+    [
+        ("embedding <=> queries.query_vector, evidence_id", "embedding <=> queries.query_vector"),
+        (
+            "queries.query_index, hits.distance, hits.evidence_id",
+            "queries.query_index, hits.distance",
+        ),
+    ],
+)
+def test_일괄검색의_안쪽과_바깥쪽_정렬이_각각_지문에_반영된다(
+    monkeypatch: pytest.MonkeyPatch, before_sql: str, after_sql: str
+) -> None:
+    target = policy_index.search_policy_rankings
+    getsource = inspect.getsource
+    source = getsource(target)
+    assert source.count(before_sql) == 1
+    before = evaluation.code_condition_fingerprint()["retrieval_order"]
+    monkeypatch.setattr(
+        inspect,
+        "getsource",
+        lambda obj: source.replace(before_sql, after_sql) if obj is target else getsource(obj),
+    )
+    assert evaluation.code_condition_fingerprint()["retrieval_order"] != before
+
+
+def test_실행하지_않는_SQL문자열은_검색_정렬_지문을_바꾸지_않는다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = policy_index.search_policy_rankings
+    getsource = inspect.getsource
+    module = ast.parse(textwrap.dedent(getsource(target)))
+    function = module.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    function.body.insert(1, ast.Expr(value=ast.Constant(value="SELECT 1 ORDER BY unused_key")))
+    source = ast.unparse(module)
+    before = evaluation.code_condition_fingerprint()["retrieval_order"]
+    assert "hits.evidence_id" in before
+    monkeypatch.setattr(
+        inspect, "getsource", lambda obj: source if obj is target else getsource(obj)
+    )
+    assert evaluation.code_condition_fingerprint()["retrieval_order"] == before
 
 
 def test_정렬_절_추출이_정렬_없음을_구분한다() -> None:
@@ -478,6 +678,9 @@ def test_정렬_절_추출이_정렬_없음을_구분한다() -> None:
     )
     assert order_by_clause("ORDER BY embedding <=> %s\n") == "embedding <=> %s"
     assert order_by_clause("SELECT 1 FROM policy_chunks\n") == "정렬 없음"
+    assert order_by_clause("ORDER BY inner_key LIMIT 5) rows ORDER BY outer_key") == (
+        "inner_key | outer_key"
+    )
 
 
 def test_L1_채점표_한_바이트가_바뀌면_지문이_움직인다(tmp_path: Path) -> None:
@@ -571,7 +774,16 @@ def test_옛_산출물과의_대조는_미상을_관용한다() -> None:
     comparison = _extended_legacy().compare(_legacy())
 
     assert comparison.comparable is True
-    assert set(comparison.unknown_fields) == set(NEW_FINGERPRINT_FIELDS)
+    assert set(comparison.unknown_fields) == {
+        *NEW_FINGERPRINT_FIELDS,
+        "judge_rule_version",
+        "intent_prompt_version",
+        "sql_prompt_version",
+        "draft_prompt_version",
+        "rewrite_prompt_version",
+        "policy_data_version",
+        "order_data_version",
+    }
 
 
 def test_세트_편입은_미상을_인정하지_않는다() -> None:
@@ -697,6 +909,7 @@ def _run_with(reason: AbstentionUndefined | None) -> ProcessedInquiry:
         drafter=cast(Any, None),
         judge=None,
         l2_enabled=False,
+        settings=declared_settings(phone_hmac_secret=secrets.token_hex(32)),
     )
     return pipeline.run(
         inquiry_id=new_inquiry_id(),
@@ -838,3 +1051,383 @@ def _stub_report() -> EvaluationReport:
         pipeline=agreement,
         judge_accuracy=SkippedMeasurement(reason="대역 — 판정 미실행"),
     )
+
+
+def test_claim_연결_검사를_되돌리면_초안_판정_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """분리 claim만 검사하던 결함으로 돌아가도 규칙 지문이 그대로면 회귀 조건을 숨긴다."""
+    before = _draft_rule_version()
+    monkeypatch.setattr(
+        gate, "_answer_texts", lambda *, inspection, raw_draft: inspection.answer_texts
+    )
+    assert _draft_rule_version() != before
+
+
+def test_L2_규칙_지문은_프롬프트와_별개인_필수_판정_항목이다() -> None:
+    """같은 프롬프트도 산출 해석 코드가 달라지면 다른 조건이어야 한다."""
+    from reply_gate.regression_guard import JUDGING_FINGERPRINT_FIELDS
+
+    values = _current().values
+    assert "judge_rule_version" in FINGERPRINT_FIELDS
+    assert "judge_rule_version" in JUDGING_FINGERPRINT_FIELDS
+    value = values["judge_rule_version"]
+    assert isinstance(value, str)
+    assert value.startswith("judgerules-")
+
+
+@pytest.mark.parametrize("declaration", ["schema", "format_attempts"])
+def test_L2_규칙_선언이_바뀌면_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch, declaration: str
+) -> None:
+    from copy import deepcopy
+
+    from reply_gate import judge
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    if declaration == "schema":
+        schema = deepcopy(judge.JUDGE_JSON_SCHEMA)
+        schema["required"].remove("contradictions")
+        monkeypatch.setattr(judge, "JUDGE_JSON_SCHEMA", schema)
+    else:
+        monkeypatch.setattr(judge, "JUDGE_MAX_ATTEMPTS", judge.JUDGE_MAX_ATTEMPTS + 1)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_같은_프롬프트라도_L2_parser_수용_규칙이_바뀌면_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from reply_gate import judge
+    from reply_gate.contracts import Draft
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    prompt = judge.JUDGE_SYSTEM_PROMPT
+    original = judge._parse_judge_result
+
+    def allow_uncited(data: object, *, draft: Draft, evidence: Any) -> Any:
+        if isinstance(data, dict) and data.get("contradictions"):
+            pair = data["contradictions"][0]
+            draft = replace(
+                draft,
+                claims=tuple(
+                    replace(claim, citation_ids=(pair["evidence_id_a"],)) for claim in draft.claims
+                ),
+            )
+        return original(data, draft=draft, evidence=evidence)
+
+    monkeypatch.setattr(judge, "_parse_judge_result", allow_uncited)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+    assert prompt == judge.JUDGE_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("admission", ["characters", "finite_numbers"])
+def test_공통_JSON_산출_수용규칙을_되돌리면_L2_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch, admission: str
+) -> None:
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    if admission == "characters":
+        monkeypatch.setattr(llm, "_require_storable_json_strings", lambda data: None)
+    else:
+        monkeypatch.setattr(llm, "_finite_json_float", float)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_L2_parser_진단_문구만_바꾸면_지문은_같다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """판정 동작을 해시하며 오류 문구 다듬기는 판정 규칙 변경이 아니다."""
+    from reply_gate import judge
+    from reply_gate.contracts import Draft
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    original = judge._parse_judge_result
+
+    def reword(data: object, *, draft: Draft, evidence: Any) -> Any:
+        try:
+            return original(data, draft=draft, evidence=evidence)
+        except judge._ParseError as error:
+            raise judge._ParseError("다듬은 오류 설명") from error
+
+    monkeypatch.setattr(judge, "_parse_judge_result", reword)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] == before
+
+
+def test_기존_실측의_L2_규칙은_미상이고_새_세트에는_편입되지_않는다() -> None:
+    old = load_run_summary(_ROOT / "reports" / "evaluation-live-l2-28.json").fingerprint
+    assert old.values["judge_rule_version"] is None
+    values = dict(old.values)
+    values["judge_rule_version"] = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    # 새 실행 대역은 추가된 입력도 실제로 안다는 조건을 명시한다. 옛 산출물은 그대로 미상이다.
+    values.update(evaluation._generation_prompt_versions())
+    values.update(
+        {"policy_data_version": "policy-db-synthetic", "order_data_version": "orders-db-synthetic"}
+    )
+    new = ConditionFingerprint.from_values(values)
+    comparison = new.compare(old)
+    assert comparison.comparable is True
+    assert set(comparison.unknown_fields) == {
+        "judge_rule_version",
+        "intent_prompt_version",
+        "sql_prompt_version",
+        "draft_prompt_version",
+        "rewrite_prompt_version",
+        "policy_data_version",
+        "order_data_version",
+    }
+    assert new.same_condition(old)[0] is False
+    assert old.same_condition(old)[0] is False
+    assert new.same_condition(new) == (True, None)
+
+
+def test_L2_규칙_변경_선언은_대조만_열고_다른_세트를_섞지_않는다() -> None:
+    baseline = _current()
+    values = dict(baseline.values)
+    values["judge_rule_version"] = "judgerules-different"
+    undeclared = ConditionFingerprint.from_values(values)
+    declared = ConditionFingerprint.from_values(values, declared=("judge_rule_version",))
+    assert undeclared.compare(baseline).comparable is False
+    assert declared.compare(baseline).comparable is True
+    assert declared.same_condition(baseline)[0] is False
+
+
+def test_L2_규칙_탐침은_수용과_거부를_모두_실행한다() -> None:
+    """입력 이름만 지문에 적거나 전부 거부하는 탐침으로는 판정 변경을 확인할 수 없다."""
+    outcomes = evaluation._judge_rule_probe_outcomes()
+    assert outcomes["json:normal"] == "accepted"
+    assert outcomes["json:surrogate_pair"] == "accepted"
+    assert outcomes["json:nul_value"] == "rejected"
+    assert outcomes["json:nul_key"] == "rejected"
+    assert outcomes["json:surrogate_high"] == "rejected"
+    for name in (
+        "normal",
+        "cited_rejection",
+        "uncited_record",
+        "explicit_conflict",
+        "duplicate_complete",
+        "unsupported",
+    ):
+        assert outcomes[f"judge:{name}"] != "rejected", name
+    for name in (
+        "uncited_rejection",
+        "duplicate_missing",
+        "invalid_reason",
+        "verdict_without_reason",
+        "unsupported_without_reason",
+        "unknown_evidence",
+        "self_conflict",
+    ):
+        assert outcomes[f"judge:{name}"] == "rejected", name
+
+
+def test_L2_parser가_모든_정상입력도_거부하면_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """양성 입력이 지문에 실제 기여한다는 음성 대조다."""
+    from reply_gate import judge
+
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+
+    def reject_all(*args: Any, **kwargs: Any) -> Any:
+        raise judge._ParseError("모든 입력을 거부하는 잘못된 parser")
+
+    monkeypatch.setattr(judge, "_parse_judge_result", reject_all)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_L2_규칙_지문은_새_리포트_JSON과_문면에_함께_실린다() -> None:
+    report = _stub_report()
+    value = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    assert (
+        report_to_json(report)["conditions"]["condition_fingerprint"]["judge_rule_version"] == value
+    )
+    assert value in render_markdown(report)
+
+
+def test_중복_JSON_키_허용으로_되돌리면_L2_규칙_지문이_바뀐다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = evaluation.code_condition_fingerprint()["judge_rule_version"]
+    monkeypatch.setattr(llm, "_unique_json_object", dict)
+    assert evaluation.code_condition_fingerprint()["judge_rule_version"] != before
+
+
+def test_초안_근거_포맷의_변경도_사용자_프롬프트_지문이_잡는다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from reply_gate import draft
+
+    before = evaluation.code_condition_fingerprint()["draft_prompt_version"]
+    monkeypatch.setattr(draft, "_format_evidence", lambda evidence: "변경된 근거 문면")
+    assert evaluation.code_condition_fingerprint()["draft_prompt_version"] != before
+
+
+@pytest.mark.parametrize("edit", ["comment", "docstring", "helper_name"])
+def test_생성_프롬프트의_설명과_내부이름은_실제_출력과_지문을_바꾸지_않는다(
+    monkeypatch: pytest.MonkeyPatch, edit: str
+) -> None:
+    """실제 LLM 입력이 같으면 설명만 고친 코드가 실측의 대조 계보를 끊지 않는다."""
+    from reply_gate import draft, evidence, query_rewrite
+    from reply_gate.contracts import JudgeResult, Verdict
+
+    calls = (
+        (evidence.build_intent_user_prompt, {"inquiry": "문의"}),
+        (
+            evidence.build_sql_user_prompt,
+            {"inquiry": "문의", "order_no": "ORD-20260101-0001", "max_rows": 50},
+        ),
+        (draft.build_draft_user_prompt, {"inquiry": "문의", "evidence": ()}),
+        (query_rewrite.build_rewrite_user_prompt, {"inquiry": "문의"}),
+        (draft._format_judge_detail, {"result": JudgeResult(verdict=Verdict.PASS)}),
+    )
+    before = evaluation._generation_prompt_versions()
+    outputs = [builder(**kwargs) for builder, kwargs in calls]
+    getsource = inspect.getsource
+    targets = {builder for builder, _ in calls}
+
+    def edited_source(obj: Any) -> str:
+        source = getsource(obj)
+        if obj not in targets:
+            return source
+        if edit == "comment":
+            return source + "\n# 설명만 추가했다.\n"
+        module = ast.parse(textwrap.dedent(source))
+        function = cast(ast.FunctionDef, module.body[0])
+        if edit == "docstring":
+            assert ast.get_docstring(function) is not None
+            function.body[0] = ast.Expr(value=ast.Constant(value="설명만 다듬었다."))
+        else:
+            function.name = "renamed_internal_helper"
+        return ast.unparse(module)
+
+    monkeypatch.setattr(inspect, "getsource", edited_source)
+    assert [builder(**kwargs) for builder, kwargs in calls] == outputs
+    assert evaluation._generation_prompt_versions() == before
+
+
+@pytest.mark.parametrize("name", ["intent", "sql", "draft", "rewrite"])
+@pytest.mark.parametrize("field", ["SYSTEM_PROMPT", "JSON_SCHEMA"])
+def test_생성_문면과_스키마의_실제_변경은_해당_지문만_바꾼다(
+    monkeypatch: pytest.MonkeyPatch, name: str, field: str
+) -> None:
+    from reply_gate import draft, evidence, query_rewrite
+
+    module = {"intent": evidence, "sql": evidence, "draft": draft, "rewrite": query_rewrite}[name]
+    before = evaluation._generation_prompt_versions()
+    attribute = f"{name.upper()}_{field}"
+    value = getattr(module, attribute)
+    changed = value + "\n변경된 안내" if field == "SYSTEM_PROMPT" else {**value, "title": "변경"}
+    monkeypatch.setattr(module, attribute, changed)
+    after = evaluation._generation_prompt_versions()
+    assert {key for key in before if before[key] != after[key]} == {f"{name}_prompt_version"}
+
+
+@pytest.mark.parametrize(
+    ("name", "branch"),
+    [
+        ("intent", "normal"),
+        ("intent", "order_ref"),
+        ("intent", "retry"),
+        ("intent", "retry_without_output"),
+        ("sql", "normal"),
+        ("sql", "retry"),
+        ("sql", "retry_without_output"),
+        ("draft", "normal"),
+        ("draft", "regenerate"),
+        ("draft", "judge_detail"),
+        ("rewrite", "normal"),
+    ],
+)
+def test_생성_사용자_문면의_각_실행_분기가_해당_지문을_바꾼다(
+    monkeypatch: pytest.MonkeyPatch, name: str, branch: str
+) -> None:
+    """소스만 바꾸는 대조가 아니라 실제 도달한 출력만 바꿔 탐침의 분기 누락을 잡는다."""
+    from reply_gate import draft, evidence, query_rewrite
+
+    module = {"intent": evidence, "sql": evidence, "draft": draft, "rewrite": query_rewrite}[name]
+    attribute = f"build_{name}_user_prompt"
+    original = getattr(module, attribute)
+    before = evaluation._generation_prompt_versions()
+    changed_outputs: list[str] = []
+
+    def changed(**kwargs: Any) -> str:
+        output = str(original(**kwargs))
+        matches = {
+            "normal": not any(
+                kwargs.get(key) for key in ("previous_error", "reject_reasons", "judge_result")
+            ),
+            "order_ref": bool(kwargs.get("order_no")) and not kwargs.get("previous_error"),
+            "retry": kwargs.get("previous_error") is not None,
+            "retry_without_output": kwargs.get("previous_error") is not None
+            and not kwargs.get("previous_sql")
+            and not kwargs.get("previous_output"),
+            "regenerate": bool(kwargs.get("reject_reasons")) and kwargs.get("judge_result") is None,
+            "judge_detail": kwargs.get("judge_result") is not None,
+        }
+        if matches[branch]:
+            changed_outputs.append(output)
+            return output + "\n변경된 사용자 안내"
+        return output
+
+    monkeypatch.setattr(module, attribute, changed)
+    after = evaluation._generation_prompt_versions()
+    assert changed_outputs
+    assert {key for key in before if before[key] != after[key]} == {f"{name}_prompt_version"}
+
+
+@pytest.mark.parametrize("part", ["rejected_claim", "contradiction", "passed_claim_filter"])
+def test_L2_재생성_세부의_실제_판정_포맷이_초안_지문에_실린다(
+    monkeypatch: pytest.MonkeyPatch, part: str
+) -> None:
+    from reply_gate import draft
+    from reply_gate.contracts import JudgeResult, Verdict
+
+    original = draft._format_judge_detail
+    before = evaluation._generation_prompt_versions()
+    seen: list[JudgeResult] = []
+
+    def changed(result: JudgeResult) -> str:
+        seen.append(result)
+        if part == "rejected_claim":
+            return original(replace(result, claim_judgments=()))
+        if part == "contradiction":
+            return original(replace(result, contradictions=()))
+        return original(result) + "\n".join(
+            item.explanation for item in result.claim_judgments if item.verdict is Verdict.PASS
+        )
+
+    monkeypatch.setattr(draft, "_format_judge_detail", changed)
+    after = evaluation._generation_prompt_versions()
+    assert seen
+    assert any(item.verdict is Verdict.REJECT for result in seen for item in result.claim_judgments)
+    assert any(item.verdict is Verdict.PASS for result in seen for item in result.claim_judgments)
+    assert any(result.contradictions for result in seen)
+    assert {key for key in before if before[key] != after[key]} == {"draft_prompt_version"}
+
+
+@pytest.mark.parametrize("formatter", ["describe_whitelist", "describe_allowed_functions"])
+def test_SQL_안내_포맷의_실제_출력_변경은_SQL_지문에_실린다(
+    monkeypatch: pytest.MonkeyPatch, formatter: str
+) -> None:
+    from reply_gate import evidence
+
+    before = evaluation._generation_prompt_versions()
+    original = getattr(evidence, formatter)
+
+    def changed(*args: Any, **kwargs: Any) -> str:
+        return str(original(*args, **kwargs)) + "\n변경된 SQL 안내"
+
+    monkeypatch.setattr(evidence, formatter, changed)
+    after = evaluation._generation_prompt_versions()
+    assert {key for key in before if before[key] != after[key]} == {"sql_prompt_version"}
+
+
+def test_모든_기각_사유의_재생성_지침이_초안_지문에_실린다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from reply_gate import draft
+    from reply_gate.contracts import RejectReason
+
+    before = evaluation._generation_prompt_versions()
+    for reason in RejectReason:
+        with monkeypatch.context() as patch:
+            patch.setitem(draft._REJECT_FEEDBACK, reason, "변경된 재생성 지침")
+            after = evaluation._generation_prompt_versions()
+            assert {key for key in before if before[key] != after[key]} == {"draft_prompt_version"}

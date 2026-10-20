@@ -251,6 +251,24 @@ def test_뒷받침_절에는_claim_이_인용한_근거만_실린다() -> None:
         assert item.evidence_text in contradiction_section
 
 
+def test_미인용_모순쌍을_기각_사유로_쓴_판정은_형식_오류다() -> None:
+    """모순 기록과 기각은 다르다. 무관한 환불 조항이 배송 답변을 기각하면 안 된다."""
+    draft = _draft(("국내 배송은 3일 이내에 도착합니다.", (DOMESTIC.id,)))
+    payload = _all_pass_payload(draft)
+    payload["contradictions"] = [
+        {"evidence_id_a": REFUND_7.id, "evidence_id_b": REFUND_30.id, "explanation": "상충."}
+    ]
+    payload["verdict"] = "reject"
+    payload["reject_reasons"] = ["contradictory_evidence"]
+    judge, recorder = _judge([_completion(payload, input_tokens=11, output_tokens=7)])
+
+    with pytest.raises(LLMFormatError) as caught:
+        judge.judge(draft=draft, evidence=(DOMESTIC, REFUND_7, REFUND_30))
+
+    assert len(recorder.calls) == 2
+    assert (caught.value.input_tokens, caught.value.output_tokens) == (22, 14)
+
+
 def test_미인용_근거만으로_이뤄진_모순도_검출된다() -> None:
     """모순 입력이 수집 근거 전체라야 미인용 쌍의 모순이 잡힌다.
 

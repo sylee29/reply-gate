@@ -180,6 +180,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    ignored: tuple[tuple[str, str], ...] = ()
+    if args.embedding_axis:
+        ignored = (("--embedding-model", "embedding_model"), ("--dimensions", "dimensions"))
+    elif args.bge_m3 or not args.live:
+        ignored = (("--embedding-model", "embedding_model"),)
+    rejected = _reject_ignored(args, parser=parser, ignored=ignored, mode="선택한 임베딩 모드는 ")
+    if rejected is not None:
+        return rejected
     if args.chunking_grid:
         return _run_chunking(args, parser=parser)
     rejected = _reject_ignored(

@@ -226,6 +226,7 @@ def test_비밀_필드_목록이_비어_있지_않다() -> None:
     """
     assert set(_비밀_필드_이름()) == {
         "anthropic_api_key",
+        "phone_hmac_secret",
         "openai_api_key",
         "postgres_app_password",
         "postgres_ro_password",
@@ -317,11 +318,11 @@ def _평문으로_꺼내는_자리() -> dict[str, int]:
             and node.func.attr == "get_secret_value"
         )
         if 횟수:
-            자리[경로.name] = 횟수
+            자리[경로.relative_to(_패키지_루트).as_posix()] = 횟수
     return 자리
 
 
-def test_평문으로_꺼내는_자리는_세_모듈_여섯_줄뿐이다() -> None:
+def test_평문으로_꺼내는_자리는_네_모듈_일곱_줄뿐이다() -> None:
     """**꺼내는 자리를 셀 수 있게 두는 것이 이 설계의 요점이다.**
 
     비밀 전용 타입이 막는 것은 실수로 흘러나가는 표시·덤프이지, 값을 꺼내는 것 자체가
@@ -329,15 +330,62 @@ def test_평문으로_꺼내는_자리는_세_모듈_여섯_줄뿐이다() -> No
     아니라 **"꺼내는 자리가 코드에 드러나고 그 수가 늘지 않는다"** 이다.
 
     - `config.py` 2회 — 접속 문자열 조립(앱 계정·read-only 계정)에 쓸 비밀번호를 꺼낸다.
-    - `db.py` 1회 — 조립된 DSN 을 psycopg 에 넘기기 직전. **미해결 24 를 닫으면서 생긴
-      자리다** — 접속 문자열을 `SecretStr` 로 감싼 대가로, 평문이 되는 지점이 "속성을 읽는
-      모든 곳"에서 **이 한 줄**로 좁아졌다.
+    - `db.py` 1회 — 비밀번호를 psycopg 의 개별 연결 인자로 넘기기 직전. DSN 파싱
+      실패가 접속 문자열 전체를 노출하지 않도록 URI 대신 개별 인자를 사용한다.
     - `llm.py` 3회 — SDK 생성자 인자(OpenAI 생성·Anthropic 판정·OpenAI 임베딩).
+    - `pipeline.py` 1회 — 문의 처리 입력의 HMAC-SHA256 키로만 꺼낸다.
 
     새 자리가 생기면 이 검사가 깨진다. 깨졌을 때 할 일은 숫자를 올리는 것이 아니라 **그
     자리가 정말 필요한지 먼저 따지는 것**이다.
     """
-    assert _평문으로_꺼내는_자리() == {"config.py": 2, "db.py": 1, "llm.py": 3}
+    assert _평문으로_꺼내는_자리() == {"config.py": 2, "db.py": 1, "llm.py": 3, "pipeline.py": 1}
+
+
+def test_하위_패키지의_동명_파일도_비밀_추출_자리를_덮어쓰지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """음성 대조 — basename 맵은 a/db.py 와 b/db.py 중 한 파일을 조용히 잃었다."""
+    for relative in ("a/db.py", "b/db.py"):
+        path = tmp_path / relative
+        path.parent.mkdir()
+        path.write_text("secret.get_secret_value()\n", encoding="utf-8")
+    monkeypatch.setattr("tests.test_config_secrets._패키지_루트", tmp_path)
+    assert _평문으로_꺼내는_자리() == {"a/db.py": 1, "b/db.py": 1}
+
+
+def _hmac_키가_해시에만_들어가는가(source: str) -> bool:
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_secret_value"
+    ]
+    if len(calls) != 1:
+        return False
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    node: ast.AST = calls[0]
+    while node in parents:
+        node = parents[node]
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "hmac"
+            and node.func.attr == "new"
+        ):
+            return True
+    return False
+
+
+def test_HMAC_키는_해시에만_꺼내며_출력_우회는_음성대조로_잡는다() -> None:
+    source = (_패키지_루트 / "pipeline.py").read_text(encoding="utf-8")
+    assert _hmac_키가_해시에만_들어가는가(source)
+    assert not _hmac_키가_해시에만_들어가는가(
+        "print(settings.phone_hmac_secret.get_secret_value())"
+    )
+    assert not _hmac_키가_해시에만_들어가는가("hmac.new(b'key', b'payload')")
 
 
 def test_비밀번호가_없으면_접속_문자열에_자격_증명_구획이_없다() -> None:
@@ -351,6 +399,16 @@ def test_비밀번호가_없으면_접속_문자열에_자격_증명_구획이_�
 
 
 # ── 선언값 헬퍼 — 테스트가 개발자의 `.env` 를 재지 않게 한다 ─────────────────
+
+
+def test_세션_임시_HMAC은_DB설정에_전달되고_선언기본값은_비어있다(
+    db_settings: Settings,
+) -> None:
+    """세션 설정 캐시를 먼저 비워야 DB 픽스처에도 임시 키가 보이고 기본값은 불변이다."""
+    session_has_key = bool(db_settings.phone_hmac_secret)
+    declared_has_no_key = not declared_settings().phone_hmac_secret
+    assert session_has_key
+    assert declared_has_no_key
 
 
 def test_선언값_헬퍼는_환경도_env_파일도_읽지_않는다(monkeypatch: pytest.MonkeyPatch) -> None:

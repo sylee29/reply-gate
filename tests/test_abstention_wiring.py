@@ -64,7 +64,7 @@ from reply_gate.retrieval_strategies import (
     abstention_statistic,
     truncate_for_gate,
 )
-from reply_gate.testing import LexicalEmbeddingClient
+from reply_gate.testing import LexicalEmbeddingClient, StubEvidenceCollector
 from tests.conftest import declared_settings
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -135,12 +135,6 @@ def test_기본_설정이_결정_0014_가_고른_구성을_그대로_들고_있�
     # 컷과 top_k 는 이 사이클에서 건드리지 않는다.
     assert settings.vector_similarity_threshold == pytest.approx(0.30)
     assert settings.vector_top_k == 5
-
-
-def test_설정이_조립한_게이트가_통계량과_tau_를_그대로_싣는다() -> None:
-    gate = declared_settings().abstention_gate()
-
-    assert gate == AbstentionGate(statistic=AbstentionStatistic.SPREAD, tau=0.06)
 
 
 def test_스위치를_끄면_게이트가_아예_조립되지_않는다() -> None:
@@ -522,10 +516,10 @@ class _PolicyIntentClient:
 
 
 def _policy_collector(*, gate_enabled: bool) -> EvidenceCollector:
-    return EvidenceCollector(
+    return StubEvidenceCollector(
         generation_client=cast(GenerationClient, _PolicyIntentClient()),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(
+        settings=declared_settings(
             vector_similarity_threshold=0.0,
             query_rewrite_enabled=False,
             abstention_gate_enabled=gate_enabled,

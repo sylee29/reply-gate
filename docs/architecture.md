@@ -4,15 +4,15 @@
 
 단일 FastAPI 프로세스가 문의 1건을 **동기로** 끝까지 처리하고, 로컬 Docker Postgres 하나가
 주문 데이터·정책 벡터·처리 기록을 모두 담는다. 외부 의존은 **LLM provider 두 곳**이다 —
-OpenAI(생성·임베딩 공통)와 Anthropic(L2 판정 전용). 계열을 가른 것은 편의가 아니라
-self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
+OpenAI(생성·임베딩 공통)와 Anthropic(L2 판정 전용). 계열을 가른 것은 같은 생성기의 자기 판정 편향을 줄이려는 선택이다.
+독립적 진실성 보증은 아니다(`tracking/decisions/0004`).
 
 ```
 웹 폼 / HTTP 클라이언트
         │  POST /inquiries          │  GET /inquiries/{id}
         ▼                           ▼
   ┌──────────────────── api.py (FastAPI) ────────────────────┐
-  │  커넥션 2개(앱 계정 · RO 계정)를 열어 아래로 넘긴다        │
+  │  앱 연결은 요청마다, RO 연결은 POST 처리에서만 연다        │
   └───────┬──────────────────────────────────┬───────────────┘
           ▼                                  ▼
     pipeline.py ── 루프 제어             records.py ── 처리 기록 저장/복원
@@ -31,7 +31,9 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 **DB 커넥션은 위에서 아래로 인자로 전달된다.** `evidence.py`·`policy_index.py`·`records.py` 는
 `db.py` 를 부르지 않고 이미 열린 커넥션을 받는다 — 그래서 테스트가 롤백 커넥션을 끼워 넣을 수
 있고, text-to-SQL 이 실수로 앱 계정 커넥션을 집을 수 없다. 커넥션을 여는 곳은 `api.py` 와
-실행 스크립트뿐이다.
+실행 스크립트다. 예외로 pipeline의 뒷자리 실패 횟수 갱신과 상품 확인 선점은 별도의 짧은
+앱 연결을 열어 먼저 commit한다. 이후 모델 오류가 잠금 기록이나 선점을 되돌리지 않게 하기 위해서다.
+호출자가 넘긴 근거 수집용 앱 연결을 임의로 commit하지 않는다.
 
 `gate.py` 는 `contracts.py` 만 부르는 잎 노드이고, `contracts.py`·`llm.py`·`order_ref.py` 는
 이 패키지의 어떤 모듈도 부르지 않는다. `config.py` 가 `retrieval_strategies.py` 를 부르는 것은
@@ -41,8 +43,8 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 `pipeline.py` 뿐이다.
 
 **반대 방향은 있다 — 그리고 그것이 "개인정보 정의는 게이트가 단독 소유한다"의 구조적 증거다.**
-`gate.py` 를 import 하는 모듈은 넷이고(`pipeline.py`·`evidence.py`·`sql_guard.py`·
-`evaluation.py`), 그중 `evidence.py`·`sql_guard.py` 는 **`pii_shaped` 하나만** 가져간다.
+`pipeline.py`·`evidence.py`·`sql_guard.py`·`evaluation.py`·`api.py`가 `gate.py`의
+판정·PII 탐지·공개 가림 함수를 재사용한다. 응답 가림도 같은 개인정보 정의를 쓴다.
 패턴 집합의 사본은 어디에도 없다.
 
 ## 구성요소 지도
@@ -51,7 +53,7 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 | 모듈 | 역할 | 의존 |
 |---|---|---|
-| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙, **커넥션 2개 개방** | config, contracts, db, llm, pipeline, policy_index, records |
+| `api.py` | HTTP 표면 5개, 응답 스키마 조립, 웹 폼 서빙, **앱 연결 개방·POST 처리에서 RO 연결 개방** | config, contracts, db, llm, pipeline, policy_index, records |
 | `pipeline.py` | 접수 검증 → 근거 수집 → 초안 → L1 → L2 → 종결. **재생성 상한과 층 결합을 강제하는 곳** | config, contracts, draft, evidence, gate, judge, llm, order_ref, retrieval_strategies |
 | `evidence.py` | 의도 분류(LLM) · 질의 재작성 조율 · 정책 검색 · **근거 채택(기권 게이트 → 절대 하한)** · 주문 존재성 선검사 · text-to-SQL 조율 | config, contracts, gate, llm, order_ref, policy_index, query_rewrite, retrieval_strategies, sql_guard |
 | `sql_guard.py` | 생성된 SQL 을 실행 전에 파싱·검증. 화이트리스트·주문 범위·함수·잠금절·**형변환 대상 타입 허용 목록**·**PII allowlist 출력 유래 판정**(패턴 집합은 `gate.pii_shaped` 를 부르기만 한다) | gate, order_ref |
@@ -72,7 +74,7 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 | `regression_guard.py` | 회귀 판정 — 이중 기준선 대조(승격=구속 / 직전 라이브=경보), 조건 지문, 비악화 두 겹 | (없음 — 입력은 리포트 JSON 그대로다) |
 | `evaluation.py` | 측정 1(픽스처)·측정 2(골든셋)·측정 3(판정 픽스처) 산출, 리포트 생성 | contracts, gate, judge, llm, pipeline, policy_index, query_rewrite, regression_guard, retrieval_labels, retrieval_strategies, sql_guard |
 | `testing.py` | 결정론 대역 — 어휘 임베딩·판정(`StubJudge`)·대역 파이프라인 조립기 | config, contracts, draft, evidence, judge, llm, pipeline |
-| `config.py` | 환경 변수 설정, DSN 조립, **채택 축 구성(컷·`top_k`·기권 게이트)** 소유 | retrieval_strategies |
+| `config.py` | 환경 변수 설정, 비밀 타입과 연결 인자 구성, **채택 축 구성(컷·`top_k`·기권 게이트)** 소유 | retrieval_strategies |
 
 `records.py` 가 `pipeline`·`evidence` 를 부르는 것은 **자료형 때문**이다 — 저장 대상인
 `ProcessedInquiry`·근거 스냅샷의 정의가 거기 있다. 반대 방향(파이프라인이 저장을 부르는 것)은
@@ -84,7 +86,15 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 ## 대표 흐름 — 주문 문의 1건
 
-1. `POST /inquiries {order_no, content}` → `api.py` 가 `pipeline.accept_inquiry` 로 넘긴다.
+`pipeline.run`은 의도 분류 전에 주문번호가 있는 모든 문의를 확인한다. 뒷자리 성공은 기존
+흐름으로, 생략·실재 주문은 상품명 확인 질문을 저장하고 대기 응답으로 끝낸다. 없는 주문·
+불일치·잠금은 같은 인계이며 분류·정책 검색을 부르지 않는다.
+`POST /inquiries/{id}/confirm`은 대기 행을 원자적으로 선점하고 true일 때만 아래 의도 분류부터
+이어 간다. 선점은 별도 짧은 트랜잭션으로 먼저 확정하며, 이후 오류도 선점을 되돌리지 않는다. 기존 ID의 결과·근거·시도 갱신은 한 트랜잭션이다. 개인정보 없는 경로의 축소 SQL
+화이트리스트는 근거 수집까지 전달하고, L1에만 빈 PII 허용목록을 넘긴다. 초안·L2에는 허용된
+근거를 그대로 유지한다. 실패 횟수는 앱 전용 DB 표에서 행 잠금으로 직렬화한다.
+
+1. `POST /inquiries {order_no, content, phone_last4?}` → `api.py` 가 `pipeline.accept_inquiry` 로 넘긴다.
    주문번호 형식이 틀리면 여기서 **422 로 끝난다** — 파이프라인에 들어가지 않는다.
 2. 문의 ID(UUID)를 **근거 수집 전에** 만든다. SQL 근거 ID 가 문의 ID 를 품고 DB CHECK 가
    그 형태를 강제하므로 순서를 바꿀 수 없다.
@@ -182,3 +192,12 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 두 provider 를 가른 이유는 비용도 가용성도 아니다: **생성과 같은 계열로 판정하면
 self-judging bias 로 검출률이 오염된다**(`tracking/decisions/0004`·`0007`).
+
+## 저장 기록과 평가 산출의 경계
+
+처리 기록은 문의별 원본 근거·SQL·초안·층별 판정의 감사 자료다. 평가 리포트 전체의 원천은
+아니다. 고정 L1/L2 픽스처·허용 라벨·검색 정답·조건 지문·구간별 지연·캐시 토큰은 별도의
+평가 입력과 실행 중 자료에서 나온다. API는 SQL 결과 행에서 공개 citations를 다시 렌더하고
+실행 SQL을 제외한다. DB 원본은 보존한다. 원문/재작성 검색은 출처 검사부터 반환까지 같은
+statement snapshot에서 수행한다. 평가만 orders/policy_chunks SHARE 잠금과 유한 lock_timeout으로
+조건을 고정하고 finally 해제한다. 정상 문의 처리 중 모델 호출에 이 평가 잠금을 걸지 않는다.

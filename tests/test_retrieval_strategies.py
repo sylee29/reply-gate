@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 
 from reply_gate import retrieval_strategies
-from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError
+from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 from reply_gate.retrieval_strategies import (
     Bm25Hit,
     FusedHit,
@@ -44,7 +44,7 @@ def _fused_candidates() -> tuple[FusedHit, ...]:
     )
 
 
-def test_default_strategy_ladder_is_four_cumulative_compositions() -> None:
+def test_기본_전략_사다리는_누적_조합4종이다() -> None:
     ladder = default_strategy_ladder()
 
     assert [strategy.name for strategy in ladder] == [
@@ -66,7 +66,7 @@ def test_default_strategy_ladder_is_four_cumulative_compositions() -> None:
     ]
 
 
-def test_rewrite_union_keeps_original_as_fallback_and_uses_max_similarity() -> None:
+def test_재작성_합집합은_원문을_남기고_최대_유사도를_쓴다() -> None:
     original = (
         VectorHit(rank=1, evidence_id="policy:original:1", similarity=0.81),
         VectorHit(rank=2, evidence_id="policy:shared:1", similarity=0.62),
@@ -86,7 +86,7 @@ def test_rewrite_union_keeps_original_as_fallback_and_uses_max_similarity() -> N
     assert [hit.rank for hit in merged] == [1, 2, 3]
 
 
-def test_bm25_uses_korean_character_bigrams_for_score_and_rank() -> None:
+def test_BM25는_한글_문자2그램으로_점수와_순위를_낸다() -> None:
     ranked = bm25_rank(
         query="환불",
         documents=(
@@ -106,7 +106,7 @@ def test_bm25_uses_korean_character_bigrams_for_score_and_rank() -> None:
     assert ranked[2].score == 0.0
 
 
-def test_rrf_combines_rankings_and_breaks_ties_by_evidence_id() -> None:
+def test_RRF는_순위를_합치고_동점은_근거ID로_가른다() -> None:
     vector = (
         VectorHit(rank=1, evidence_id="policy:a:1", similarity=0.9),
         VectorHit(rank=2, evidence_id="policy:b:1", similarity=0.8),
@@ -132,7 +132,7 @@ def test_rrf_combines_rankings_and_breaks_ties_by_evidence_id() -> None:
     assert fused[3].rrf_score == pytest.approx(1 / 63)
 
 
-def test_llm_rerank_uses_returned_order_without_sampling_parameters(tmp_path: Path) -> None:
+def test_LLM_리랭크는_샘플링_인자없이_반환된_순서를_쓴다(tmp_path: Path) -> None:
     client = _RecordingGenerationClient(
         [
             JsonCompletion(
@@ -255,7 +255,7 @@ def test_리랭크_캐시는_지시문이_바뀌면_무효화된다(
         JsonCompletion(data={"evidence_ids": ["policy:a:1"]}, input_tokens=1, output_tokens=1),
     ],
 )
-def test_llm_rerank_failure_or_unparseable_output_keeps_previous_order(
+def test_LLM_리랭크_실패나_해석불가_산출은_이전_순서를_유지한다(
     tmp_path: Path, outcome: object
 ) -> None:
     client = _RecordingGenerationClient([outcome])
@@ -278,6 +278,43 @@ def test_llm_rerank_failure_or_unparseable_output_keeps_previous_order(
     assert result.fell_back
     assert result.fallback_reason is not None
     assert not result.served_from_cache
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LLMCallError(
+            stage="retrieval_rerank",
+            reason="refusal",
+            attempts=1,
+            input_tokens=17,
+            output_tokens=9,
+        ),
+        LLMFormatError(
+            stage="retrieval_rerank",
+            detail="invalid JSON",
+            input_tokens=17,
+            output_tokens=9,
+        ),
+    ],
+)
+def test_리랭크_실패_예외의_과금_토큰을_폴백에도_보존한다(
+    tmp_path: Path, error: LLMCallError | LLMFormatError
+) -> None:
+    """실패한 호출의 토큰도 실비용이다 — 결정 0009의 리랭크 집계 계약을 지킨다."""
+    outcome = llm_rerank(
+        query="환불 문의",
+        candidates=_fused_candidates(),
+        policy_texts={"policy:a:1": "A 조항", "policy:b:1": "B 조항", "policy:c:1": "C 조항"},
+        client=cast(GenerationClient, _RecordingGenerationClient([error])),
+        model="gpt-cheap",
+        cache_dir=tmp_path,
+    )
+
+    assert outcome.fell_back
+    assert outcome.hits == _fused_candidates()
+    assert (outcome.input_tokens, outcome.output_tokens) == (17, 9)
+    assert not outcome.served_from_cache
 
 
 def test_리랭크_폴백은_캐시에_기록되지_않는다(tmp_path: Path) -> None:
@@ -323,7 +360,7 @@ def test_리랭크_폴백은_캐시에_기록되지_않는다(tmp_path: Path) ->
     ]
 
 
-def test_llm_rerank_reuses_cache_for_same_input_and_model(tmp_path: Path) -> None:
+def test_LLM_리랭크는_같은_입력과_모델의_캐시를_재사용한다(tmp_path: Path) -> None:
     client = _RecordingGenerationClient(
         [
             JsonCompletion(

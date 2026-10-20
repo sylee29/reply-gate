@@ -19,9 +19,10 @@ venv/
 # Claude Code 로컬 전용 설정 (개인 권한 allowlist — 공유 대상 아님)
 .claude/settings.local.json
 
-# dryforge 작업 공간 (3-doc 본문은 버전관리 대상)
-.dryforge/worktrees/
-.dryforge/backup/
+# dryforge 로컬 작업 공간
+.dryforge/
+# worktrees/ · backups/ 를 포함해 로컬 사이클 자료 전체를 제외한다.
+.scratch/
 
 # 산출물 — 라이브 실측 리포트만 추적한다.
 # 문서가 인용하는 수치의 근거이고, 재생성하려면 과금되는 재실행이 필요하다.

@@ -1,6 +1,7 @@
-"""FastAPI 표면 — 엔드포인트 4개와 응답 스키마 (docs/contracts.md).
+"""FastAPI 표면 — 엔드포인트 5개와 응답 스키마 (docs/contracts.md).
 
 | `POST /inquiries`       | 문의 접수 + 동기 처리 |
+| `POST /inquiries/{id}/confirm` | 상품 확인 + 같은 문의 처리 |
 | `GET  /inquiries/{id}`  | 처리 기록 조회 (저장된 값에서 재구성) |
 | `GET  /`                | 최소 웹 폼 1장 |
 | `GET  /health`          | 헬스 체크 |
@@ -50,6 +51,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
@@ -57,14 +59,17 @@ from typing import Annotated, Any, Self
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from psycopg.rows import DictRow
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, Field, SecretStr, StrictBool, model_validator
 
 from reply_gate.config import Settings, get_settings
-from reply_gate.contracts import GateResult, JudgeResult
+from reply_gate.contracts import EvidenceSource, GateResult, InquiryStatus, JudgeResult
 from reply_gate.db import connect, readonly_connect
+from reply_gate.evidence import render_sql_rows
+from reply_gate.gate import is_quantity_echo, redact_pii
 from reply_gate.llm import (
     EmbeddingClient,
     EmbeddingResult,
@@ -75,6 +80,8 @@ from reply_gate.llm import (
 )
 from reply_gate.pipeline import (
     AttemptRecord,
+    ConfirmationConflict,
+    ConfirmationNotFound,
     InquiryPipeline,
     MissingCredentialsError,
     ProcessedInquiry,
@@ -82,9 +89,11 @@ from reply_gate.pipeline import (
     accept_inquiry,
     build_pipeline,
     new_inquiry_id,
+    require_identity_credentials,
 )
-from reply_gate.policy_index import PolicyIndexProvenanceError
+from reply_gate.policy_index import PolicyIndexEmptyError, PolicyIndexProvenanceError
 from reply_gate.records import load_inquiry, save_inquiry
+from reply_gate.sql_guard import SqlGuardRejection, private_output_columns
 
 __all__ = [
     "InquiryRequest",
@@ -121,16 +130,24 @@ class InquiryRequest(BaseModel):
 
     content: str = Field(description="문의 내용 (필수)")
     order_no: str | None = Field(default=None, description="주문번호 ORD-YYYYMMDD-NNNN (선택)")
+    phone_last4: str | None = Field(default=None, repr=False, description="전화번호 뒷자리 (선택)")
 
     @model_validator(mode="after")
     def _accept(self) -> Self:
         try:
-            accepted = accept_inquiry(content=self.content, order_no=self.order_no)
+            accepted = accept_inquiry(
+                content=self.content, order_no=self.order_no, phone_last4=self.phone_last4
+            )
         except ReceiptError as exc:
             raise ValueError(str(exc)) from exc
         self.content = accepted.content
         self.order_no = accepted.order_no
+        self.phone_last4 = accepted.phone_last4
         return self
+
+
+class ConfirmationRequest(BaseModel):
+    confirmed: StrictBool
 
 
 # ── 응답 ────────────────────────────────────────────────────────────────────
@@ -251,7 +268,7 @@ def _gate_out(result: GateResult | None) -> GateOut | None:
     )
 
 
-def _judge_out(result: JudgeResult | None) -> JudgeOut | None:
+def _judge_out(result: JudgeResult | None, mask: Callable[[str], str]) -> JudgeOut | None:
     """L2 층 내역 → 응답. **미실행이면 `None`** 이고 키는 그대로 남는다.
 
     claim 판정·모순쌍이 0건인 것과 L2 가 아예 돌지 않은 것은 다른 상태다 — 전자는 빈
@@ -264,9 +281,9 @@ def _judge_out(result: JudgeResult | None) -> JudgeOut | None:
         reject_reasons=[reason.value for reason in result.reject_reasons],
         claim_judgments=[
             ClaimJudgmentOut(
-                claim_text=judgment.claim_text,
+                claim_text=mask(judgment.claim_text),
                 verdict=judgment.verdict.value,
-                explanation=judgment.explanation,
+                explanation=mask(judgment.explanation),
             )
             for judgment in result.claim_judgments
         ],
@@ -274,20 +291,88 @@ def _judge_out(result: JudgeResult | None) -> JudgeOut | None:
             ContradictionOut(
                 evidence_id_a=contradiction.evidence_id_a,
                 evidence_id_b=contradiction.evidence_id_b,
-                explanation=contradiction.explanation,
+                explanation=mask(contradiction.explanation),
             )
             for contradiction in result.contradictions
         ],
     )
 
 
-def _attempt_out(attempt: AttemptRecord) -> AttemptOut:
+def _attempt_out(attempt: AttemptRecord, mask: Callable[[str], str]) -> AttemptOut:
     return AttemptOut(
         verdict=attempt.verdict.value,
         reject_reasons=[reason.value for reason in attempt.reject_reasons],
         l1=_gate_out(attempt.l1_result),
-        l2=_judge_out(attempt.l2_result),
+        l2=_judge_out(attempt.l2_result, mask),
     )
+
+
+def _public_evidence(
+    processed: ProcessedInquiry,
+) -> tuple[list[CitationOut], Callable[[str], str]]:
+    """원본 스냅샷을 읽기만 하고 응답용 사본에서만 공개 범위를 줄인다."""
+    allowed = (
+        processed.answer or ""
+        if processed.status is InquiryStatus.ANSWERED
+        and processed.verification_method != "product_confirm"
+        else ""
+    )
+    snapshots = {snapshot.evidence_id: snapshot for snapshot in processed.sql_snapshots}
+    private_columns: dict[str, frozenset[str]] = {}
+    private_values: set[str] = set()
+    unknown_sql = False
+    for item in processed.evidence:
+        if item.source is not EvidenceSource.SQL:
+            continue
+        snapshot = snapshots.get(item.id)
+        if snapshot is None:
+            unknown_sql = True
+            continue
+        try:
+            columns = frozenset(private_output_columns(snapshot.query_sql))
+        except SqlGuardRejection:
+            unknown_sql = True
+            continue
+        private_columns[item.id] = columns
+        private_values.update(
+            str(value)
+            for row in snapshot.result_rows
+            for key, value in row.items()
+            if key in columns and value is not None and str(value)
+        )
+
+    def mask(text: str) -> str:
+        return redact_pii(text, allowed_text=allowed, private_values=tuple(private_values))
+
+    citations: list[CitationOut] = []
+    for item in processed.evidence:
+        if item.source is EvidenceSource.POLICY:
+            content = mask(item.content)
+        elif item.id not in private_columns:
+            # 예전 기록이나 분석 불가 SQL을 현재 주문 재조회/추정으로 복구하지 않는다.
+            content = "[가림: 저장된 SQL 근거의 출력 유래를 확인할 수 없음]"
+        else:
+            snapshot = snapshots[item.id]
+            columns = private_columns[item.id]
+            rows = tuple(
+                {
+                    key: (
+                        value
+                        if key not in columns and is_quantity_echo(str(value), answer_text=allowed)
+                        else mask("= " + str(value)).removeprefix("= ")
+                        if value is not None
+                        else None
+                    )
+                    for key, value in sorted(row.items())
+                }
+                for row in snapshot.result_rows
+            )
+            content = render_sql_rows(rows, mask_key=mask)
+        citations.append(CitationOut(id=item.id, source=item.source.value, content=content))
+    # 상품 확인의 오래된 분석 불가 기록은 L2 설명의 비패턴 값을 증명할 수 없다.
+    if unknown_sql and processed.verification_method == "product_confirm":
+        return citations, lambda text: "[가림]" if text else text
+    return citations, mask
 
 
 class InquiryResponse(BaseModel):
@@ -309,19 +394,23 @@ class InquiryResponse(BaseModel):
 
     @classmethod
     def of(cls, processed: ProcessedInquiry) -> InquiryResponse:
+        citations, mask = _public_evidence(processed)
+        restrict_answer = processed.verification_method == "product_confirm"
         return cls(
             inquiry_id=processed.inquiry_id,
             status=processed.status.value,
-            answer=processed.answer,
+            answer=(
+                mask(processed.answer) if restrict_answer and processed.answer else processed.answer
+            ),
             claims=[
-                ClaimOut(text=claim.text, citation_ids=list(claim.citation_ids))
+                ClaimOut(
+                    text=mask(claim.text) if restrict_answer else claim.text,
+                    citation_ids=list(claim.citation_ids),
+                )
                 for claim in processed.claims
             ],
-            citations=[
-                CitationOut(id=item.id, source=item.source.value, content=item.content)
-                for item in processed.evidence
-            ],
-            attempts=[_attempt_out(attempt) for attempt in processed.attempts],
+            citations=citations,
+            attempts=[_attempt_out(attempt, mask) for attempt in processed.attempts],
             escalation_reason=(
                 None if processed.escalation_reason is None else processed.escalation_reason.value
             ),
@@ -348,7 +437,7 @@ class HealthResponse(BaseModel):
 
 
 class InquiryService:
-    """요청 1건의 수명 동안 살아 있는 조립품 — 파이프라인 + 커넥션 2개.
+    """요청 수명의 앱 커넥션 + 처리 시점에 여는 read-only 커넥션과 파이프라인.
 
     문의 ID 는 **근거 수집 전에** 확정한다: SQL 근거 ID 가 그 값을 품고, DB CHECK 가
     둘의 일치를 강제하기 때문이다.
@@ -366,21 +455,36 @@ class InquiryService:
         *,
         open_pipeline: Callable[[], InquiryPipeline],
         app_conn: psycopg.Connection[DictRow],
-        readonly_conn: psycopg.Connection[DictRow],
+        open_readonly: Callable[[], AbstractContextManager[psycopg.Connection[DictRow]]],
     ) -> None:
         self._open_pipeline = open_pipeline
         self._app_conn = app_conn
-        self._readonly_conn = readonly_conn
+        self._open_readonly = open_readonly
 
-    def process(self, *, content: str, order_no: str | None) -> ProcessedInquiry:
-        processed = self._open_pipeline().run(
-            inquiry_id=new_inquiry_id(),
-            content=content,
-            order_no=order_no,
-            app_conn=self._app_conn,
-            readonly_conn=self._readonly_conn,
-        )
+    def process(
+        self, *, content: str, order_no: str | None, phone_last4: str | None = None
+    ) -> ProcessedInquiry:
+        with self._open_readonly() as readonly_conn:
+            processed = self._open_pipeline().run(
+                inquiry_id=new_inquiry_id(),
+                content=content,
+                order_no=order_no,
+                app_conn=self._app_conn,
+                readonly_conn=readonly_conn,
+                phone_last4=phone_last4,
+            )
         save_inquiry(conn=self._app_conn, processed=processed)
+        return processed
+
+    def confirm(self, *, inquiry_id: str, confirmed: bool) -> ProcessedInquiry:
+        with self._open_readonly() as readonly_conn:
+            processed = self._open_pipeline().confirm(
+                inquiry_id=inquiry_id,
+                confirmed=confirmed,
+                app_conn=self._app_conn,
+                readonly_conn=readonly_conn,
+            )
+        save_inquiry(conn=self._app_conn, processed=processed, update_pending=True)
         return processed
 
     def fetch(self, inquiry_id: str) -> ProcessedInquiry | None:
@@ -487,14 +591,33 @@ def get_service() -> ServiceOpener:
 
     @contextmanager
     def _open() -> Iterator[InquiryService]:
-        """요청마다 커넥션 2개를 열고 닫는다 (text-to-SQL 은 반드시 read-only 계정으로)."""
-        with connect(settings=settings) as app_conn, readonly_connect(settings=settings) as ro:
-            yield InquiryService(open_pipeline=_pipeline, app_conn=app_conn, readonly_conn=ro)
+        """앱 연결은 요청마다, RO 연결은 process 안에서 열고 닫는다."""
+        with connect(settings=settings) as app_conn:
+            yield InquiryService(
+                open_pipeline=_pipeline,
+                app_conn=app_conn,
+                open_readonly=lambda: readonly_connect(settings=settings),
+            )
 
     return _open
 
 
 ServiceDep = Annotated[ServiceOpener, Depends(get_service)]
+
+
+@app.exception_handler(RequestValidationError)
+def request_validation_handler(request: Request, exc: RequestValidationError) -> Response:
+    """오류 위치와 종류만 반환한다. input/ctx/원문 메시지는 민감 입력을 반사할 수 있다."""
+    del request
+    detail = [
+        {"loc": error["loc"], "type": error["type"], "msg": "입력 형식을 확인하세요"}
+        for error in exc.errors()
+    ]
+    return Response(
+        status_code=422,
+        media_type="application/json",
+        content=json.dumps({"detail": detail}, ensure_ascii=True, allow_nan=False),
+    )
 
 
 @app.exception_handler(MissingCredentialsError)
@@ -504,9 +627,10 @@ def missing_credentials_handler(request: Request, exc: Exception) -> JSONRespons
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
+@app.exception_handler(PolicyIndexEmptyError)
 @app.exception_handler(PolicyIndexProvenanceError)
 def stale_policy_index_handler(request: Request, exc: Exception) -> JSONResponse:
-    """낡은 정책 인덱스도 **설정 오류(503)** 다 — 자격 증명 부재와 같은 계열이다.
+    """미적재·낡은 정책 인덱스는 **설정 오류(503)** 다 — 자격 증명 부재와 같은 계열이다.
 
     `no_evidence` 인계로 바꾸면 "검색이 못 찾았다"로 집계되어, 재색인을 빠뜨린 운영 실수가
     검색 품질 지표로 위장한다. 처리 기록은 커넥션 롤백으로 남지 않는다.
@@ -542,6 +666,7 @@ def _require_judge_credentials() -> None:
     무관하다 — 그 경로는 이 함수에 닿기 전에 끝난다.
     """
     settings = get_settings()
+    require_identity_credentials(settings)
     if settings.l2_enabled and not settings.anthropic_api_key:
         raise MissingCredentialsError(
             "ANTHROPIC_API_KEY 가 설정되지 않았다. L2 판정이 켜져 있으면 판정 없이 답변을 "
@@ -559,7 +684,26 @@ def create_inquiry(payload: InquiryRequest, open_service: ServiceDep) -> Inquiry
     # 처리 기록을 남기기 전에 끝낸다 — 설정 오류는 인계(`llm_call_failed`)가 아니다.
     _require_judge_credentials()
     with open_service() as service:
-        processed = service.process(content=payload.content, order_no=payload.order_no)
+        processed = service.process(
+            content=payload.content, order_no=payload.order_no, phone_last4=payload.phone_last4
+        )
+    return InquiryResponse.of(processed)
+
+
+@app.post("/inquiries/{inquiry_id}/confirm")
+def confirm_inquiry(
+    inquiry_id: str, payload: ConfirmationRequest, open_service: ServiceDep
+) -> InquiryResponse:
+    _require_judge_credentials()
+    try:
+        with open_service() as service:
+            processed = service.confirm(inquiry_id=inquiry_id, confirmed=payload.confirmed)
+    except ConfirmationNotFound as exc:
+        raise HTTPException(status_code=404, detail="그런 문의가 없다") from exc
+    except ConfirmationConflict as exc:
+        raise HTTPException(
+            status_code=409, detail="확인 대기가 아니거나 확인 시간이 만료되었다"
+        ) from exc
     return InquiryResponse.of(processed)
 
 

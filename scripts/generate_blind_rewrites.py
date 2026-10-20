@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Final
@@ -95,37 +96,65 @@ def main(argv: list[str] | None = None) -> int:
         print("OPENAI_API_KEY 가 비어 있다. .env 에 값을 채운 뒤 다시 실행한다.", file=sys.stderr)
         return 2
 
-    client = OpenAIGenerationClient(
-        api_key=settings.openai_api_key, model=settings.generation_model
-    )
-    note = (
-        f"생성 모델 {settings.generation_model} 이 문의 원문만 보고 만든 재작성이다 "
-        "— 정책 문서·검색 정답 라벨을 입력으로 받지 않았다."
-    )
-
-    lines: list[str] = []
-    for case in cases:
-        try:
-            rewritten = rewrite_one(
-                client=client, inquiry=case.content, effort=settings.generation_effort
-            )
-        except (LLMCallError, LLMFormatError) as exc:
-            print(f"{case.id} 재작성 실패: {exc}", file=sys.stderr)
-            return 1
-        lines.append(
-            json.dumps(
-                {
-                    "id": case.id,
-                    "original": case.content,
-                    "rewritten": rewritten,
-                    "note": note,
-                },
-                ensure_ascii=False,
-            )
+    # 출력 위치·권한을 과금 전에 검증하고 독점 예약한다. exists 검사와 쓰기 사이의
+    # 경쟁도 x 모드가 막는다. 모델 실패·사용자 중단이면 불완전 산출을 정리한다.
+    try:
+        output = args.out.open("x", encoding="utf-8")
+    except OSError as exc:
+        print(f"산출 경로를 만들 수 없다: {args.out} ({type(exc).__name__})", file=sys.stderr)
+        return 2
+    complete = False
+    reservation = os.fstat(output.fileno())
+    try:
+        client = OpenAIGenerationClient(
+            api_key=settings.openai_api_key, model=settings.generation_model
         )
-        print(f"{case.id}: {rewritten}")
+        note = (
+            f"생성 모델 {settings.generation_model} 이 문의 원문만 보고 만든 재작성이다 "
+            "— 정책 문서·검색 정답 라벨을 입력으로 받지 않았다."
+        )
 
-    args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        lines: list[str] = []
+        for case in cases:
+            try:
+                rewritten = rewrite_one(
+                    client=client, inquiry=case.content, effort=settings.generation_effort
+                )
+            except (LLMCallError, LLMFormatError) as exc:
+                print(f"{case.id} 재작성 실패: {exc}", file=sys.stderr)
+                return 1
+            lines.append(
+                json.dumps(
+                    {
+                        "id": case.id,
+                        "original": case.content,
+                        "rewritten": rewritten,
+                        "note": note,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            print(f"{case.id}: {rewritten}")
+
+        output.write("\n".join(lines) + "\n")
+        output.flush()
+        complete = True
+    finally:
+        try:
+            output.close()
+        except BaseException:
+            complete = False
+            raise
+        finally:
+            if not complete:
+                try:
+                    current = args.out.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    # 예약 이후 다른 작성자가 교체한 파일은 지우지 않는다.
+                    if (current.st_dev, current.st_ino) == (reservation.st_dev, reservation.st_ino):
+                        args.out.unlink()
     print(f"\n{len(lines)}건 생성 완료 → {args.out}")
     return 0
 

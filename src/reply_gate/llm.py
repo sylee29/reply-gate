@@ -33,6 +33,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
+from math import isfinite
 from time import perf_counter
 from typing import Any, Protocol, cast
 
@@ -41,6 +42,8 @@ import openai
 from anthropic.types import Message
 from openai.types.responses import Response
 from pydantic import SecretStr
+
+from reply_gate.contracts import has_unstorable_characters
 
 __all__ = [
     "AnthropicGenerationClient",
@@ -56,6 +59,7 @@ __all__ = [
     "OptionalEmbeddingDependencyError",
     "accumulate_optional_ms",
     "accumulate_optional_tokens",
+    "validate_embedding_vectors",
 ]
 
 #: 최초 호출 + 재시도 1회 = 최대 2회 전송 시도 (docs/standards.md "재시도 상한").
@@ -185,6 +189,11 @@ class LLMCallError(RuntimeError):
 class LLMFormatError(ValueError):
     """구조화 출력이 기대 형식과 다름. 재시도 정책은 호출자가 정한다.
 
+    원문에 NUL/lone surrogate가 있으면 저장 가능한 진단 표현으로 보존한다:
+    [Unicode escaped raw text] 뒤 ASCII 표현을 unicode_escape로 해석하면 코드포인트가
+    정확히 복원된다. JSON 재해석과 달리 literal surrogate pair 두 개를 하나로 합치지 않는다.
+    안전한 원문은 접두어처럼 보여도 그대로 둔다. 접두어만 보고 자동 복원하지 않는다.
+
     원문(`raw_text`)과 토큰 사용량을 함께 실어 보낸다 — 초안 생성은 재시도하지 않고
     이 산출을 그대로 L1 에 넘겨 `schema_violation` 으로 판정시키기 때문이다
     (docs/standards.md "재시도 상한").
@@ -212,7 +221,11 @@ class LLMFormatError(ValueError):
         super().__init__(f"구조화 출력 형식 불일치 (stage={stage}): {detail}")
         self.stage = stage
         self.detail = detail
-        self.raw_text = raw_text
+        self.raw_text = (
+            "[Unicode escaped raw text] " + raw_text.encode("unicode_escape").decode("ascii")
+            if has_unstorable_characters(raw_text)
+            else raw_text
+        )
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.transport_attempts = transport_attempts
@@ -258,6 +271,33 @@ class EmbeddingResult:
     total_tokens: int
     #: 질의 임베딩 구간의 시간. 부를 것이 없어 즉시 돌아온 호출은 0.0 이다(측정값이다).
     elapsed_ms: float = 0.0
+
+
+def validate_embedding_vectors(
+    vectors: Sequence[Sequence[float]], *, count: int, dimensions: int
+) -> None:
+    """provider·캐시·주입 임베더에 같은 수치 계약을 적용한다."""
+    if len(vectors) != count:
+        raise ValueError("임베딩 개수가 입력 텍스트 수와 다르다")
+    for vector in vectors:
+        if len(vector) != dimensions:
+            raise ValueError("임베딩 차원이 구성과 다르다")
+        try:
+            invalid = any(
+                isinstance(value, bool) or not isinstance(value, int | float) or not isfinite(value)
+                for value in vector
+            )
+        except OverflowError:
+            invalid = True
+        if invalid:
+            raise ValueError("임베딩 값은 유한한 숫자여야 한다")
+        if not any(value != 0 for value in vector):
+            raise ValueError("임베딩은 영벡터일 수 없다")
+        # downstream 코사인은 제곱합을 쓴다. 좌표만 유한해도 overflow/underflow로
+        # 무효한 검색 점수가 될 수 있으므로 캐시·DB에 채택하기 전에 같은 연산을 검증한다.
+        squared_norm = sum(float(value) * float(value) for value in vector)
+        if not isfinite(squared_norm) or squared_norm == 0:
+            raise ValueError("임베딩 노름을 유한한 양수로 계산할 수 없다")
 
 
 class GenerationClient(Protocol):
@@ -351,6 +391,38 @@ def _call_with_one_retry[T](
     ) from last
 
 
+def _finite_json_float(value: str) -> float:
+    """비표준 NaN/Infinity와 유효 숫자 표기의 float 오버플로를 함께 거부한다."""
+    number = float(value)
+    if not isfinite(number):
+        raise ValueError("JSON 숫자는 유한해야 한다")
+    return number
+
+
+def _require_storable_json_strings(data: object) -> None:
+    """JSON의 모든 문자열을 검사한다. 깊은 입력도 추가 재귀 한계를 만들지 않는다."""
+    pending = [data]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            if has_unstorable_characters(value):
+                raise ValueError("JSON 문자열에 저장할 수 없는 문자가 있다")
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON 객체에 중복 키가 있다")
+        result[key] = value
+    return result
+
+
 def _parse_json_completion(
     *,
     stage: str,
@@ -380,8 +452,15 @@ def _parse_json_completion(
             elapsed_ms=elapsed_ms,
         )
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
+        data = json.loads(
+            text,
+            parse_constant=_finite_json_float,
+            parse_float=_finite_json_float,
+            object_pairs_hook=_unique_json_object,
+        )
+        _require_storable_json_strings(data)
+    except (ValueError, RecursionError) as exc:
+        # JSONDecodeError뿐 아니라 정수 자릿수·중첩 깊이 제한도 모델 산출의 파싱 실패다.
         raise LLMFormatError(
             stage=stage,
             detail=f"JSON 파싱 실패: {exc}",
@@ -462,10 +541,6 @@ class OpenAIGenerationClient:
             timeout=timeout,
         )
         self._model = model
-
-    @property
-    def model(self) -> str:
-        return self._model
 
     def complete_json(
         self,
@@ -757,9 +832,16 @@ class OpenAIEmbeddingClient:
             is_transport_error=_is_openai_transport_error,
             is_api_error=_is_openai_api_error,
         )
+        indices = [item.index for item in response.data]
+        if any(type(index) is not int for index in indices) or sorted(indices) != list(
+            range(len(inputs))
+        ):
+            raise ValueError("임베딩 응답 index는 입력 범위와 정확히 일치해야 한다")
         ordered = sorted(response.data, key=lambda item: item.index)
+        vectors = [list(item.embedding) for item in ordered]
+        validate_embedding_vectors(vectors, count=len(inputs), dimensions=self._dimensions)
         return EmbeddingResult(
-            vectors=[list(item.embedding) for item in ordered],
+            vectors=vectors,
             total_tokens=response.usage.total_tokens,
             elapsed_ms=elapsed,
         )
@@ -819,8 +901,11 @@ class BgeM3EmbeddingClient:
         for vector in raw:
             if not isinstance(vector, list) or len(vector) != self.DIMENSIONS:
                 raise ValueError(f"BGE-M3 임베딩은 {self.DIMENSIONS}차원이어야 한다")
-            if any(not isinstance(value, int | float) for value in vector):
+            if any(
+                isinstance(value, bool) or not isinstance(value, int | float) for value in vector
+            ):
                 raise ValueError("BGE-M3 임베딩 값은 숫자여야 한다")
+            validate_embedding_vectors([vector], count=1, dimensions=self.DIMENSIONS)
             vectors.append([float(value) for value in vector])
         # 로컬 추론은 provider 토큰 과금이 없으므로 기존 EmbeddingResult 계약에서 0이다.
         # **시간은 0 이 아니다** — 과금이 없다는 것과 시간을 쓰지 않았다는 것은 다르다.

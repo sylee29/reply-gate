@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from scripts import compare_retrieval
 
 from reply_gate.retrieval_eval import (
@@ -174,3 +175,30 @@ class _FakeLocalEmbedder:
     @property
     def dimensions(self) -> int:
         return self.DIMENSIONS
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--live", "--embedding-axis", "--embedding-model", "requested-model"],
+        ["--live", "--embedding-axis", "--dimensions", "256"],
+        ["--bge-m3", "--embedding-model", "requested-model"],
+        ["--stub-embedding", "--embedding-model", "requested-model"],
+        ["--stub-embedding", "--chunking-grid", "--embedding-model", "requested-model"],
+    ],
+)
+def test_실행_모드가_무시하는_명시_모델_옵션은_호출_전에_거부한다(
+    argv: list[str], monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """고정 모델 축이나 대역 모드가 사용자의 명시 모델 요청을 조용히 버리지 않는다."""
+    calls = _capture_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(compare_retrieval, "_run_axis", lambda **kwargs: 0)
+    monkeypatch.setattr(compare_retrieval, "BgeM3EmbeddingClient", _FakeLocalEmbedder)
+    monkeypatch.setattr(
+        compare_retrieval,
+        "run_chunking_comparison",
+        lambda **kwargs: ReportPaths(tmp_path / "x.md", tmp_path / "x.json"),
+    )
+    assert compare_retrieval.main(argv) == 2
+    assert "읽지 않는다" in capsys.readouterr().err
+    assert calls == []

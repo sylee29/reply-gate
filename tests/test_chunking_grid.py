@@ -24,6 +24,7 @@ from reply_gate.policy_index import PlantedKind, PolicyChunk, PolicyDocument, lo
 from reply_gate.retrieval_eval import (
     DEFAULT_CHUNKING_STRATEGIES,
     DEFAULT_CONTAINMENT_SWEEP,
+    DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
     ChunkingKind,
     ChunkingStrategy,
     CorpusUnit,
@@ -32,6 +33,7 @@ from reply_gate.retrieval_eval import (
     RetrievalQuery,
     build_policy_sources,
     chunk_policy_sources,
+    load_rewritten_queries,
     map_units_to_clauses,
     retrieve_cases,
     run_chunking_comparison,
@@ -86,7 +88,7 @@ class _RecordingEmbedder:
     """어휘 대역을 감싸 임베딩 대상 텍스트를 기록한다."""
 
     def __init__(self, dimensions: int = 64) -> None:
-        self._inner = LexicalEmbeddingClient(dimensions=dimensions)
+        self._inner = LexicalEmbeddingClient(dimensions=dimensions, model="lexical-2gram-v1")
         self.texts: list[str] = []
 
     @property
@@ -279,7 +281,7 @@ def test_조항_단위_격자는_기존_벡터_채점과_같은_수치를_낸다
     cases = load_golden_set()
     labels = load_retrieval_labels()
     config = RetrievalEvalConfig(model="lexical-2gram-v1", dimensions=64, top_k=5, cutoff=0.10)
-    embedder = LexicalEmbeddingClient(dimensions=64)
+    embedder = LexicalEmbeddingClient(dimensions=64, model="lexical-2gram-v1")
     queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
     sources = build_policy_sources(documents)
     units = chunk_policy_sources(sources, _CLAUSE_ONLY)
@@ -318,7 +320,7 @@ def test_채점은_케이스_부분집합으로_좁힐_수_있다(tmp_path: Path
     retrieved = retrieve_cases(
         queries=tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases),
         policy_texts=tuple((unit.unit_id, unit.embedding_text) for unit in units),
-        embedder=LexicalEmbeddingClient(dimensions=64),
+        embedder=LexicalEmbeddingClient(dimensions=64, model="lexical-2gram-v1"),
         config=config,
         cache_dir=tmp_path / "cache",
     )
@@ -440,7 +442,7 @@ def test_write_chunking_report_는_출력_디렉터리를_만든다(tmp_path: Pa
         documents=load_policy_documents(),
         cases=load_golden_set(),
         labels=load_retrieval_labels(),
-        embedder=LexicalEmbeddingClient(dimensions=64),
+        embedder=LexicalEmbeddingClient(dimensions=64, model="lexical-2gram-v1"),
         model="lexical-2gram-v1",
         dimensions=64,
         is_stub=True,
@@ -459,7 +461,7 @@ def test_인접_판정은_원문_순서에서_계산된다(tmp_path: Path) -> No
         documents=load_policy_documents(),
         cases=load_golden_set(),
         labels=load_retrieval_labels(),
-        embedder=LexicalEmbeddingClient(dimensions=64),
+        embedder=LexicalEmbeddingClient(dimensions=64, model="lexical-2gram-v1"),
         model="lexical-2gram-v1",
         dimensions=64,
         is_stub=True,
@@ -584,3 +586,67 @@ def test_캐시_미적중_0_을_공짜로_읽지_않게_적는다(tmp_path: Path
 
     assert "미적중 0 은" not in first.markdown.read_text(encoding="utf-8")
     assert "미적중 0 은" in second.markdown.read_text(encoding="utf-8")
+
+
+def test_청킹은_oracle_픽스처를_blind로_측정하기_전에_거부한다(tmp_path: Path) -> None:
+    """청킹 통제 질의는 blind만 허용하고 정책 기반 상한을 섞지 않는다."""
+    with pytest.raises(RetrievalConfigurationError, match="blind"):
+        run_chunking_comparison(
+            live=False,
+            rewritten_queries_path=DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
+            cache_dir=tmp_path / "cache",
+            output_dir=tmp_path / "reports",
+        )
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_직접_주입한_청킹_질의는_blind로_표시하지_않는다(tmp_path: Path) -> None:
+    """직접 주입문의 출처를 확인하지 않고 deployable 성능이라고 주장하지 않는다."""
+    grid = run_chunking_grid(
+        documents=load_policy_documents(),
+        cases=load_golden_set(),
+        labels=load_retrieval_labels(),
+        embedder=LexicalEmbeddingClient(dimensions=8, model="lexical-2gram-v1"),
+        model="lexical-2gram-v1",
+        dimensions=8,
+        is_stub=True,
+        cache_dir=tmp_path / "cache",
+        strategies=(_CLAUSE_ONLY,),
+        rewritten_queries=load_rewritten_queries(),
+    )
+    paths = write_chunking_report(grid, output_dir=tmp_path / "reports")
+    payload = json.loads(paths.json.read_text())
+    assert payload["configuration"]["query_conditions"] == ["original", "caller_injected"]
+    assert "blind" not in payload["configuration"]["query_condition_note"]
+    assert "호출자 주입" in paths.markdown.read_text()
+
+
+def test_청킹_비용_설명은_단가표_기준일과_환산_미실행을_구분한다(tmp_path: Path) -> None:
+    """달러를 계산하지 않는 것과 저장소에 가격표가 없는 것은 다른 주장이다."""
+    paths = run_chunking_comparison(
+        live=False,
+        dimensions=8,
+        strategies=(_CLAUSE_ONLY,),
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "reports",
+    )
+    payload = json.loads(paths.json.read_text())
+    note = payload["embedding_cost"]["dollar_note"]
+    assert "docs/tracking/pricing.md" in note
+    assert "2026-08-19" in note and "달러 환산은 미실행" in note
+    assert "단가표가 없다" not in note
+    assert note in paths.markdown.read_text()
+
+
+def test_주입_임베더의_모델을_청킹_리포트와_캐시에_추론한다(tmp_path: Path) -> None:
+    paths = run_chunking_comparison(
+        live=True,
+        embedding_client=LexicalEmbeddingClient(dimensions=8, model="stub:local-test"),
+        strategies=(_CLAUSE_ONLY,),
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "reports",
+    )
+    payload = json.loads(paths.json.read_text())
+    assert payload["configuration"]["embedding_model"] == "stub:local-test"
+    cached = [json.loads(p.read_text()) for p in (tmp_path / "cache").glob("*.json")]
+    assert cached and all(row["model"] == "stub:local-test" for row in cached)

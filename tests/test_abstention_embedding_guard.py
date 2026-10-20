@@ -110,6 +110,45 @@ def test_검증된_조건을_명시해도_통과한다() -> None:
     assert gate is not None
 
 
+@pytest.mark.parametrize(
+    ("model", "dimensions"),
+    [("text-embedding-3-large", 1536), ("text-embedding-3-small", 3072)],
+)
+def test_실제_수집기는_주입_임베더의_모델과_차원도_설정에_대조한다(
+    model: str, dimensions: int
+) -> None:
+    """설정만 small로 두고 다른 실제 벡터에 검증된 τ를 쓰는 배선을 막는다."""
+    from reply_gate.api import build_embedding_client, build_generation_client
+
+    settings = declared_settings(query_rewrite_enabled=False)
+    actual = declared_settings(embedding_model=model, embedding_dimensions=dimensions)
+    with pytest.raises(AbstentionGateWiringError, match="임베더"):
+        evidence.EvidenceCollector(
+            generation_client=build_generation_client(settings),
+            embedding_client=build_embedding_client(actual),
+            settings=settings,
+        )
+
+
+@pytest.mark.parametrize("gate_enabled", [False, True])
+def test_실제_수집기는_조건이_맞거나_게이트를_명시적으로_끄면_조립된다(
+    gate_enabled: bool,
+) -> None:
+    """양성 대조: 기본값과 명시 off는 실제 클라이언트를 호출하지 않고 조립된다."""
+    from reply_gate.api import build_embedding_client, build_generation_client
+
+    settings = declared_settings(query_rewrite_enabled=False, abstention_gate_enabled=gate_enabled)
+    actual = (
+        settings if gate_enabled else declared_settings(embedding_model="text-embedding-3-large")
+    )
+    collector = evidence.EvidenceCollector(
+        generation_client=build_generation_client(settings),
+        embedding_client=build_embedding_client(actual),
+        settings=settings,
+    )
+    assert (collector._abstention_gate is not None) is gate_enabled
+
+
 def test_검증_목록이_현행_기본값을_담고_있다() -> None:
     """**음성 대조** — 목록이 비면 아래 거부 검사들은 통과해도 아무것도 지키지 않는다.
 

@@ -22,14 +22,12 @@ from reply_gate.retrieval_eval import (
     DEFAULT_EMBEDDING_CANDIDATES,
     DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
     STUB_EMBEDDING_MODEL,
-    CutoffSweepPoint,
     EmbeddingCandidate,
     EmbeddingProvider,
     RankedHit,
     ReportPaths,
     RetrievalConfigurationError,
     RetrievalEvalConfig,
-    RetrievalEvaluation,
     RetrievalQuery,
     RetrievedCase,
     RewriteCondition,
@@ -38,11 +36,11 @@ from reply_gate.retrieval_eval import (
     evaluate_strategy_ladder,
     retrieve_cases,
     retrieve_strategy_ladder,
+    run_chunking_comparison,
     run_embedding_model_axis,
     run_retrieval_comparison,
     score_retrieval,
     score_strategy_ladder,
-    write_report,
     write_strategy_report,
 )
 from reply_gate.retrieval_labels import RetrievalLabel, load_retrieval_labels
@@ -52,6 +50,7 @@ from reply_gate.testing import LexicalEmbeddingClient
 
 class _FixedEmbedder:
     def __init__(self, vectors: dict[str, list[float]]) -> None:
+        self.model = "fixed"
         self._vectors = vectors
         self.calls: list[tuple[str, tuple[str, ...]]] = []
 
@@ -75,7 +74,7 @@ class _IdentityReranker:
         )
 
 
-def test_score_retrieval_uses_documented_empty_label_and_zero_hit_denominators() -> None:
+def test_검색_채점은_빈_라벨과_검색0건의_문서상_분모를_쓴다() -> None:
     retrieved = (
         RetrievedCase(
             case_id="A",
@@ -117,7 +116,7 @@ def test_score_retrieval_uses_documented_empty_label_and_zero_hit_denominators()
     assert by_id["C"].accepted_recall == 0.0
 
 
-def test_retrieve_cases_ranks_all_policy_vectors_in_memory_without_labels(
+def test_메모리_검색은_라벨없이_모든_정책_벡터를_정렬한다(
     tmp_path: Path,
 ) -> None:
     embedder = _FixedEmbedder(
@@ -148,7 +147,7 @@ def test_retrieve_cases_ranks_all_policy_vectors_in_memory_without_labels(
     ]
 
 
-def test_embedding_cache_reuses_same_text_and_invalidates_changed_policy(
+def test_임베딩_캐시는_같은_문구를_재사용하고_변경된_정책을_무효화한다(
     tmp_path: Path,
 ) -> None:
     embedder = _FixedEmbedder(
@@ -192,6 +191,7 @@ def test_embedding_cache_reuses_same_text_and_invalidates_changed_policy(
         config=config,
         cache_dir=tmp_path,
     )
+    embedder.model = "fixed-v2"
     retrieve_cases(
         queries=queries,
         policy_texts=(("policy:a:1", "정책 A"), ("policy:b:1", "정책 B 변경")),
@@ -208,80 +208,6 @@ def test_embedding_cache_reuses_same_text_and_invalidates_changed_policy(
         ("retrieval_policy", ("정책 A", "정책 B 변경")),
         ("retrieval_query", ("문의",)),
     ]
-
-
-def test_단일_설정_리포트는_30건을_싣고_같은_이름을_덮어쓰지_않는다(tmp_path: Path) -> None:
-    """`write_report` 의 렌더와 **덮어쓰기 방지**를 본다.
-
-    30건을 실제로 검색·채점해 리포트 문면을 만든다. 이전에는 `evaluate_retrieval` 이 이
-    조립을 대신했는데, 그 함수는 컷 스윕과 최적점 선택을 전략 사다리(`_sweep_point` ·
-    `_best_sweep_cutoff`)와 **중복 구현**하고 있었고 어떤 실행 경로도 부르지 않아 지웠다.
-    조립은 여기서 명시한다 — 스윕 값 자체는 사다리 쪽 검사가 들고 있으므로 여기서는
-    렌더 경로만 태운다.
-    """
-    config = RetrievalEvalConfig(
-        model="lexical-2gram-v1",
-        dimensions=64,
-        top_k=5,
-        cutoff=0.10,
-        is_stub=True,
-    )
-    documents = load_policy_documents()
-    retrieved = retrieve_cases(
-        queries=tuple(
-            RetrievalQuery(case_id=case.id, text=case.content) for case in load_golden_set()
-        ),
-        policy_texts=tuple(
-            (chunk.evidence_id, chunk.embedding_text)
-            for document in documents
-            for chunk in document.chunks
-        ),
-        embedder=LexicalEmbeddingClient(dimensions=64),
-        config=config,
-        cache_dir=tmp_path / "cache",
-    )
-    labels = tuple(load_retrieval_labels())
-    score = score_retrieval(retrieved, labels, top_k=config.top_k, cutoff=config.cutoff)
-
-    def _point(cutoff: float) -> CutoffSweepPoint:
-        aggregate = score_retrieval(retrieved, labels, top_k=config.top_k, cutoff=cutoff).aggregate
-        return CutoffSweepPoint(
-            cutoff=cutoff,
-            accepted_precision=aggregate.accepted_precision,
-            accepted_recall=aggregate.accepted_recall,
-            # macro F1 의 정의는 사다리 쪽 한 곳이 소유한다 — 여기서 다시 쓰지 않는다.
-            macro_f1=None,
-            precision_case_count=aggregate.precision_case_count,
-            recall_case_count=aggregate.recall_case_count,
-        )
-
-    sweep = (_point(0.10), _point(0.30))
-    evaluation = RetrievalEvaluation(
-        config=config, score=score, sweep=sweep, best_cutoff=config.cutoff
-    )
-
-    assert len(evaluation.score.cases) == 30
-    assert all(len(case.ranked_hits) == 26 for case in evaluation.score.cases)
-
-    first = write_report(evaluation, output_dir=tmp_path / "reports")
-    markdown_before = first.markdown.read_text(encoding="utf-8")
-    json_before = first.json.read_text(encoding="utf-8")
-    second = write_report(evaluation, output_dir=tmp_path / "reports")
-
-    assert first.markdown.exists() and first.json.exists()
-    assert second.markdown.exists() and second.json.exists()
-    assert second.markdown.stem == f"{first.markdown.stem}-2"
-    assert second.json.stem == f"{first.json.stem}-2"
-    assert first.markdown.read_text(encoding="utf-8") == markdown_before
-    assert first.json.read_text(encoding="utf-8") == json_before
-    assert "실제 검색 품질이 아니다" in markdown_before
-    assert "결정론 어휘 임베딩 대역" in markdown_before
-    assert "G17" in markdown_before
-    assert "policy:support:4-1" in markdown_before
-    for case_id in ("G21", "G22", "G23", "G24"):
-        assert case_id in markdown_before
-    assert '"database_used": false' in json_before
-    assert '"labels_used_for_retrieval": false' in json_before
 
 
 def test_전략_리포트는_전략마다_컷_스윕과_최적점을_싣는다(tmp_path: Path) -> None:
@@ -321,8 +247,8 @@ def test_전략_리포트는_기존_산출물을_덮어쓰지_않는다(tmp_path
     바뀌지 않아야 한다. 재생성에 과금이 들고 확률 층이라 같은 값이 나오지 않으므로, 덮어쓰기는
     복구 불가능한 손실이다(하드 게이트 7).
 
-    이 검사는 오래 없었다 — 단일 설정 쪽 writer 의 검사가 이 writer 까지 덮는 것처럼 보이는
-    착시였고, 두 writer 는 이름 규칙도 재귀 지점도 다르다.
+    이 검사는 오래 없었다 — 단일 설정 쪽 writer(지금은 지웠다)의 검사가 이 writer 까지 덮는
+    것처럼 보이는 착시였고, 두 writer 는 이름 규칙도 재귀 지점도 달랐다.
 
     **이 검사가 붙잡는 층은 경로 선택기**(`_next_strategy_report_paths`)다. writer 의
     `open("x")` + `FileExistsError` 재귀는 **경쟁 상태** 방어라 순차 실행으로는 탈 수 없다.
@@ -396,8 +322,8 @@ def test_리랭크_과금_미승인이면_그_단만_사유와_함께_미측정�
     """무과금이라고 안내한 실행이 조용히 과금하지 않고, 빈 자리를 0 으로 채우지도 않는다."""
     paths = run_retrieval_comparison(
         live=True,
-        embedding_model="local-fake",
-        embedding_client=LexicalEmbeddingClient(dimensions=32),
+        embedding_model="stub:local-fake",
+        embedding_client=LexicalEmbeddingClient(dimensions=32, model="stub:local-fake"),
         paid_rerank=False,
         cutoff=0.10,
         sweep_start=0.10,
@@ -445,7 +371,7 @@ def test_대역_리랭크_실행은_폴백_건수와_토큰을_리포트에_남�
     assert "## 리랭크 관측" in paths.markdown.read_text(encoding="utf-8")
 
 
-def test_run_retrieval_comparison_loads_committed_rewrites_for_default_ladder(
+def test_기본_검색_비교는_커밋된_재작성문을_읽는다(
     tmp_path: Path,
 ) -> None:
     paths = run_retrieval_comparison(
@@ -476,7 +402,7 @@ def test_run_retrieval_comparison_loads_committed_rewrites_for_default_ladder(
     assert "oracle" not in markdown
 
 
-def test_run_retrieval_comparison_can_report_oracle_upper_bound_condition(
+def test_검색_비교는_oracle_상한_조건을_보고할_수_있다(
     tmp_path: Path,
 ) -> None:
     paths = run_retrieval_comparison(
@@ -499,7 +425,7 @@ def test_run_retrieval_comparison_can_report_oracle_upper_bound_condition(
     assert "배포 가능 개선폭이 아님" in paths.markdown.read_text(encoding="utf-8")
 
 
-def test_fixture_and_rewrite_configuration_fail_before_any_embedding_call(tmp_path: Path) -> None:
+def test_픽스처와_재작성_설정_오류는_임베딩_전에_실패한다(tmp_path: Path) -> None:
     embedder = _FixedEmbedder({})
 
     with pytest.raises(FileNotFoundError):
@@ -570,7 +496,7 @@ def test_저장소_밖_재작성_입력은_조건_명시를_요구한다(tmp_pat
         )
 
 
-def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Path) -> None:
+def test_벡터_단독은_재작성_미사용을_보고한다(tmp_path: Path) -> None:
     paths = run_retrieval_comparison(
         live=False,
         dimensions=32,
@@ -591,7 +517,7 @@ def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Pat
     assert "질의 재작성: 미사용" in paths.markdown.read_text(encoding="utf-8")
 
 
-def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_cuts(
+def test_전략_사다리는_대역4종을_완주하고_별도_컷을_보고한다(
     tmp_path: Path,
 ) -> None:
     cases = load_golden_set()
@@ -600,7 +526,7 @@ def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_c
         cases=cases,
         labels=load_retrieval_labels(),
         rewritten_queries={case.id: f"{case.content} 재작성" for case in cases},
-        embedder=LexicalEmbeddingClient(dimensions=32),
+        embedder=LexicalEmbeddingClient(dimensions=32, model=STUB_EMBEDDING_MODEL),
         embedding_config=RetrievalEvalConfig(
             model="lexical-2gram-v1",
             dimensions=32,
@@ -658,7 +584,7 @@ def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_c
         ({"G": "   "}, "비어"),
     ],
 )
-def test_rewrite_input_is_validated_before_embedding(
+def test_재작성_입력은_임베딩_전에_검증한다(
     tmp_path: Path, rewritten_queries: dict[str, str], message: str
 ) -> None:
     embedder = _FixedEmbedder({"정책 A": [1.0, 0.0], "문의": [1.0, 0.0], "재작성": [0.0, 1.0]})
@@ -680,7 +606,7 @@ def test_rewrite_input_is_validated_before_embedding(
     assert embedder.calls == []
 
 
-def test_vector_rewrite_uses_distinct_injected_text(tmp_path: Path) -> None:
+def test_벡터_재작성은_별도로_주입된_문구를_쓴다(tmp_path: Path) -> None:
     embedder = _FixedEmbedder(
         {
             "정책 A": [1.0, 0.0],
@@ -722,7 +648,7 @@ def test_vector_rewrite_uses_distinct_injected_text(tmp_path: Path) -> None:
     assert ("retrieval_query", ("실제 재작성 문의",)) in embedder.calls
 
 
-def test_strategy_retrieval_boundary_does_not_accept_or_import_labels() -> None:
+def test_전략_검색_경계는_라벨을_받거나_import하지_않는다() -> None:
     assert "labels" not in inspect.signature(retrieve_strategy_ladder).parameters
     retrieval_eval_module = inspect.getmodule(retrieve_strategy_ladder)
     assert retrieval_eval_module is not None
@@ -882,7 +808,7 @@ class _CandidateEmbedder:
         return EmbeddingResult(vectors=[[0.0] * self._dimensions for _ in texts], total_tokens=0)
 
 
-def test_embedding_model_axis_has_four_documented_candidates() -> None:
+def test_임베딩_모델_축에는_문서화된_후보4종이_있다() -> None:
     assert [
         (candidate.model, candidate.dimensions, candidate.provider)
         for candidate in DEFAULT_EMBEDDING_CANDIDATES
@@ -894,7 +820,7 @@ def test_embedding_model_axis_has_four_documented_candidates() -> None:
     ]
 
 
-def test_missing_BGE_dependency_marks_only_that_axis_row_unmeasured(tmp_path: Path) -> None:
+def test_BGE_의존성_누락은_해당_축만_미측정으로_남긴다(tmp_path: Path) -> None:
     evaluated: list[str] = []
 
     def factory(candidate: EmbeddingCandidate, api_key: SecretStr) -> EmbeddingClient:
@@ -940,3 +866,63 @@ def test_대역_임베딩_구현은_모델_버전_문자열에_고정된다() ->
         0.577350269,
         0.577350269,
     ]
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_다른_모델의_임베더는_캐시_읽기와_쓰기_전에_거부한다(
+    tmp_path: Path, warm_cache: bool
+) -> None:
+    """차원이 같아도 다른 모델의 벡터를 선언 모델 캐시로 재사용하면 안 된다."""
+    embedder = _FixedEmbedder({"정책": [1.0, 0.0], "문의": [1.0, 0.0]})
+    kwargs: dict[str, Any] = dict(
+        queries=(RetrievalQuery(case_id="G", text="문의"),),
+        policy_texts=(("policy:a:1", "정책"),),
+        embedder=embedder,
+        config=RetrievalEvalConfig(model="fixed", dimensions=2),
+        cache_dir=tmp_path / "cache",
+    )
+    if warm_cache:
+        retrieve_cases(**kwargs)
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*.json")}
+    embedder.model = "another-model"
+    embedder.calls.clear()
+    with pytest.raises(ValueError, match="모델"):
+        retrieve_cases(**kwargs)
+    assert embedder.calls == []
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*.json")} == before
+
+
+def test_주입_임베더의_모델을_검색_리포트와_캐시에_추론한다(tmp_path: Path) -> None:
+    """주입 클라이언트가 있는데 환경 기본 모델 이름으로 캐싱하지 않는다."""
+    paths = run_retrieval_comparison(
+        live=True,
+        embedding_client=LexicalEmbeddingClient(dimensions=8, model="stub:local-test"),
+        paid_rerank=False,
+        strategies=(StrategyDefinition("vector", (RetrievalStage.VECTOR,)),),
+        output_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+    )
+    payload = json.loads(paths.json.read_text())
+    assert payload["configuration"]["embedding_model"] == "stub:local-test"
+    cached = [json.loads(p.read_text()) for p in (tmp_path / "cache").glob("*.json")]
+    assert cached and all(row["model"] == "stub:local-test" for row in cached)
+
+
+@pytest.mark.parametrize("chunking", [False, True])
+def test_명시한_모델과_주입_클라이언트가_다르면_비교를_거부한다(
+    tmp_path: Path, chunking: bool
+) -> None:
+    """명시 모델은 실제 클라이언트의 provenance를 덮어쓸 수 없다."""
+    kwargs: dict[str, Any] = dict(
+        live=True,
+        embedding_model="declared",
+        embedding_client=_CandidateEmbedder(2, "actual"),
+        cache_dir=tmp_path / "cache",
+        output_dir=tmp_path / "reports",
+    )
+    with pytest.raises(ValueError, match="모델"):
+        if chunking:
+            run_chunking_comparison(**kwargs)
+        else:
+            run_retrieval_comparison(**kwargs, paid_rerank=False)
+    assert not list(tmp_path.rglob("*.json"))

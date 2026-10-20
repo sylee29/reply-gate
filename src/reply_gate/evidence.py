@@ -18,7 +18,7 @@ citations 에 남긴다).
 * 반면 선검사를 통과한 주문에 대해 **SQL 이 정상 실행되고 0건**인 것은 구조적 실패가 아니라
   "주문 소스 근거 0건"이다 — `order` 단독이면 `no_evidence`, `both` 면 정책 근거만으로 진행한다.
 
-실패 정책 (docs/standards.md "재시도 상한" / docs/business-rules.md "인계 사유 6종"):
+실패 정책 (docs/standards.md "재시도 상한" / docs/business-rules.md "인계 사유 7종"):
 
 * **전송 오류**는 래퍼가 이미 1회 재시도했다 — `LLMCallError` 가 오면 어느 단계에서 왔든
   `llm_call_failed` 인계이고, 실패한 단계 이름을 남긴다. SQL 생성의 전송 오류도 여기에 속한다.
@@ -34,9 +34,9 @@ citations 에 남긴다).
 
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from decimal import Decimal
 from enum import StrEnum
@@ -44,9 +44,11 @@ from time import perf_counter
 from typing import Any, Final
 
 import psycopg
+import sqlglot
 from psycopg.rows import DictRow
+from sqlglot import exp
 
-from reply_gate.config import Settings, get_settings
+from reply_gate.config import AbstentionGateWiringError, Settings, get_settings
 from reply_gate.contracts import (
     EscalationReason,
     Evidence,
@@ -62,9 +64,10 @@ from reply_gate.llm import (
     LLMFormatError,
     accumulate_optional_ms,
     accumulate_optional_tokens,
+    validate_embedding_vectors,
 )
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
-from reply_gate.policy_index import PolicySearchHit, search_policy_chunks
+from reply_gate.policy_index import PolicySearchHit, search_policy_rankings
 from reply_gate.query_rewrite import QUERY_REWRITE_STAGE, rewrite_query
 from reply_gate.retrieval_strategies import (
     AbstentionGate,
@@ -76,8 +79,10 @@ from reply_gate.retrieval_strategies import (
     truncate_for_gate,
 )
 from reply_gate.sql_guard import (
+    PRIVATE_ORDER_COLUMNS,
     SCHEMA_WHITELIST,
     SqlGuardRejection,
+    SqlGuardRule,
     ValidatedQuery,
     describe_allowed_functions,
     describe_whitelist,
@@ -91,7 +96,6 @@ __all__ = [
     "INTENT_STAGE",
     "INTENT_SYSTEM_PROMPT",
     "ORDER_EXISTS_SQL",
-    "SPAN_GATE",
     "SPAN_NAMES",
     "SPAN_POLICY_SEARCH",
     "SPAN_SQL_EXECUTION",
@@ -169,12 +173,12 @@ CONTENT_ROW_LIMIT: Final = 10
 # 바깥에서 감싸면 그 여섯이 한 칸으로 접힌다. 그래서 계측이 이 모듈 안까지 들어오고,
 # 결과 묶음(`EvidenceCollection`)이 구간 시간을 함께 들고 나온다.
 
-#: 코드만 도는 구간 셋의 이름. **밖으로 나가는 구간 여섯은 단계 이름을 그대로 쓴다**
+#: 코드만 도는 구간 셋 중 이 모듈이 재는 둘의 이름 — 게이트 판정은 파이프라인이
+#: `StageDurations.gate_ms` 칸에 직접 싣는다. **밖으로 나가는 구간 여섯은 단계 이름을 그대로 쓴다**
 #: (`INTENT_STAGE`·`QUERY_REWRITE_STAGE`·`INQUIRY_EMBEDDING_STAGE`·`SQL_GENERATION_STAGE`·
 #: `draft.DRAFT_STAGE`·`pipeline.L2_JUDGE_STAGE`) — 이름을 두 벌로 두면 한쪽만 바뀐다.
 SPAN_POLICY_SEARCH: Final = "policy_search"
 SPAN_SQL_EXECUTION: Final = "sql_execution"
-SPAN_GATE: Final = "gate"
 
 
 @dataclass(frozen=True)
@@ -503,7 +507,7 @@ class SqlGenerationResult:
     """SQL 생성 **1회** 호출의 결과. 재시도 여부는 호출자(수집기)가 정한다.
 
     `sql` 이 `None` 이면 유효한 SQL 을 얻지 못한 것이고 `error` 에 사유가 담긴다 —
-    `sql_failed`(생성 실패) 경로다 — docs/business-rules.md "인계 사유 6종".
+    `sql_failed`(생성 실패) 경로다 — docs/business-rules.md "인계 사유 7종".
     전송 오류는 `LLMCallError` 로 올라간다(그건 `sql_failed` 가 아니라 `llm_call_failed`다).
     """
 
@@ -608,6 +612,10 @@ def order_exists(*, conn: psycopg.Connection[DictRow], order_no: str) -> bool:
 
 def _jsonable(value: object) -> Any:
     """스냅샷을 그대로 jsonb 로 넣을 수 있게 원시 타입으로 낮춘다."""
+    if isinstance(value, float) and not math.isfinite(value):
+        # PostgreSQL float는 이 값들을 허용하지만 JSON 숫자는 허용하지 않는다.
+        # Decimal 비유한 값과 같은 명시적 문자열로 근거/스냅샷을 함께 보존한다.
+        return "NaN" if math.isnan(value) else "Infinity" if value > 0 else "-Infinity"
     if value is None or isinstance(value, bool | int | float | str):
         return value
     if isinstance(value, dt.datetime | dt.date | dt.time):
@@ -638,15 +646,28 @@ def _render_value(value: Any) -> str:
     return "(없음)" if value is None else str(value)
 
 
-def _render_rows(rows: Sequence[Mapping[str, Any]], *, limit: int | None = None) -> str:
+def _render_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    limit: int | None = None,
+    mask_key: Callable[[str], str] = str,
+) -> str:
     shown = rows if limit is None else rows[:limit]
     lines = [
-        f"{index}) " + ", ".join(f"{key}={_render_value(value)}" for key, value in row.items())
+        f"{index}) "
+        + ", ".join(f"{mask_key(key)}= {_render_value(value)}" for key, value in row.items())
         for index, row in enumerate(shown, start=1)
     ]
     if limit is not None and len(rows) > limit:
         lines.append(f"... (이하 {len(rows) - limit}건 생략)")
     return "\n".join(lines)
+
+
+def render_sql_rows(
+    rows: Sequence[Mapping[str, Any]], *, mask_key: Callable[[str], str] = str
+) -> str:
+    """실행 SQL 없는 응답용 결과 요약. 저장용 content/evidence_text와 별개다."""
+    return f"결과 {len(rows)}건\n{_render_rows(rows, limit=CONTENT_ROW_LIMIT, mask_key=mask_key)}"
 
 
 def _sql_evidence_texts(
@@ -862,7 +883,7 @@ class EvidenceCollection:
     intent: IntentSource | None
     evidence: tuple[Evidence, ...]
     escalation_reason: EscalationReason | None
-    #: `llm_call_failed` 일 때 실패한 단계 이름 (docs/business-rules.md "인계 사유 6종").
+    #: `llm_call_failed` 일 때 실패한 단계 이름 (docs/business-rules.md "인계 사유 7종").
     failed_stage: str | None
     sql_snapshots: tuple[SqlEvidenceSnapshot, ...]
     sql_failures: tuple[SqlFailure, ...]
@@ -898,10 +919,6 @@ class EvidenceCollection:
     #: 0 이 아니라 미측정(`None`)이다. 초안·게이트·판정 세 칸은 여기서 늘 미측정이고
     #: 파이프라인이 채운다.
     stage_durations: StageDurations = field(default_factory=StageDurations)
-
-    @property
-    def escalated(self) -> bool:
-        return self.escalation_reason is not None
 
 
 @dataclass
@@ -969,9 +986,24 @@ class EvidenceCollector:
         self._embedder = embedding_client
         self._settings = resolved
         self._rewrite_client = rewrite_client
+        self._validate_embedding_condition()
         # 기권 게이트는 설정에서 한 번만 조립한다 — 켜고 끄는 자리가 하나여야 런타임과
         # 리포트의 조건 지문이 갈리지 않는다. `None` 은 "꺼짐"이고 채택은 절대 하한만 남는다.
         self._abstention_gate = resolved.abstention_gate()
+
+    def _validate_embedding_condition(self) -> None:
+        """τ 검증은 설정 이름이 아니라 실제로 검색할 임베더 조건에 걸려야 한다."""
+        if not self._settings.abstention_gate_enabled:
+            return
+        configured = (self._settings.embedding_model, self._settings.embedding_dimensions)
+        actual = (self._embedder.model, self._embedder.dimensions)
+        if actual != configured:
+            raise AbstentionGateWiringError(
+                f"기권 게이트의 설정과 실제 임베더 조건이 다르다: "
+                f"설정 {configured[0]}/{configured[1]}차원, "
+                f"임베더 {actual[0]}/{actual[1]}차원. "
+                "같은 조건을 배선하거나 ABSTENTION_GATE_ENABLED=false 로 명시한다."
+            )
 
     def collect(
         self,
@@ -981,6 +1013,7 @@ class EvidenceCollector:
         order_no: str | None,
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> EvidenceCollection:
         """문의 1건의 근거를 모은다. 결과는 근거 목록 또는 초안 전 인계 사유다."""
         ledger = _Ledger()
@@ -1027,6 +1060,7 @@ class EvidenceCollector:
                     content=content,
                     order_no=order_no,
                     readonly_conn=readonly_conn,
+                    exclude_personal_columns=exclude_personal_columns,
                 )
                 # 주문 측 구조적 사유는 정책 근거를 이미 모았더라도 인계가 우선한다.
                 if escalation is not None:
@@ -1089,25 +1123,21 @@ class EvidenceCollector:
             raise
         ledger.spans.add(INQUIRY_EMBEDDING_STAGE, embedding.elapsed_ms)
         ledger.embedding_tokens += embedding.total_tokens
-        if not embedding.vectors:
-            return
+        validate_embedding_vectors(
+            embedding.vectors, count=len(queries), dimensions=self._embedder.dimensions
+        )
 
         # 벡터 검색은 밖으로 나가지 않는 구간이라 래퍼가 볼 수 없다 — **부르는 쪽이 잰다.**
         # 질의가 둘이면(원문·재작성) 두 번의 왕복이 한 구간으로 합산된다.
         search_started = perf_counter()
         try:
-            rankings = [
-                search_policy_chunks(
-                    conn=conn,
-                    query_vector=vector,
-                    top_k=self._settings.vector_top_k,
-                    embedding_model=self._embedder.model,
-                    embedding_dimensions=self._embedder.dimensions,
-                )
-                # 임베딩 대역이 질의 수보다 적게 돌려주는 경우까지 여기서 감당한다 —
-                # 없는 벡터로 검색하지 않고, 있는 만큼만 합친다.
-                for vector in embedding.vectors[: len(queries)]
-            ]
+            rankings = search_policy_rankings(
+                conn=conn,
+                query_vectors=embedding.vectors,
+                top_k=self._settings.vector_top_k,
+                embedding_model=self._embedder.model,
+                embedding_dimensions=self._embedder.dimensions,
+            )
         finally:
             ledger.spans.add(SPAN_POLICY_SEARCH, _span_ms(search_started))
         candidates = merge_policy_rankings(
@@ -1171,13 +1201,14 @@ class EvidenceCollector:
         content: str,
         order_no: str | None,
         readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> EscalationReason | None:
         """선검사 → text-to-SQL. 인계 사유가 있으면 그것을, 없으면 `None` 을 돌려준다."""
         if order_no is None or not order_no.strip():
             return EscalationReason.MISSING_ORDER_REF
         normalized = normalize_order_no(order_no)
         # 형식이 깨진 값은 참조가 없는 것과 같다 — `order_not_found` 는 형식이 맞는
-        # 주문번호에만 쓴다(docs/business-rules.md "인계 사유 6종").
+        # 주문번호에만 쓴다(docs/business-rules.md "인계 사유 7종").
         # 정상 경로에서는 접수 단계가 먼저 막는다.
         if not is_valid_order_no(normalized):
             return EscalationReason.MISSING_ORDER_REF
@@ -1199,6 +1230,7 @@ class EvidenceCollector:
             content=content,
             order_no=normalized,
             readonly_conn=readonly_conn,
+            exclude_personal_columns=exclude_personal_columns,
         )
 
     def _run_text_to_sql(
@@ -1209,9 +1241,18 @@ class EvidenceCollector:
         content: str,
         order_no: str,
         readonly_conn: psycopg.Connection[DictRow],
+        exclude_personal_columns: bool = False,
     ) -> EscalationReason | None:
         """생성 → 검증 → 실행. 실패는 피드백을 실어 **1회만** 재시도한다(코드가 상한 강제)."""
         max_rows = self._settings.sql_max_rows
+        whitelist = (
+            {
+                table: tuple(c for c in columns if c not in PRIVATE_ORDER_COLUMNS)
+                for table, columns in SCHEMA_WHITELIST.items()
+            }
+            if exclude_personal_columns
+            else SCHEMA_WHITELIST
+        )
         previous_sql: str | None = None
         previous_error: str | None = None
 
@@ -1222,6 +1263,7 @@ class EvidenceCollector:
                     inquiry=content,
                     order_no=order_no,
                     max_rows=max_rows,
+                    whitelist=whitelist,
                     previous_sql=previous_sql,
                     previous_error=previous_error,
                     effort=self._settings.generation_effort,
@@ -1269,7 +1311,18 @@ class EvidenceCollector:
             try:
                 # 조회 범위를 **선검사를 통과한 주문 1건**으로 묶는 것도 검증 단계의 일이다
                 # (docs/architecture.md "대표 흐름" 3단계). 프롬프트 문구는 그 보증이 되지 못한다.
-                query = validate_sql(generation.sql, order_no=order_no, max_rows=max_rows)
+                query = validate_sql(
+                    generation.sql, order_no=order_no, max_rows=max_rows, whitelist=whitelist
+                )
+                # 축소 whitelist가 SELECT *의 실제 DB projection까지 좁히지는 않는다.
+                if exclude_personal_columns and any(
+                    isinstance(star.parent, (exp.Select, exp.Column))
+                    for star in sqlglot.parse_one(query.sql, dialect="postgres").find_all(exp.Star)
+                ):
+                    raise SqlGuardRejection(
+                        rule=SqlGuardRule.UNSUPPORTED_PROJECTION,
+                        detail="상품 확인 경로는 허용된 열 이름을 명시해야 한다 (* 사용 불가)",
+                    )
             except SqlGuardRejection as rejection:
                 previous_sql = generation.sql
                 previous_error = f"{rejection.rule.value}: {rejection.detail}"
@@ -1289,6 +1342,14 @@ class EvidenceCollector:
             try:
                 rows = execute_validated_query(conn=readonly_conn, query=query)
             except psycopg.Error as exc:
+                # 연결·서버·권한 장애는 SQL을 다시 생성해도 고칠 수 없다.
+                # 문장/값 오류와 실행 시간 상한만 기존 제한 재시도를 탄다.
+                if not isinstance(
+                    exc, (psycopg.DataError, psycopg.ProgrammingError, psycopg.errors.QueryCanceled)
+                ) or isinstance(
+                    exc, (psycopg.errors.InsufficientPrivilege, psycopg.errors.UndefinedTable)
+                ):
+                    raise
                 _reset_after_error(readonly_conn)
                 previous_sql = query.sql
                 previous_error = _first_line(exc)
@@ -1394,6 +1455,5 @@ def _reset_after_error(conn: psycopg.Connection[DictRow]) -> None:
     read-only 커넥션은 기본이 autocommit 이라 대개 할 일이 없지만, 호출자가 트랜잭션
     커넥션을 넘겼을 때 재시도 쿼리가 "current transaction is aborted" 로 죽는 것을 막는다.
     """
-    # 커넥션 자체가 끊긴 경우까지 여기서 살릴 수는 없다 — 다음 시도가 같은 오류를 낸다.
-    with contextlib.suppress(psycopg.Error):
-        conn.rollback()
+    # 연결/서버 오류는 호출자가 전파하며 이 함수는 재시도 가능한 SQL 오류만 받는다.
+    conn.rollback()

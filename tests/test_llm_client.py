@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import pathlib
+import sys
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -15,6 +16,7 @@ import openai
 import pytest
 from pydantic import SecretStr
 
+from reply_gate.draft import DraftGenerator
 from reply_gate.llm import (
     MAX_ATTEMPTS,
     AnthropicGenerationClient,
@@ -530,7 +532,7 @@ class _LocalEmbeddingModel:
 
 
 def test_BGE_M3_는_선택_모델_경계에서_1024차원_dense_벡터를_만든다() -> None:
-    model = _LocalEmbeddingModel([[0.0] * 1024, [1.0] * 1024])
+    model = _LocalEmbeddingModel([[1.0] + [0.0] * 1023, [1.0] * 1024])
     client = BgeM3EmbeddingClient(model=model)
 
     result = client.embed(stage="retrieval", texts=["문의", "정책"])
@@ -546,3 +548,208 @@ def test_BGE_M3_는_잘못된_차원을_거부한다() -> None:
 
     with pytest.raises(ValueError, match="1024차원"):
         client.embed(stage="retrieval", texts=["문의"])
+
+
+def _json_client(
+    provider: str, text: str
+) -> tuple[OpenAIGenerationClient | AnthropicGenerationClient, _RecordingCalls]:
+    if provider == "openai":
+        return _generation_client([_response(text)])
+    return _anthropic_client([_anthropic_response(text)])
+
+
+def _assert_json_format_failure(provider: str, text: str) -> None:
+    client, calls = _json_client(provider, text)
+    with pytest.raises(LLMFormatError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    error = excinfo.value
+    assert error.stage == "draft"
+    assert error.raw_text == text
+    assert text not in str(error)
+    assert (error.input_tokens, error.output_tokens) == (11, 7)
+    assert error.transport_attempts == len(calls.calls) == 1
+    assert error.elapsed_ms >= 0
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999", "-1e999"])
+def test_유한하지_않은_JSON_숫자는_원문과_토큰을_보존한_형식오류다(
+    provider: str, number: str
+) -> None:
+    """Python 확장 상수와 float 오버플로를 받아들이면 JSONB 저장 단계에서야 실패한다."""
+    _assert_json_format_failure(provider, '{"intent": "policy", "extra": ' + number + "}")
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_JSON_정수_자릿수_제한도_형식오류로_변환한다(provider: str) -> None:
+    """json.loads의 일반 ValueError가 초안/L1 경로와 실패 호출 토큰을 우회했던 입력이다."""
+    original_limit = sys.get_int_max_str_digits()
+    try:
+        sys.set_int_max_str_digits(4300)
+        _assert_json_format_failure(provider, '{"claims": [' + "1" * 4301 + "]}")
+    finally:
+        sys.set_int_max_str_digits(original_limit)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_JSON_중첩_깊이_제한도_형식오류로_변환한다(provider: str) -> None:
+    """파서의 깊이 제한 역시 모델 산출 실패다. Python 3.13의 C 파서 한계도 넘긴다."""
+    _assert_json_format_failure(provider, "[" * 10000 + "0" + "]" * 10000)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_유효한_JSON_숫자와_상수_모양_문자열은_바꾸지_않는다(provider: str) -> None:
+    """음성 입력을 거부하는 동안 정상 숫자와 고객 문장 안의 문자열까지 훼손하지 않는다."""
+    payload = {"values": [0, -3, 1.25, 1e100], "text": "NaN Infinity -Infinity 1e999"}
+    client, calls = _json_client(provider, json.dumps(payload))
+
+    result = client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert result.data == payload
+    assert (result.input_tokens, result.output_tokens) == (11, 7)
+    assert len(calls.calls) == 1
+
+
+def test_JSON_숫자_형식실패도_초안은_원문으로_L1에_넘긴다() -> None:
+    """실제 래퍼→초안 생성 경로: 형식 오류는 초안 생성기의 재시도나 500이 되지 않는다."""
+    text = '{"claims": [{"text": "환불 안내", "citation_ids": [], "extra": NaN}]}'
+    client, calls = _json_client("openai", text)
+
+    result = DraftGenerator(client=client).generate(inquiry="환불 정책", evidence=())
+
+    assert result.raw == text
+    assert (result.input_tokens, result.output_tokens) == (11, 7)
+    assert len(calls.calls) == 1
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        r'{"nested":[{"text":"\u0000"}]}',
+        r'{"nested":[{"\u0000":"value"}]}',
+        r'{"nested":[{"text":"\ud800"}]}',
+        r'{"nested":[{"\ud800":"value"}]}',
+        r'{"nested":[{"text":"\udfff"}]}',
+        r'{"nested":[{"\udfff":"value"}]}',
+    ],
+    ids=["nul-value", "nul-key", "high-value", "high-key", "low-value", "low-key"],
+)
+def test_JSON_저장불가_문자는_키와_값_모두_형식오류다(provider: str, text: str) -> None:
+    """escape된 원문은 저장 가능해도 파싱 결과의 문자열이 저장 불가일 수 있다."""
+    _assert_json_format_failure(provider, text)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("character", ["\x00", "\ud800", "\udfff"], ids=["nul", "high", "low"])
+@pytest.mark.parametrize("malformed", [False, True], ids=["json", "malformed"])
+def test_JSON_저장불가_원문은_역복원_가능한_진단문자열로_보존한다(
+    provider: str, character: str, malformed: bool
+) -> None:
+    """파싱 실패 원문 자체에도 NUL/surrogate가 있으면 기록 저장 단계가 다시 실패한다."""
+    text = "잘못된 JSON " + character if malformed else '{"text":"' + character + '"}'
+    client, calls = _json_client(provider, text)
+
+    with pytest.raises(LLMFormatError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    error = excinfo.value
+    prefix = "[Unicode escaped raw text] "
+    assert error.raw_text.startswith(prefix)
+    assert error.raw_text.removeprefix(prefix).encode("ascii").decode("unicode_escape") == text
+    assert "\x00" not in error.raw_text
+    error.raw_text.encode("utf-8")  # lone surrogate가 남으면 이 줄에서 실패한다.
+    assert (error.input_tokens, error.output_tokens) == (11, 7)
+    assert error.transport_attempts == len(calls.calls) == 1
+    assert error.elapsed_ms >= 0
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("ensure_ascii", [False, True])
+def test_JSON_정상_유니코드와_백슬래시_문자열은_보존한다(provider: str, ensure_ascii: bool) -> None:
+    """실제 emoji와 escaped surrogate pair는 정상이며 '\\u0000' 글자열도 NUL이 아니다."""
+    payload = {
+        "한글\n": [{"text": "안내 😀\n\t", "literal": r"\u0000 \ud800 \udfff"}],
+        "other": [None, True, 42],
+    }
+    client, calls = _json_client(provider, json.dumps(payload, ensure_ascii=ensure_ascii))
+
+    result = client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert result.data == payload
+    assert len(calls.calls) == 1
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_JSON_문자검사는_깊은_정상배열을_추가로_거부하지_않는다(provider: str) -> None:
+    """JSON 파서는 허용하는 1,100단을 후속 재귀 문자열 검사가 새로 실패시키면 안 된다."""
+    text = "[" * 1100 + '"한글 😀"' + "]" * 1100
+    client, calls = _json_client(provider, text)
+
+    result = client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    value = result.data
+    for _ in range(1100):
+        assert isinstance(value, list)
+        value = value[0]
+    assert value == "한글 😀"
+    assert len(calls.calls) == 1
+
+
+@pytest.mark.parametrize("text", ["잘못된 JSON", '[Unicode escaped raw text] "원문"'])
+def test_JSON_안전한_실패원문은_진단접두어처럼_보여도_바꾸지_않는다(text: str) -> None:
+    """접두어만 보고 원문을 재인코딩하거나 자동 decode하지 않는다."""
+    _assert_json_format_failure("openai", text)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_JSON_문자실패도_캐시와_시간을_보존한다(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """저장 적합성 검사가 기존 실패 호출의 계열별 실비용이나 시간을 지우면 안 된다."""
+    client, calls = _json_client(provider, r'{"text":"\u0000"}')
+    usage = calls._outcomes[0].usage
+    if provider == "openai":
+        usage.input_tokens_details = SimpleNamespace(cache_write_tokens=3, cached_tokens=5)
+    else:
+        usage.cache_creation_input_tokens = 3
+        usage.cache_read_input_tokens = 5
+    clock = iter([1.0, 1.25])
+    monkeypatch.setattr("reply_gate.llm.perf_counter", lambda: next(clock))
+
+    with pytest.raises(LLMFormatError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    error = excinfo.value
+    assert (error.input_tokens, error.output_tokens) == (11, 7)
+    assert (error.cache_creation_input_tokens, error.cache_read_input_tokens) == (3, 5)
+    assert error.elapsed_ms == 250.0
+    assert error.transport_attempts == len(calls.calls) == 1
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "characters",
+    ["\ud83d\ude00\x00", "😀\x00", r"\ud83d\ude00\u0000" + "\x00"],
+    ids=["literal-pair-nul", "emoji-nul", "backslash-nul"],
+)
+def test_JSON_진단표현은_surrogate쌍과_emoji와_백슬래시를_구별해_복원한다(
+    provider: str, characters: str
+) -> None:
+    """JSON 재파싱은 literal surrogate 두 개를 emoji 하나로 합쳐 진단 원문을 잃었다."""
+    text = "잘못된 원문 " + characters
+    client, calls = _json_client(provider, text)
+
+    with pytest.raises(LLMFormatError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    error = excinfo.value
+    prefix = "[Unicode escaped raw text] "
+    assert error.raw_text.startswith(prefix)
+    restored = error.raw_text.removeprefix(prefix).encode("ascii").decode("unicode_escape")
+    assert restored == text
+    assert [ord(character) for character in restored] == [ord(character) for character in text]
+    error.raw_text.encode("ascii")
+    assert (error.input_tokens, error.output_tokens) == (11, 7)
+    assert error.transport_attempts == len(calls.calls) == 1

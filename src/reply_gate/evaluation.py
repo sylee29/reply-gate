@@ -34,6 +34,7 @@ import json
 import re
 import textwrap
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import reduce
@@ -43,15 +44,22 @@ from typing import Any, Final, Protocol, cast
 import psycopg
 from psycopg.rows import DictRow
 
-from reply_gate import policy_index, retrieval_strategies, sql_guard
+from reply_gate import draft as draft_module
+from reply_gate import evidence as evidence_module
+from reply_gate import judge as judge_module
+from reply_gate import llm, policy_index, retrieval_strategies, sql_guard
+from reply_gate import query_rewrite as rewrite_module
 from reply_gate.contracts import (
     Claim,
+    ClaimJudgment,
     Draft,
     EscalationReason,
     Evidence,
+    EvidenceContradiction,
     EvidenceSource,
     InquiryStatus,
     IntentSource,
+    JudgeResult,
     RejectReason,
     Verdict,
     is_policy_evidence_id,
@@ -128,6 +136,7 @@ __all__ = [
     "build_report",
     "code_condition_fingerprint",
     "display_path",
+    "load_fixture_phone_inputs",
     "load_golden_set",
     "load_judge_fixtures",
     "load_l1_fixtures",
@@ -335,10 +344,6 @@ class L1Outcome:
     actual_verdict: Verdict
     expected_reasons: tuple[RejectReason, ...]
     actual_reasons: tuple[RejectReason, ...]
-
-    @property
-    def verdict_matched(self) -> bool:
-        return self.expected_verdict is self.actual_verdict
 
     @property
     def reasons_matched(self) -> bool:
@@ -591,7 +596,7 @@ class GoldenOutcome:
 
     @property
     def gate_never_ran(self) -> bool:
-        """L2 판정 호출이 무너져 **판정 자체가 없었던** 케이스인가.
+        """의도·초안·L2 호출 실패로 **판정 자체가 없었던** 케이스인가.
 
         판정 호출이 실패한 시도의 종합 verdict 는 `pass` 다(docs/contracts.md "층별 판정 키"
         ③ — 그 시도의 진실은 `escalation_reason` 이 들고 있다). 그래서 `attempt_verdicts`
@@ -599,12 +604,14 @@ class GoldenOutcome:
         미실행이 관측 실패로 접혀 지표에 0 으로 채워진다
         (`scripts/AGENTS.md` 불변식 5 — 미실행을 0 으로 채우지 않는다).
 
-        contracts.md 가 지정한 신호를 그대로 쓴다: 인계 사유 `llm_call_failed` +
-        실패 단계 `l2_judge`.
+        인계 사유 `llm_call_failed` 이고 L2 호출이 실패했거나 시도 자체가 없는 경우다.
+        업무상 `no_evidence` 종료는 기술적 실패가 아니다. 앞선 시도에서 이미 기각했다면
+        재현은 관측됐으므로 마지막 호출 실패가 이를 지우지 않는다.
         """
         return (
             self.escalation_reason is EscalationReason.LLM_CALL_FAILED
-            and self.failed_stage == L2_JUDGE_STAGE
+            and (self.failed_stage == L2_JUDGE_STAGE or not self.attempt_verdicts)
+            and not self.rejected_at_least_once
         )
 
 
@@ -654,12 +661,8 @@ def _span_aggregate(span: str, values: Sequence[float | None]) -> SpanAggregate:
 
 
 def _percentile_ms(values: Sequence[float], percent: int) -> float | None:
-    """nearest-rank 백분위 — 정수 지연(`_percentile`)과 **같은 규칙**의 실수판이다."""
-    if not values:
-        return None
-    ordered = sorted(values)
-    rank = max(1, min(len(ordered), _ceil_div(percent * len(ordered), 100)))
-    return ordered[rank - 1]
+    """실수 지연도 같은 nearest-rank 규칙을 따른다."""
+    return _percentile(values, percent)
 
 
 @dataclass(frozen=True)
@@ -715,6 +718,8 @@ class PipelineAgreement:
     #: 구간 아홉의 세트 집계. **미측정 케이스는 각 구간의 분모에서 빠진다.**
     #: 순서는 `evidence.SPAN_NAMES`(파이프라인 실행 순서)와 같다.
     stage_durations: tuple[SpanAggregate, ...] = ()
+    #: 측정 동안 잠근 실제 DB 입력의 지문. 파일 지문으로 추정하지 않는다.
+    input_fingerprint: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def match_rate(self) -> float | None:
@@ -850,6 +855,7 @@ class PipelineRunning(Protocol):
         order_no: str | None,
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
+        phone_last4: str | None = None,
     ) -> ProcessedInquiry: ...
 
 
@@ -889,12 +895,38 @@ def _compare(case: GoldenCase, processed: ProcessedInquiry) -> tuple[bool, tuple
     return not mismatches, tuple(mismatches)
 
 
+def load_fixture_phone_inputs(
+    path: Path = _ROOT / "db" / "fixtures" / "orders.jsonl",
+) -> tuple[dict[str, str], str]:
+    """같은 한 번의 읽기에서 확인 입력과 전체 픽스처 판을 함께 고정한다.
+
+    전화 뒷자리 맵만 해시하지 않는다. 실제 DB 주문 판과 이 전체 입력 판을 함께 지문에 싣는다.
+    """
+    content = path.read_text(encoding="utf-8")
+    inputs: dict[str, str] = {}
+    for line in content.splitlines():
+        row = json.loads(line)
+        inputs[row["order_no"]] = "".join(c for c in row["customer_phone"] if c in "0123456789")[
+            -4:
+        ]
+    return inputs, text_digest(content, prefix="order-fixture-")
+
+
+def fixture_phone_last4(order_no: str | None) -> str | None:
+    """평가자는 커밋된 합성 주문의 정당한 주문자로 요청한다. 골든셋은 불변이다."""
+    if order_no is None:
+        return None
+    inputs, _version = load_fixture_phone_inputs()
+    return inputs.get(order_no)
+
+
 def evaluate_case(
     *,
     case: GoldenCase,
     pipeline: PipelineRunning,
     app_conn: psycopg.Connection[DictRow],
     readonly_conn: psycopg.Connection[DictRow],
+    phone_last4_by_order: Mapping[str, str | None] | None = None,
 ) -> GoldenOutcome:
     """골든셋 1건을 접수 → 파이프라인 → 라벨 대조까지 돌린다.
 
@@ -930,6 +962,11 @@ def evaluate_case(
         order_no=accepted.order_no,
         app_conn=app_conn,
         readonly_conn=readonly_conn,
+        phone_last4=(
+            fixture_phone_last4(accepted.order_no)
+            if phone_last4_by_order is None
+            else phone_last4_by_order.get(accepted.order_no or "")
+        ),
     )
     matched, mismatches = _compare(case, processed)
     return GoldenOutcome(
@@ -977,6 +1014,7 @@ def measure_pipeline_agreement(
     app_conn: psycopg.Connection[DictRow],
     readonly_conn: psycopg.Connection[DictRow],
     on_outcome: Callable[[GoldenOutcome], None] | None = None,
+    phone_last4_by_order: Mapping[str, str | None] | None = None,
 ) -> PipelineAgreement:
     """측정 2 — 골든셋 전체를 **끝까지** 흘린다.
 
@@ -987,7 +1025,11 @@ def measure_pipeline_agreement(
     outcomes: list[GoldenOutcome] = []
     for case in cases:
         outcome = evaluate_case(
-            case=case, pipeline=pipeline, app_conn=app_conn, readonly_conn=readonly_conn
+            case=case,
+            pipeline=pipeline,
+            app_conn=app_conn,
+            readonly_conn=readonly_conn,
+            phone_last4_by_order=phone_last4_by_order,
         )
         outcomes.append(outcome)
         if on_outcome is not None:
@@ -1096,7 +1138,7 @@ def _aggregate_stage_durations(outcomes: Sequence[GoldenOutcome]) -> tuple[SpanA
     )
 
 
-def _percentile(values: Sequence[int], percent: int) -> int | None:
+def _percentile[T: (int, float)](values: Sequence[T], percent: int) -> T | None:
     """nearest-rank 백분위. 30건 규모에서 보간은 없는 정밀도를 가장한다."""
     if not values:
         return None
@@ -1558,6 +1600,9 @@ _PII_RULE_PROBE: Final = (
     "010-9999\u09038888 010-9999\u20e38888 "
     "010\u20139999\u22128888 010\u30fb9999\u30fb8888 "
     "+82-10-1234-5678 0082 2 123 4567 1588-1234 900101-1234567  A_B@Example.COM "
+    "메일은 hong@example.com입니다. customer_email=hong@example.com입니다 "
+    "<hong@example.com입니다> hong@example.com입니다.evil support@쇼핑몰.한국 "
+    "국제 연락처 +1-202-555-0123 끝"
 )
 
 #: 조회 가드 탐침이 쓰는 주문번호. **선검사를 통과한 형식**이어야 한다(아니면 호출 측
@@ -1572,6 +1617,11 @@ _SQL_GUARD_PROBE_ORDER_NO: Final = "ORD-20260201-0001"
 #: 계산 컬럼), 그리고 거부 쪽 셋(목록 밖 캐스트 대상 타입 · 목록 밖 함수 · 주문 범위 미한정)을
 #: 함께 든다. **양쪽을 다 담아야** 규칙이 어느 방향으로 움직여도 값이 따라간다.
 _SQL_GUARD_PROBES: Final[tuple[str, ...]] = (
+    # 입력 AST는 통과하지만 직렬화 뒤 리터럴 경계가 달라지는 재현과 정상 대조다.
+    f"SELECT order_no FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"
+    r" AND status <> E'\\' AND status <> ' OR 1=1 --'",
+    f"SELECT order_no FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"
+    " AND status <> E'CaseSensitive'",
     f"SELECT customer_phone FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
     "WITH scoped AS ("
     f"SELECT order_no, customer_phone FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"
@@ -1595,6 +1645,22 @@ _SQL_GUARD_PROBES: Final[tuple[str, ...]] = (
     f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
     f"SELECT pg_sleep(1) AS napped FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
     "SELECT customer_phone FROM orders",
+    "SELECT customer_phone AS concat, concat('010-', '9999-9999') FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    f"SELECT customer_phone AS {'a' * 63}, concat('010-', '9999-9999') AS {'a' * 63}x "
+    f"FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    'WITH scoped AS (SELECT customer_phone AS "Phone" FROM orders '
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}') SELECT \"Phone\" FROM scoped",
+    "SELECT coalesce(customer_phone, '미정') FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    f"SELECT customer_phone AS {'a' * 64} FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    'WITH scoped AS (SELECT customer_phone AS "Phone", '
+    "concat('010-', '9999-9999') AS phone FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}') SELECT phone FROM scoped",
+    "SELECT customer_phone AS customer_email, "
+    "CASE WHEN true THEN customer_phone ELSE customer_email END FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
 )
 
 #: 조회 가드 탐침의 결과 행 수 상한. 판정에 영향을 주지 않는 고정값이다.
@@ -1616,45 +1682,45 @@ _ABSTENTION_PROBES: Final[tuple[tuple[float, ...], ...]] = (
 #: 입력 순서대로 나오는 구현과 정렬하는 구현이 같은 답을 내면 탐침이 아무것도 못 가른다.
 _RETRIEVAL_TIE_PROBE: Final[tuple[str, ...]] = ("b", "a", "c")
 
-#: 정책 검색 SQL 의 정렬 절을 뽑는 패턴. **파일 전체가 아니라 이 절 하나만** 읽는다 —
+#: 정책 검색 SQL 의 정렬 절을 뽑는 패턴. **파일 전체가 아니라 정렬 절들만** 읽는다 —
 #: 함수 안 주석이 바뀌었다고 계보가 끊기면 안 된다.
-_ORDER_BY_PATTERN: Final = re.compile(r"ORDER BY\s+(.*)", re.DOTALL)
-
-#: `ORDER BY` 뒤에서 절을 끝내는 표기. 여기까지만 정렬 키로 읽는다.
-_ORDER_BY_TERMINATORS: Final[tuple[str, ...]] = ("LIMIT", "OFFSET", "FETCH")
+_ORDER_BY_PATTERN: Final = re.compile(
+    r"ORDER BY\s+(.*?)(?=\b(?:LIMIT|OFFSET|FETCH|ORDER BY)\b|$)", re.DOTALL
+)
 
 
 def order_by_clause(source: str) -> str:
-    """SQL 문면에서 `ORDER BY` 절만 뽑아 공백을 접는다. 없으면 `"정렬 없음"`.
+    """SQL 문면의 `ORDER BY` 절들을 순서대로 뽑는다. 없으면 `"정렬 없음"`.
 
     **없을 때 옛 값을 남기지 않는다** — 정렬 절이 사라진 것은 조용한 무변경이 아니라
-    행동 계약이 바뀐 것이고, 지문은 그것을 값으로 드러내야 한다.
+    행동 계약이 바뀐 것이고, 지문은 그것을 값으로 드러내야 한다. 일괄 검색은 안쪽의
+    top_k 선택과 바깥쪽의 반환 순서가 모두 결과에 관여하므로 둘 다 기록한다.
     """
-    match = _ORDER_BY_PATTERN.search(source)
-    if match is None:
-        return "정렬 없음"
-    clause = match.group(1)
-    for terminator in _ORDER_BY_TERMINATORS:
-        clause = clause.partition(terminator)[0]
-    return " ".join(clause.split())
+    clauses = [" ".join(match.group(1).split()) for match in _ORDER_BY_PATTERN.finditer(source)]
+    return " | ".join(clauses) if clauses else "정렬 없음"
 
 
 def _policy_search_sql() -> str:
     """정책 검색 함수가 **실제로 실행하는** SQL 문면.
 
-    소스를 문자열로 훑지 않고 AST 로 본다 — 주석은 애초에 없고 docstring 은 제외할 수 있다.
-    설명 문장에 `ORDER BY` 가 스치기만 해도 지문이 흔들리면, 문서를 고친 것이 계보를 끊는다.
+    execute 첫 인자에 속한 SQL 문자열만 AST로 읽는다. 주석·docstring·결과 행의 키나
+    실행하지 않는 문자열이 바뀐 것을 정렬 규칙 변경으로 기록하지 않는다.
     """
-    module = ast.parse(textwrap.dedent(inspect.getsource(policy_index.search_policy_chunks)))
+    module = ast.parse(textwrap.dedent(inspect.getsource(policy_index.search_policy_rankings)))
     function = module.body[0]
     if not isinstance(function, ast.FunctionDef):  # pragma: no cover - 방어
         return ""
-    body = function.body[1:] if ast.get_docstring(function) is not None else function.body
     return "\n".join(
         node.value
-        for statement in body
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "execute"
+        and call.args
+        for node in ast.walk(call.args[0])
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and re.match(r"\s*(?:SELECT|WITH)\b", node.value)
     )
 
 
@@ -1699,19 +1765,96 @@ def _normalized_probe_matches(pattern: PiiPattern) -> str:
     )
 
 
+def _cross_claim_pii_probe() -> str:
+    """분리된 claim을 연결한 답변 검사와 근거 에코 허용을 함께 지문에 담는다."""
+    evidence_id = "policy:probe:1"
+    draft = {
+        "claims": [
+            {"text": "연락처는 010", "citation_ids": [evidence_id]},
+            {"text": "9999 8888 입니다.", "citation_ids": [evidence_id]},
+        ]
+    }
+    observed: list[str] = []
+    for text in ("연락처 미기재", "연락처는 010-9999-8888 입니다."):
+        evidence = Evidence(
+            id=evidence_id, source=EvidenceSource.POLICY, content=text, evidence_text=text
+        )
+        result = evaluate_draft(raw_draft=draft, evidences=(evidence,))
+        observed.append(
+            result.verdict.value + ":" + ",".join(r.value for r in result.reject_reasons)
+        )
+    return "|".join(observed)
+
+
+def _email_boundary_probe() -> str:
+    """문맥에 의존하는 이메일 접미사와 명시된 주소의 경계를 실제 L1으로 잰다."""
+    evidence_id = "policy:probe:email"
+    observed: list[str] = []
+    for source, texts in (
+        ("customer_email=hong@example.com", ("hong@example.com입니다.",)),
+        ("customer_email=hong@example.com입니다", ("hong@example.com",)),
+        ("customer_email=hong@example.com입니다", ("<주소", "hong@example.com입니다", ">")),
+        ("customer_email=hong@example.com", ("<주소", "hong@example.com입니다", ">")),
+        ("customer_email=hong@example.com", (") (주소 hong@example.com입니다.",)),
+    ):
+        evidence = Evidence(
+            id=evidence_id, source=EvidenceSource.POLICY, content=source, evidence_text=source
+        )
+        raw_draft = {"claims": [{"text": text, "citation_ids": [evidence_id]} for text in texts]}
+        result = evaluate_draft(raw_draft=raw_draft, evidences=(evidence,))
+        observed.append(
+            result.verdict.value + ":" + ",".join(r.value for r in result.reject_reasons)
+        )
+    return "|".join(observed)
+
+
+def _draft_content_boundary_probe() -> str:
+    """빈 내용, 수량 에코, 이메일 내부 숫자의 채택 경계를 실제 판정으로 읽는다."""
+    evidence_id = "policy:probe:content"
+    observed: list[str] = []
+    for source, text in (
+        ("일반 안내", "\u200b"),
+        ("일반 안내", "\u115f"),
+        ("일반 안내", "+12025550123 개인 연락처"),
+        ("amount= 15,881,234.00", "+15881234원"),
+        ("amount= 10000000.0", "+10000000원"),
+        ('email= "10000000"@example.com', "+10000000원"),
+        ("일반 안내", "+10000000원"),
+        ("amount= 10000000.0", "+10000000원, 연락처 +10000000"),
+        ("email= user@example.com", "010 user@example.com 1234 5678"),
+        ("email= user@example.com", "changed+user@example.com"),
+        ("email= changed+user@example.com", "changed+user@example.com"),
+    ):
+        evidence = Evidence(
+            id=evidence_id, source=EvidenceSource.POLICY, content=source, evidence_text=source
+        )
+        result = evaluate_draft(
+            raw_draft={"claims": [{"text": text, "citation_ids": [evidence_id]}]},
+            evidences=(evidence,),
+        )
+        observed.append(
+            result.verdict.value + ":" + ",".join(r.value for r in result.reject_reasons)
+        )
+    return "|".join(observed)
+
+
 def _draft_rule_version() -> str:
-    """초안 판정 규칙의 판 — **접기 규칙과 패턴 집합**의 내용 지문.
+    """초안 판정 규칙의 판 — **접기·패턴·claim 연결 검사**의 내용 지문.
 
     읽는 것은 넷이다: 기각 사유의 고정 순서 · 번호 계열이 구분자로 받는 표기 변종 집합 ·
     두 접기(공통·번호)가 고정 탐침에 대해 내는 결과 · 패턴마다의 (이름, 정규식, 플래그,
     접기 결과, **매치별** 정규화 결과). 접기와 정규화는 **이름이 아니라 동작**으로 담는다 —
-    함수 이름만 담으면 본문이 바뀌어도 지문이 안 움직인다.
+    함수 이름만 담으면 본문이 바뀌어도 지문이 안 움직인다. claim 연결 검사도 기각/에코
+    양방향의 동작을 탐침으로 읽는다.
     """
     parts = [
         "reasons=" + ",".join(reason.value for reason in REASON_ORDER),
         "separators=" + ",".join(f"U+{ord(ch):04X}" for ch in sorted(NUMERIC_SEPARATOR_VARIANTS)),
         "fold_common=" + fold_for_detection(_PII_RULE_PROBE),
         "fold_numeric=" + fold_numeric_for_detection(_PII_RULE_PROBE),
+        "cross_claim_pii=" + _cross_claim_pii_probe(),
+        "email_boundary=" + _email_boundary_probe(),
+        "content_boundary=" + _draft_content_boundary_probe(),
     ]
     parts.extend(
         f"pattern={pattern.name}|regex={pattern.regex.pattern}|flags={pattern.regex.flags}"
@@ -1753,7 +1896,7 @@ def _abstention_undefined_policy() -> str:
 def _retrieval_order_rule() -> str:
     """검색 순서 규칙 — **tie-break 유무**를 두 자리에서 함께 읽는다.
 
-    DB 가 상위 `top_k` 를 자를 때의 정렬(`policy_index.search_policy_chunks`)과, 원문·재작성
+    DB 의 선택·반환 정렬(`policy_index.search_policy_rankings`)과, 원문·재작성
     합집합을 접는 파이썬 병합(`retrieval_strategies.merge_rewritten_rankings`)이다. **두
     자리가 갈리면 재작성 켜짐/꺼짐이 다른 순서를 낸다** — 그래서 한 칸에 함께 싣는다.
     병합 쪽은 동점 후보를 정본 순서와 반대로 넣어 결과 순서를 그대로 적는다.
@@ -1769,14 +1912,281 @@ def _retrieval_order_rule() -> str:
     return f"db=[{db_clause}] · merge=[{'>'.join(hit.evidence_id for hit in merged)}]"
 
 
-def code_condition_fingerprint() -> dict[str, str]:
+def _judge_rule_probe_outcomes() -> dict[str, str]:
+    """고정 입력의 실제 산출 해석 결과. 측정 3의 픽스처나 정확도 분모가 아니다.
+
+    진단 문면은 기록하지 않는다. 판정·개수·ID를 읽되 예상 못 한 예외는 숨기지 않는다.
+    공통 JSON admission도 L2 형식 재시도 여부를 결정하므로 같은 규칙 판에 포함한다.
+    """
+    json_probes = {
+        "normal": '{"text":"한국어 안내", "values":[0,1.25,1e100]}',
+        "literal_words": '{"text":"NaN Infinity 1e999"}',
+        "surrogate_pair": r'{"text":"\ud83d\ude00"}',
+        "duplicate_key": '{"verdict":"reject","verdict":"pass"}',
+        "nested_duplicate_key": '{"nested":{"ok":false,"ok":true}}',
+        "malformed": '{"text":',
+        "nan": '{"value":NaN}',
+        "infinity": '{"value":Infinity}',
+        "negative_infinity": '{"value":-Infinity}',
+        "overflow": '{"value":1e999}',
+        "nul_value": r'{"nested":[{"text":"\u0000"}]}',
+        "nul_key": r'{"\u0000":"value"}',
+        "surrogate_high": r'{"text":"\ud800"}',
+        "surrogate_low": r'{"text":"\udc00"}',
+    }
+    outcomes: dict[str, str] = {}
+    for name, text in json_probes.items():
+        try:
+            llm._parse_json_completion(
+                stage=judge_module.JUDGE_STAGE, text=text, input_tokens=0, output_tokens=0
+            )
+        except LLMFormatError:
+            outcomes[f"json:{name}"] = "rejected"
+        else:
+            outcomes[f"json:{name}"] = "accepted"
+
+    evidence = tuple(
+        Evidence(
+            id=f"policy:judge-probe:{index}",
+            source=EvidenceSource.POLICY,
+            content=text,
+            evidence_text=text,
+        )
+        for index, text in enumerate(
+            ("배송은 3일 걸립니다.", "환불 기간은 7일입니다.", "환불 기간은 30일입니다."), start=1
+        )
+    )
+    normal = Draft(claims=(Claim(text="배송은 3일 걸립니다.", citation_ids=(evidence[0].id,)),))
+    cited = Draft(claims=(Claim(text="환불 기간은 7일입니다.", citation_ids=(evidence[1].id,)),))
+    explicit = Draft(
+        claims=(
+            Claim(
+                text="환불 기간은 조항에 따라 7일과 30일로 서로 다르게 안내됩니다.",
+                citation_ids=(evidence[1].id, evidence[2].id),
+            ),
+        )
+    )
+    duplicate = Draft(claims=(normal.claims[0], normal.claims[0]))
+
+    def payload(draft: Draft) -> dict[str, Any]:
+        return {
+            "claim_judgments": [
+                {"claim_text": claim.text, "verdict": "pass", "explanation": "근거에 있습니다."}
+                for claim in draft.claims
+            ],
+            "contradictions": [],
+            "verdict": "pass",
+            "reject_reasons": [],
+        }
+
+    def conflicting(draft: Draft, *, rejects: bool) -> dict[str, Any]:
+        data = payload(draft)
+        data["contradictions"] = [
+            {
+                "evidence_id_a": evidence[1].id,
+                "evidence_id_b": evidence[2].id,
+                "explanation": "기간이 다릅니다.",
+            }
+        ]
+        if rejects:
+            data.update(verdict="reject", reject_reasons=["contradictory_evidence"])
+        return data
+
+    probes = [
+        ("normal", normal, payload(normal)),
+        ("uncited_rejection", normal, conflicting(normal, rejects=True)),
+        ("cited_rejection", cited, conflicting(cited, rejects=True)),
+        ("uncited_record", normal, conflicting(normal, rejects=False)),
+        ("explicit_conflict", explicit, conflicting(explicit, rejects=False)),
+        ("duplicate_complete", duplicate, payload(duplicate)),
+        ("duplicate_missing", duplicate, payload(normal)),
+    ]
+    unsupported = payload(normal)
+    unsupported["claim_judgments"][0]["verdict"] = "reject"
+    unsupported.update(verdict="reject", reject_reasons=["unsupported_claim"])
+    probes.append(("unsupported", normal, unsupported))
+    invalid_reason = deepcopy(unsupported)
+    invalid_reason["reject_reasons"] = ["not_a_judge_reason"]
+    probes.append(("invalid_reason", normal, invalid_reason))
+    mismatched = payload(normal)
+    mismatched["verdict"] = "reject"
+    probes.append(("verdict_without_reason", normal, mismatched))
+    missing_reason = deepcopy(unsupported)
+    missing_reason.update(verdict="pass", reject_reasons=[])
+    probes.append(("unsupported_without_reason", normal, missing_reason))
+    unknown_id = conflicting(cited, rejects=True)
+    unknown_id["contradictions"][0]["evidence_id_b"] = "policy:judge-probe:missing"
+    probes.append(("unknown_evidence", cited, unknown_id))
+    same_id = conflicting(cited, rejects=True)
+    same_id["contradictions"][0]["evidence_id_b"] = evidence[1].id
+    probes.append(("self_conflict", cited, same_id))
+    for name, draft, data in probes:
+        try:
+            result = judge_module._parse_judge_result(data, draft=draft, evidence=evidence)
+        except judge_module._ParseError:
+            outcomes[f"judge:{name}"] = "rejected"
+        else:
+            outcomes[f"judge:{name}"] = json.dumps(
+                {
+                    "verdict": result.verdict.value,
+                    "reasons": [reason.value for reason in result.reject_reasons],
+                    "claims": [
+                        (item.claim_text, item.verdict.value) for item in result.claim_judgments
+                    ],
+                    "contradictions": [
+                        (item.evidence_id_a, item.evidence_id_b) for item in result.contradictions
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+    return outcomes
+
+
+def _judge_rule_version() -> str:
+    """L2 산출 해석의 선언+행동 지문. 프롬프트·모델·측정 3 정답판은 별도 축이다."""
+    material = {
+        "schema": judge_module.JUDGE_JSON_SCHEMA,
+        "format_attempts": judge_module.JUDGE_MAX_ATTEMPTS,
+        "reasons": [reason.value for reason in judge_module.L2_REJECT_REASONS],
+        "probes": _judge_rule_probe_outcomes(),
+    }
+    return text_digest(
+        json.dumps(material, ensure_ascii=False, sort_keys=True), prefix="judgerules-"
+    )
+
+
+def _generation_prompt_versions(*, sql_max_rows: int = 50) -> dict[str, str]:
+    """실제 호출 모듈의 시스템 문면·사용자 템플릿·스키마에 묶인 판.
+
+    고정 입력으로 최초·재시도·재생성 문면을 실행한다. 주석·docstring·내부 이름은
+    조건이 아니며, 실제 데이터 변경은 별도의 실제 입력 지문이 맡는다.
+    """
+    inquiry = "배송 상태와 환불 규정을 알려 주세요."
+    order_no = "ORD-20260101-0001"
+    evidence = (
+        Evidence(
+            id="policy:prompt:1",
+            source=EvidenceSource.POLICY,
+            content="환불 기간은 7일입니다.",
+            evidence_text="환불 기간은 7일입니다.",
+        ),
+        Evidence(
+            id="policy:prompt:2",
+            source=EvidenceSource.POLICY,
+            content="환불 기간은 14일입니다.",
+            evidence_text="환불 기간은 14일입니다.",
+        ),
+        Evidence(
+            id="sql:prompt:1",
+            source=EvidenceSource.SQL,
+            content="status=배송중",
+            evidence_text="status=배송중",
+        ),
+    )
+    judge_result = JudgeResult(
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.UNSUPPORTED_CLAIM, RejectReason.CONTRADICTORY_EVIDENCE),
+        claim_judgments=(
+            ClaimJudgment(
+                "환불 기간은 30일입니다.", Verdict.REJECT, "인용 근거에 없는 기간입니다."
+            ),
+            ClaimJudgment("배송 중입니다.", Verdict.PASS, "주문 근거와 일치합니다."),
+        ),
+        contradictions=(
+            EvidenceContradiction(evidence[0].id, evidence[1].id, "환불 기간이 서로 다릅니다."),
+        ),
+    )
+    user_probes = {
+        "intent": [
+            evidence_module.build_intent_user_prompt(inquiry=inquiry),
+            evidence_module.build_intent_user_prompt(inquiry=inquiry, order_no=order_no),
+            evidence_module.build_intent_user_prompt(inquiry=inquiry, previous_error="형식 오류"),
+            evidence_module.build_intent_user_prompt(
+                inquiry=inquiry,
+                order_no=order_no,
+                previous_output="invalid",
+                previous_error="형식 오류",
+            ),
+        ],
+        "sql": [
+            evidence_module.build_sql_user_prompt(
+                inquiry=inquiry, order_no=order_no, max_rows=sql_max_rows
+            ),
+            evidence_module.build_sql_user_prompt(
+                inquiry=inquiry,
+                order_no=order_no,
+                max_rows=sql_max_rows,
+                previous_sql="",
+                previous_error="화이트리스트 밖",
+            ),
+            evidence_module.build_sql_user_prompt(
+                inquiry=inquiry,
+                order_no=order_no,
+                max_rows=sql_max_rows,
+                previous_sql="SELECT 1",
+                previous_error="화이트리스트 밖",
+            ),
+        ],
+        "draft": [
+            draft_module.build_draft_user_prompt(inquiry=inquiry, evidence=evidence),
+            draft_module.build_draft_user_prompt(
+                inquiry=inquiry, evidence=evidence, reject_reasons=tuple(RejectReason)
+            ),
+            draft_module.build_draft_user_prompt(
+                inquiry=inquiry,
+                evidence=evidence,
+                reject_reasons=judge_result.reject_reasons,
+                judge_result=judge_result,
+            ),
+        ],
+        "rewrite": [rewrite_module.build_rewrite_user_prompt(inquiry=inquiry)],
+    }
+    specs = (
+        (
+            "intent",
+            evidence_module.INTENT_SYSTEM_PROMPT,
+            evidence_module.INTENT_JSON_SCHEMA,
+        ),
+        (
+            "sql",
+            evidence_module.SQL_SYSTEM_PROMPT,
+            evidence_module.SQL_JSON_SCHEMA,
+        ),
+        (
+            "draft",
+            draft_module.DRAFT_SYSTEM_PROMPT,
+            draft_module.DRAFT_JSON_SCHEMA,
+        ),
+        (
+            "rewrite",
+            rewrite_module.REWRITE_SYSTEM_PROMPT,
+            rewrite_module.REWRITE_JSON_SCHEMA,
+        ),
+    )
+    return {
+        f"{name}_prompt_version": text_digest(
+            json.dumps(
+                [system, schema, user_probes[name]],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            prefix=f"{name}-prompt-",
+        )
+        for name, system, schema in specs
+    }
+
+
+def code_condition_fingerprint(*, sql_max_rows: int = 50) -> dict[str, str]:
     """**코드가 결정하는** 조건 지문 항목. 실행 인자·설정·시각을 보지 않는다.
 
     실행 인자에 묶인 항목(골든셋·판정 픽스처·L1 채점표의 판 등)은 진입점이 명시 지문으로
     싣고, 명시가 이긴다 — 여기 값과 이름이 겹치면 진입점 쪽이 남는다.
     """
     return {
+        **_generation_prompt_versions(sql_max_rows=sql_max_rows),
         "judge_thinking": JUDGE_THINKING,
+        "judge_rule_version": _judge_rule_version(),
         "draft_rule_version": _draft_rule_version(),
         "sql_guard_version": _sql_guard_version(),
         "retrieval_order": _retrieval_order_rule(),
@@ -1807,7 +2217,7 @@ class RunConditions:
     #: 실행 경로에 켜진 검색 전략 조합. 예: `vector` · `vector+rewrite`.
     retrieval_strategy: str
     l1_fixture_count: int
-    golden_case_count: int
+    golden_case_count: int | None
     #: 판정 픽스처 수. **로드하지 못했으면 `None`** — 미실행을 0 으로 채우지 않는다.
     judge_fixture_count: int | None
     l1_fixtures_path: str
@@ -2080,27 +2490,25 @@ def build_report(
     pipeline: PipelineAgreement | SkippedMeasurement,
     judge_accuracy: JudgeAccuracy | SkippedMeasurement,
     retrieval_labels_path: Path | None = None,
-    regression_guard: RegressionGuard | GuardUnavailable | None = None,
+    golden_set_path: Path = DEFAULT_GOLDEN_SET_PATH,
 ) -> EvaluationReport:
     """리포트를 조립한다. **측정 3 도 명시해야 한다** — 기본값으로 비워 두면 미실행이
     조용히 "사유 없는 미실행"으로 찍힌다.
 
     회귀 가드는 리포트 JSON 을 입력으로 쓰므로 조립 뒤에 붙이는 것이 자연스럽다 —
-    `attach_regression_guard` 가 그 순서를 들고 있다. 여기서 넘기지 않으면 가드 절은
+    `attach_regression_guard` 가 그 순서를 들고 있다. 그것을 거치지 않으면 가드 절은
     **미산출 + 사유**로 남는다."""
     failure_attribution = _build_failure_attribution(
         pipeline=pipeline,
         retrieval_labels_path=retrieval_labels_path,
+        golden_set_path=golden_set_path,
     )
-    report = EvaluationReport(
+    return EvaluationReport(
         conditions=conditions,
         gate_accuracy=gate_accuracy,
         pipeline=pipeline,
         judge_accuracy=judge_accuracy,
         failure_attribution=failure_attribution,
-    )
-    return (
-        report if regression_guard is None else replace(report, regression_guard=regression_guard)
     )
 
 
@@ -2136,6 +2544,7 @@ def _build_failure_attribution(
     *,
     pipeline: PipelineAgreement | SkippedMeasurement,
     retrieval_labels_path: Path | None,
+    golden_set_path: Path,
 ) -> FailureAttribution | UnavailableBreakdown:
     # 지연 import: retrieval_labels 는 골든셋 검증을 위해 evaluation 로더를 쓴다.
     # 보고서 조립 시점에만 반대 방향을 열어 모듈 순환 import 를 피한다.
@@ -2151,7 +2560,7 @@ def _build_failure_attribution(
 
     path = DEFAULT_RETRIEVAL_LABELS_PATH if retrieval_labels_path is None else retrieval_labels_path
     try:
-        labels = load_retrieval_labels(path)
+        labels = load_retrieval_labels(path, golden_set_path=golden_set_path)
     except (KeyError, OSError, TypeError, ValueError) as exc:
         return UnavailableBreakdown(reason=f"검색 정답 라벨 로드 실패({type(exc).__name__}): {exc}")
 
@@ -2286,6 +2695,7 @@ ORDER_STAGE_ESCALATIONS: Final[frozenset[EscalationReason]] = frozenset(
     {
         EscalationReason.MISSING_ORDER_REF,
         EscalationReason.ORDER_NOT_FOUND,
+        EscalationReason.ORDER_UNCONFIRMED,
         EscalationReason.SQL_FAILED,
     }
 )
@@ -2425,7 +2835,7 @@ def render_markdown(report: EvaluationReport) -> str:
         f" · 임베딩 {conditions.embedding_dimensions}차원",
         f"- 유사도 임계값: {conditions.similarity_threshold} / top k: {conditions.top_k}",
         f"- L1 픽스처: {conditions.l1_fixture_count}건 (`{conditions.l1_fixtures_path}`)",
-        f"- 골든셋: {conditions.golden_case_count}건 (`{conditions.golden_set_path}`)",
+        f"- 골든셋: {_count(conditions.golden_case_count)} (`{conditions.golden_set_path}`)",
         f"- 판정 픽스처: {_count(conditions.judge_fixture_count)} "
         f"(`{conditions.judge_fixtures_path}`)",
         f"- OPENAI_API_KEY 설정 여부: {'설정됨' if conditions.api_key_present else '없음'}",
@@ -3375,10 +3785,23 @@ def write_report(
     out_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = out_dir / f"{stem}.md"
     json_path = out_dir / f"{stem}.json"
-    markdown_path.write_text(render_markdown(report), encoding="utf-8")
-    json_path.write_text(
-        json.dumps(report_to_json(report), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    markdown = render_markdown(report)
+    payload = json.dumps(report_to_json(report), ensure_ascii=False, indent=2) + "\n"
+    if stem.casefold().startswith(LIVE_REPORT_STEM):
+        # 이름 선검사 뒤 다른 실행이 먼저 끝날 수 있다. 두 파일 모두 독점 생성한 뒤에만
+        # 쓴다. 두 번째 파일이 이미 있으면 우리가 만든 빈 첫 파일만 치우고 거부한다.
+        with markdown_path.open("x", encoding="utf-8") as markdown_file:
+            try:
+                json_file = json_path.open("x", encoding="utf-8")
+            except FileExistsError:
+                markdown_path.unlink()
+                raise
+            with json_file:
+                markdown_file.write(markdown)
+                json_file.write(payload)
+    else:
+        markdown_path.write_text(markdown, encoding="utf-8")
+        json_path.write_text(payload, encoding="utf-8")
     return markdown_path, json_path
 
 

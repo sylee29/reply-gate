@@ -2702,3 +2702,82 @@ def test_과금_0회_산출물은_직전_라이브_탐색의_머리가_되지_�
         )
     collected = _collect_live_runs(reports_dir, l2_enabled=True)
     assert [run.stem for run in collected] == ["evaluation-live-l2-1"]
+
+
+def test_앞선_기각은_재생성_뒤_판정_실패가_미측정으로_지우지_않는다() -> None:
+    """미끼의 최소 한 번 기각은 이미 관측됐으므로 마지막 실패가 이를 지우면 안 된다."""
+    from dataclasses import replace
+
+    died = _judge_call_died()
+    processed = replace(
+        died,
+        attempts=(
+            AttemptRecord(
+                attempt_no=1,
+                verdict=Verdict.REJECT,
+                reject_reasons=(RejectReason.MISSING_CITATION,),
+                draft={},
+            ),
+            replace(died.attempts[0], attempt_no=2),
+        ),
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[_bait_case()],
+        pipeline=ScriptedPipeline([processed]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    assert agreement.bait_total == 1
+    assert agreement.bait_reject_reproduced == 1
+    assert agreement.bait_unmeasured == 0
+    assert agreement.bait_reject_recall == 1.0
+    assert agreement.outcomes[0].matched is False
+
+
+@pytest.mark.parametrize("existing_extension", [".md", ".json"])
+def test_선검사_뒤_생긴_라이브_산출물을_쓰기_시점에도_덮지_않는다(
+    tmp_path: Path, existing_extension: str
+) -> None:
+    """두 실행이 같은 빈 이름을 먼저 고른 경우에도 먼저 쓴 과금 근거는 보존한다."""
+    stem = _stem(tmp_path, real=True, l2=True)
+    assert _stem(tmp_path, real=True, l2=True) == stem
+    existing = tmp_path / f"{stem}{existing_extension}"
+    existing.write_text("먼저 끝난 과금 실행", encoding="utf-8")
+    report = _report(pipeline=SkippedMeasurement(reason="두 번째 실행"))
+    with pytest.raises(FileExistsError):
+        write_report(report, out_dir=tmp_path, stem=stem)
+    assert existing.read_text(encoding="utf-8") == "먼저 끝난 과금 실행"
+    other_extension = ".json" if existing_extension == ".md" else ".md"
+    assert not (tmp_path / f"{stem}{other_extension}").exists()
+
+
+def test_측정3_단독은_쓰지_않는_골든셋을_로드하지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """판정 픽스처 단독 실측은 골든셋의 존재 여부 때문에 죽어서는 안 된다."""
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    monkeypatch.setattr(
+        evaluate,
+        "_run_measurement_three",
+        lambda *, fixtures, settings: measure_judge_accuracy(
+            fixtures=fixtures, judge=OracleJudge(fixtures)
+        ),
+    )
+    _block_outbound_sockets(monkeypatch)
+    assert (
+        evaluate.main(
+            [
+                "--live",
+                "--measurements",
+                "3",
+                "--golden-set",
+                str(tmp_path / "없음.jsonl"),
+                "--out-dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads((tmp_path / "evaluation-live-l2-1.json").read_text(encoding="utf-8"))
+    assert payload["measurement_3_l2_judge_accuracy"]["executed"] is True
+    assert payload["conditions"]["golden_case_count"] is None

@@ -79,24 +79,12 @@ uv run python -m scripts.seed_orders
 스키마를 적용하고 커밋된 픽스처(`db/fixtures/orders.jsonl`) 500건을 적재한다.
 재실행해도 500건 그대로다.
 
-> 스키마를 고친 뒤에는 볼륨째 재생성해야 한다:
-> `docker compose down -v && docker compose up -d --wait` → 이 단계를 다시 실행.
-> DDL 이 전부 `CREATE TABLE IF NOT EXISTS` 라 기존 테이블의 컬럼은 바뀌지 않는다.
-> **단 컬럼 추가는 예외다** — `db/schema.sql` 은 `ALTER TABLE … ADD COLUMN IF NOT EXISTS` 로
-> 살아 있는 볼륨에 컬럼을 붙인다(검색 계열 3개가 이 방식으로 들어갔다). 컬럼 **변경·삭제**만
-> 볼륨 재생성이 필요하다 — 볼륨을 지우면 보존 기록과 **유료 정책 재색인**이 함께 딸려온다
-> (`docs/engineering-notes.md` "스키마를 바꿨으면 볼륨째 지워야 한다 — 컬럼 추가만 예외다").
->
-> **L2 도입으로 스키마가 바뀌었다** — `inquiry_attempts` 에 층별 판정 컬럼
-> (`l1_verdict`·`l1_reject_reasons`·`l2_verdict`·`l2_reject_reasons`·`claim_verdicts`·
-> `evidence_contradictions`)이, `inquiries` 에 판정 토큰 컬럼
-> (`judge_input_tokens`·`judge_output_tokens`)이 추가됐다. **이전 사이클의 볼륨을 그대로 쓰면
-> 이 컬럼들이 없어 저장이 실패한다.** 위 볼륨 재생성을 반드시 한 번 실행한 뒤 5단계(정책
-> 인덱싱)를 다시 돌린다 — 볼륨을 지우면 정책 청크도 함께 사라진다.
->
-> **이번 사이클에도 스키마가 바뀌었다** — `policy_chunks` 에 임베딩 출처 컬럼
-> (`embedding_model`·`embedding_dimensions`, 둘 다 NOT NULL)이 추가됐다. 이전 볼륨을 그대로
-> 쓰면 정책 적재가 NOT NULL 위반으로 실패한다. 같은 볼륨 재생성 절차를 한 번 더 돌린다.
+**2026-10-13 문의자 확인 스키마는 멱등 적용이다.** `db.apply_schema()`가 새 확인/잠금
+테이블·확인 경로와 선점 시각·상태/사유/L1 쌍 제약을 적용한다. 시딩 명령은 스키마뿐 아니라
+주문 데이터를 upsert·삭제·commit하므로 **기존 자료의 스키마 확인만을 위해 시딩을 실행하지 않는다.**
+기존 개발 DB는 이번 검증에서 사용하거나 변경하지 않았다. 사용자가 적용하기 전 백업과
+현재 제약/컬럼을 확인하고, 스키마 적용을 별도 작업으로 실행한다. 과거 L2·임베딩 출처 도입 때의
+볼륨 재생성 절차를 이번 변경의 필수 단계로 읽지 않는다. 볼륨 삭제는 기록과 유료 색인을 지운다.
 
 ## 5. 정책 인덱싱 — **API 키 필요**
 
@@ -106,7 +94,11 @@ uv run python -m scripts.index_policies
 
 `data/policies/` 의 문서 4개를 조항 단위로 쪼개 임베딩하고 `policy_chunks` 에 적재한다(26건).
 재실행하면 중복 없이 갱신되고, 문서에서 사라진 조항은 삭제된다.
-**이 단계를 건너뛰면 정책 근거 검색이 항상 0건이라 모든 문의가 `no_evidence` 로 인계된다.**
+**정책 테이블이 0행이면 실제 정책 검색(`policy`·`both`)이 503 설정 오류로 끝난다.**
+응답의 `detail`에 위 인덱싱 명령이 들어 있으며 처리 기록·품질 지표는 남기지 않는다.
+`order`와 저장 기록 GET은 영향을 받지 않는다. 분류·재작성·임베딩 호출이 먼저 발생할 수
+있으므로 빈 인덱스 검사가 과금 전 선검사는 아니다. 정상 인덱스에서 컷·기권으로 근거가
+없어진 경우의 업무 판정은 그대로다.
 
 **라이브 실측 전에는 색인 출처를 확인한다.** DB 는 워크트리 사이에 공유되므로(컨테이너 이름과
 볼륨이 고정) 다른 작업이 같은 `policy_chunks` 를 건드릴 수 있다. 기대와 다르면 이 단계를 다시
@@ -142,10 +134,10 @@ uv run uvicorn reply_gate.api:app --reload
 
 ```bash
 uv run ruff check .            # 0
-uv run ruff format --check .   # 193 files
-uv run mypy                    # strict — 81 files, 0 errors
+uv run ruff format --check .   # 201 files
+uv run mypy                    # strict — 99 files, 0 errors
 uv run pytest                  # DB 를 띄운 실행에서만 건수 대조가 선다
-uv run pytest -m db            # 178 passed, 1,329 deselected · skip 0 이어야 한다
+uv run pytest -m db            # 287 passed, 2,194 deselected · skip 0 이어야 한다
 ```
 
 `pytest` 는 DB 기동을 전제한다. DB 가 없으면 `db` 마커 테스트가 사유를 담아 skip 되므로,
@@ -155,7 +147,7 @@ uv run pytest -m db            # 178 passed, 1,329 deselected · skip 0 이어�
 링크 쪽은 따로도 돌릴 수 있다:
 
 ```bash
-uv run python -m scripts.check_links        # 문서 50개 · 링크 429개 · 깨짐 0건
+uv run python -m scripts.check_links        # 문서 53개 · 링크 450개 · 깨짐 0건
 ```
 
 **건수 대조는 전체 스위트에서만 성립한다.** 경로·`-k`·`-m` 을 주면 그 세션이 스위트가 아니므로
@@ -163,7 +155,7 @@ uv run python -m scripts.check_links        # 문서 50개 · 링크 429개 · �
 
 **그리고 테스트 건수 쪽은 DB 를 띄운 실행에서만 성립한다.** 문서가 인용하는 것은 `N passed`
 인데 세션이 아는 것은 수집 건수이고, 둘은 **skip 이 0 일 때만** 같다. DB 가 없으면 `db` 마커
-178건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
+287건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
 검사 — 은 skip 과 무관해서 계속 대조한다). 이 갈래가 없던 첫 판은 `1,310 passed · 178 skipped`
 인 실행에서도 `1,488 passed` 인용을 초록으로 통과시켰다([findings 37](tracking/findings.md)).
 
@@ -219,7 +211,7 @@ uv run python -m scripts.evaluate --live --measurements 3 --judge-model claude-o
 가드가 대조를 **진행하며 차이를 병기**하고, 선언되지 않은 지문 불일치만 "대조 불가"가 된다.
 선언은 그 실행의 예외 처리이지 승격 등재의 정정이 아니다.
 
-### 다음에 풀셋 라이브를 사면 두 항목을 반드시 선언한다
+### 다음 라이브 비교 전에 코드 조건 변경을 확인한다
 
 **승격 기준선(`-28`·`-29`·`-30`)의 지문 두 칸이 지금 코드와 갈려 있다**
 ([findings 32](tracking/findings.md)) — 사이클 종료 뒤 감사 수정이 `draft_rule_version` 을
@@ -228,8 +220,16 @@ uv run python -m scripts.evaluate --live --measurements 3 --judge-model claude-o
 로 나온다(0 이나 "통과"가 아니다 — 그건 설계대로다).
 
 ```bash
-uv run python -m scripts.evaluate --live   --declare-experiment draft_rule_version   --declare-experiment l1_fixture_version
+uv run python -m scripts.evaluate --live   --declare-experiment draft_rule_version   --declare-experiment l1_fixture_version   --declare-experiment sql_guard_version
 ```
+
+**2026-09-30 정정:** 위 두 칸은 2026-08-26의 상태다. 전체 리뷰에서 claim 연결 판정과 SQL
+출력명 경계를 고치고 행동 탐침을 추가하여 현재는 `sql_guard_version`도 다르다. 위 명령은
+그 세 차이를 표시하는 예시이며 실행 승인이 아니다. L2 산출 해석은 새 `judge_rule_version`에
+기록한다. **과거 보고서에는 이 값이 없으므로 미상으로 남는다.** 선언하거나 대조가
+진행된다는 이유로 과거 parser까지 같은 조건이었다고 읽지 않는다. 새 실행의 규칙 버전이
+서로 다르면 별도 선언 없이는 대조가 거부되고, 선언해도 같은 세트로 묶지 않는다.
+판단 근거는 [결정0028](tracking/decisions/0028-L2-산출-해석-규칙을-별도-지문으로-기록한다.md)이다.
 
 **함께 지는 의무 하나 — 분모를 병기한다.** 채점표가 늘면서 **측정 1 의 검출 분모가
 26 → 28** 이 됐다(양성 28 · 음성 9). 선언한 실행의 비악화 판정은 **분모가 다른 두 값 사이의
@@ -470,3 +470,23 @@ docker compose down -v       # 볼륨까지 지운다 (데이터 삭제)
 ```
 
 서버를 백그라운드로 띄웠다면 종료를 확인한다: `pgrep -fl "uvicorn reply_gate"`.
+
+## 문의자 확인 도입 후 실행 주의 (2026-10-13)
+
+`PHONE_HMAC_SECRET`은 문의 처리에서 필요한 환경 비밀이다. 원문 키를 문서·CLI 인자·로그에
+넣지 않는다. GET 기록 조회와 무료 L1 검사는 그 키 없이 가능하다. 전화 뒷자리 누락은 상품명
+확인 대기이며 30분 뒤 확인 요청은 409다. 잘못된 뒷자리 5회는 주문별 15분 잠금이다.
+상품 확인 경로는 잠금과 독립이며 개인정보를 제외한다. HMAC은 네 자리의 낮은 엔트로피를
+늘리는 인증 수단이 아니며, 상품 확인은 주문 존재·상품명 노출을 받아들인 시연 계약이다.
+
+확인 요청을 원자적으로 선점한 뒤 모델/DB 실패가 나면 자동으로 재처리하지 않는다. 기록은
+대기+선점 상태로 남을 수 있고 다음 confirm은 409이므로 새 문의로 시작한다.
+기존 개발 DB의 역할·초기화 로그 설정도 자동 이관하지 않았다.
+
+과거 “유료 실측을 닫았다”는 문장은 2026-08-26의 결정이다. 2026-10-13 별도 승인으로
+새 3회 세트를 측정했지만 승격하지 않았다. 기존 반복 실행·색인과의 혼합을 막기 위해 격리
+DB를 사용했고 종료 후 삭제했다. [실측과 남은 판단](tracking/status.md#문의자-확인-도입-후-측정값승격-전--2026-10-13).
+
+평가는 처리 기록을 저장하지 않지만 전화 확인 상태는 별도 짧은 트랜잭션으로 확정될 수 있다.
+성공 시 실패 횟수 초기화나 새 확인 상태 행 생성도 쓰기다. 주문·정책 입력 고정 SHARE 잠금과
+확인 상태 쓰기를 고려해 라이브 평가는 전용 격리 DB에서 실행한다.

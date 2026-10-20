@@ -39,7 +39,8 @@ from reply_gate.gate import evaluate_draft
 from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
 from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
-from reply_gate.testing import LexicalEmbeddingClient
+from reply_gate.testing import LexicalEmbeddingClient, StubEvidenceCollector
+from tests.conftest import declared_settings
 
 INQUIRY_ID = "11111111-2222-3333-4444-555555555555"
 INQUIRY = "환불 신청은 언제까지 가능한가요? 제 주문도 확인해 주세요."
@@ -134,10 +135,10 @@ def _collector(
     테스트가 대역 분포 때문에 기권에 걸리면 그 테스트만 게이트를 명시적으로 끈다 —
     그 끄기는 사유와 함께 호출부에 적는다.
     """
-    return EvidenceCollector(
+    return StubEvidenceCollector(
         generation_client=cast(GenerationClient, client),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(
+        settings=declared_settings(
             vector_top_k=top_k,
             vector_similarity_threshold=threshold,
             sql_max_rows=max_rows,
@@ -577,7 +578,7 @@ def test_SQL_원문은_표시용_content에만_남고_allowlist_근거는_결과
 
     assert sql in content
     assert "010-9999-9999" in content
-    assert evidence_text == "1) status=배송중"
+    assert evidence_text == "1) status= 배송중"
 
 
 def test_SQL_계산_결과의_PII는_evidence_text에서_출처로_승인하지_않는다() -> None:
@@ -589,7 +590,7 @@ def test_SQL_계산_결과의_PII는_evidence_text에서_출처로_승인하지_
         pii_safe_output_columns=(),
     )
 
-    assert "customer_phone=010-9999-9999" in content
+    assert "customer_phone= 010-9999-9999" in content
     assert "010-9999-9999" not in evidence_text
 
 
@@ -685,7 +686,7 @@ def test_직접_컬럼_provenance는_접기와_무관하게_정상_에코를_보
 
     assert (
         evidence_text
-        == "1) customer_phone=\uff10\uff11\uff10-\uff11\uff12\uff13\uff14-\uff15\uff16\uff17\uff18"
+        == "1) customer_phone= \uff10\uff11\uff10-\uff11\uff12\uff13\uff14-\uff15\uff16\uff17\uff18"
     )
 
 
@@ -696,8 +697,8 @@ def test_SQL_계산_결과가_비PII면_L2용_evidence_text에_계속_남긴다(
         pii_safe_output_columns=(),
     )
 
-    assert "status_label=배송중" in content
-    assert evidence_text == "1) status_label=배송중"
+    assert "status_label= 배송중" in content
+    assert evidence_text == "1) status_label= 배송중"
 
 
 @pytest.mark.parametrize(
@@ -716,7 +717,7 @@ def test_DB가_노출하는_별칭과_직접_컬럼_provenance가_일치하면_P
         pii_safe_output_columns=(safe_name,),
     )
 
-    assert evidence_text == f"1) {row_name}=010-1234-5678"
+    assert evidence_text == f"1) {row_name}= 010-1234-5678"
 
 
 # ── text-to-SQL (DB 필요) ───────────────────────────────────────────────────

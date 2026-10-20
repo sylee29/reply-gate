@@ -252,6 +252,51 @@ def test_근거에_있는_번호는_표기가_달라도_통과한다() -> None:
     assert RejectReason.PII_DETECTED not in result.reject_reasons
 
 
+@pytest.mark.parametrize(
+    "texts",
+    [
+        ("연락처는 010", "9999 8888 입니다."),
+        ("연락처는 02", "123 4567 입니다."),
+        ("연락처는 1588", "1234 입니다."),
+        ("확인 번호는 900101", "1234567 입니다."),
+    ],
+    ids=["휴대전화", "일반전화", "대표번호", "주민등록번호"],
+)
+def test_claim_경계에서_조립된_근거_없는_PII도_기각한다(texts: tuple[str, str]) -> None:
+    """답변은 공백으로 연결되므로 개별 claim 검사만으로는 번호 조립을 놓친다."""
+    raw_draft = {"claims": [{"text": text, "citation_ids": [POLICY_ID]} for text in texts]}
+    evidences = [_evidence(POLICY_ID, "연락처 미기재")]
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
+
+    assert result.reject_reasons == (RejectReason.PII_DETECTED,)
+
+
+def test_claim_경계에서_조립되어도_근거에_있는_번호는_통과한다() -> None:
+    """경계 검사를 추가하면서 근거 유래 allowlist 에코를 기각하면 안 된다."""
+    raw_draft = {
+        "claims": [
+            {"text": "등록된 연락처는 010", "citation_ids": [SQL_ID]},
+            {"text": "1234 5678 입니다.", "citation_ids": [SQL_ID]},
+        ]
+    }
+    evidences = [_evidence(SQL_ID, "customer_phone=010-1234-5678", source=EvidenceSource.SQL)]
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_claim_연결은_실제_공백과_문장_구분을_보존한다() -> None:
+    """숫자 조각을 붙이거나 구두점을 없애 실제 답변에 없는 전화번호를 만들지 않는다."""
+    for texts in [("158", "81234"), ("지역번호는 02.", "접수번호는 1234567입니다.")]:
+        raw_draft = {"claims": [{"text": text, "citation_ids": [POLICY_ID]} for text in texts]}
+
+        result = evaluate_draft(raw_draft=raw_draft, evidences=_evidences())
+
+        assert result.verdict is Verdict.PASS
+
+
 def test_근거에_있는_이메일은_대문자로_에코해도_통과한다() -> None:
     evidences = [
         _evidence(SQL_ID, '{"email": "hong@example.com"}', source=EvidenceSource.SQL),
@@ -261,6 +306,111 @@ def test_근거에_있는_이메일은_대문자로_에코해도_통과한다() 
     result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
 
     assert result.verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize("suffix", ["입니다.", "으로 연락해 주세요.", "을 확인했습니다."])
+@pytest.mark.parametrize("source_is_prose", [False, True], ids=["근거는_주소", "근거는_산문"])
+def test_이메일_뒤_한국어_산문_접미사는_양쪽에서_같은_주소로_읽는다(
+    suffix: str, source_is_prose: bool
+) -> None:
+    """한국어를 도메인에 붙여 정상 에코를 기각하던 양방향 오탐을 재현한다."""
+    prose = "등록된 이메일은 hong@example.com" + suffix
+    source = prose if source_is_prose else "customer_email=hong@example.com"
+    answer = "hong@example.com" if source_is_prose else prose
+
+    result = evaluate_draft(raw_draft=_draft(text=answer), evidences=[_evidence(POLICY_ID, source)])
+
+    assert result.verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    ("source", "answer"),
+    [
+        ("customer_email=hong@example.com입니다", "hong@example.com"),
+        ("customer_email = hong@example.com입니다", "등록된 주소는 hong@example.com입니다."),
+        ("customer_email=hong@example.com", "<hong@example.com입니다>"),
+        ("customer_email=hong@example.com", '"hong@example.com입니다"'),
+        ("customer_email=hong@example.com", "`hong@example.com입니다`"),
+        ("customer_email=hong@example.com", "hong@example.com입니다.evil"),
+        ("customer_email=hong@example.com", "hong@example.com입니다..evil"),
+        ("customer_email=hong@example.com", "hong@example.com입니다._evil"),
+        ("customer_email=hong@example.com", "hong@example.com입니다-evil"),
+        ("customer_email=hong@example.com", "hong@example.com입니다evil"),
+        ("customer_email=hong@example.com", "hong@example.한국"),
+        ("customer_email=hong@example.com", "hong@example.com한국"),
+        ("customer_email=hong@example.com", "other@example.com입니다."),
+        ("customer_email=hong_name@example.com", "hong-name@example.com입니다."),
+        ("customer_email=hong@example.com", "<주소 hong@example.com입니다."),
+        ("customer_email=hong@example.com", '"주소 hong@example.com입니다.'),
+        ("customer_email=hong@example.com", "[주소 hong@example.com입니다."),
+    ],
+)
+def test_한국어_이메일_경계가_다른_주소나_명시된_혼합_IDN을_승인하지_않는다(
+    source: str, answer: str
+) -> None:
+    """한쪽 주소의 부분값을 allowlist로 빌리거나 명시된 주소를 산문으로 줄이면 안 된다."""
+    result = evaluate_draft(raw_draft=_draft(text=answer), evidences=[_evidence(POLICY_ID, source)])
+
+    assert result.reject_reasons == (RejectReason.PII_DETECTED,)
+
+
+@pytest.mark.parametrize(
+    "address", ["hong@example.한국", "hong@example.com한국", "hong@example.com입니다"]
+)
+def test_명시_구분자_안의_IDN_주소는_완전일치로_에코한다(address: str) -> None:
+    """한국어를 전부 지우는 수정이 아니라 명시된 주소는 그대로 비교하는 경계다."""
+    result = evaluate_draft(
+        raw_draft=_draft(text=f"등록된 주소는 <{address}>입니다."),
+        evidences=[_evidence(POLICY_ID, f"customer_email={address}")],
+    )
+
+    assert result.verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("<", ">"),
+        ("(", ")"),
+        ("[", "]"),
+        ("{", "}"),
+        ('"', '"'),
+        ("'", "'"),
+        ("`", "`"),
+        ("\u201c", "\u201d"),
+        ("\u2018", "\u2019"),
+    ],
+)
+def test_claim_경계를_넘는_명시_이메일은_최종_답변의_문맥으로_검사한다(
+    left: str, right: str
+) -> None:
+    """조각만 접으면 실제 답변에서는 literal인 IDN의 일부를 새 주소로 오인한다."""
+    raw_draft = {
+        "claims": [
+            {"text": text, "citation_ids": [POLICY_ID]}
+            for text in (left + "주소", "hong@example.com입니다", right)
+        ]
+    }
+    literal = _evidence(POLICY_ID, "customer_email=hong@example.com입니다")
+    different = _evidence(POLICY_ID, "customer_email=hong@example.com")
+
+    assert evaluate_draft(raw_draft=raw_draft, evidences=[literal]).verdict is Verdict.PASS
+    assert evaluate_draft(raw_draft=raw_draft, evidences=[different]).reject_reasons == (
+        RejectReason.PII_DETECTED,
+    )
+
+
+@pytest.mark.parametrize("prefix", [") (주소", "> <주소", "] [주소", "} {주소"])
+def test_먼저_나온_닫기_구분자가_뒤의_열린_주소_구분자를_상쇄하지_않는다(
+    prefix: str,
+) -> None:
+    """개수 차이만 보면 앞의 stray closer가 뒤의 미닫힌 literal 보호를 없앤다."""
+    result = evaluate_draft(
+        raw_draft=_draft(text=f"{prefix} hong@example.com입니다."),
+        evidences=[_evidence(POLICY_ID, "customer_email=hong@example.com")],
+    )
+
+    assert result.reject_reasons == (RejectReason.PII_DETECTED,)
 
 
 @pytest.mark.parametrize(

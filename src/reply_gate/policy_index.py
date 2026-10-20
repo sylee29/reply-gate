@@ -25,10 +25,11 @@ from pathlib import Path
 import psycopg
 from pgvector import Vector
 from pgvector.psycopg import register_vector
+from psycopg import sql
 from psycopg.rows import DictRow
 
 from reply_gate.contracts import policy_evidence_id
-from reply_gate.llm import EmbeddingClient
+from reply_gate.llm import EmbeddingClient, validate_embedding_vectors
 
 __all__ = [
     "DEFAULT_POLICY_DIR",
@@ -36,12 +37,14 @@ __all__ = [
     "PlantedKind",
     "PolicyChunk",
     "PolicyDocument",
+    "PolicyIndexEmptyError",
     "PolicyIndexProvenanceError",
     "PolicySearchHit",
     "index_policy_documents",
     "load_policy_documents",
     "parse_policy_document",
     "search_policy_chunks",
+    "search_policy_rankings",
 ]
 
 #: 저장소의 정책 문서 원본 위치.
@@ -53,6 +56,10 @@ POLICY_INDEX_STAGE = "policy_index"
 _FRONT_MATTER = re.compile(r"\A---\n(?P<body>.*?)\n---\n", re.DOTALL)
 _PLANTED = re.compile(r"<!--\s*planted:\s*(?P<kind>[a-z_]+)\s*(?:;\s*note:\s*(?P<note>.*?))?-->")
 _HEADING = re.compile(r"^##\s+(?P<article>\S+)\s+(?P<title>.+?)\s*$")
+
+
+class PolicyIndexEmptyError(RuntimeError):
+    """정책 미적재는 검색 품질이 아니라 설정 오류다 — 처리 기록으로 집계하지 않는다."""
 
 
 class PolicyIndexProvenanceError(RuntimeError):
@@ -253,10 +260,7 @@ def index_policy_documents(
     embedding = embedder.embed(
         stage=POLICY_INDEX_STAGE, texts=[chunk.embedding_text for chunk in chunks]
     )
-    if len(embedding.vectors) != len(chunks):
-        raise ValueError(
-            f"임베딩 개수가 조항 수와 다르다: {len(embedding.vectors)} != {len(chunks)}"
-        )
+    validate_embedding_vectors(embedding.vectors, count=len(chunks), dimensions=embedder.dimensions)
 
     register_vector(conn)
     with conn.cursor() as cur:
@@ -304,7 +308,7 @@ def index_policy_documents(
 
 
 def _assert_index_provenance(
-    cur: psycopg.Cursor[DictRow], *, embedding_model: str, embedding_dimensions: int
+    rows: Sequence[DictRow], *, embedding_model: str, embedding_dimensions: int
 ) -> None:
     """저장된 벡터가 전부 질의와 같은 공간에서 나왔는지 확인한다 — 아니면 거부한다.
 
@@ -312,19 +316,13 @@ def _assert_index_provenance(
     **오류처럼 보이지 않는다.** 실측에서 다른 모델의 질의는 전 조항이 임계값 아래로 떨어져
     `no_evidence` 로 끝났다 — 낡은 인덱스가 "검색이 못 찾았다"로 위장한 것이다.
 
-    적재 전(행 0개)은 불일치가 아니다. 검색할 것이 없으면 빈 결과와 같다.
+    적재 전(행 0개)은 별도의 설정 오류다. NULL 벡터 행도 적재된 행으로 센다.
     """
-    cur.execute(
-        """
-        SELECT embedding_model, embedding_dimensions, count(*) AS n
-        FROM policy_chunks
-        GROUP BY embedding_model, embedding_dimensions
-        ORDER BY embedding_model, embedding_dimensions
-        """
-    )
-    rows = cur.fetchall()
     if not rows:
-        return
+        raise PolicyIndexEmptyError(
+            "정책 인덱스가 비어 있다. "
+            "`uv run python -m scripts.index_policies` 로 정책을 적재해야 한다."
+        )
     if len(rows) == 1 and (
         rows[0]["embedding_model"] == embedding_model
         and int(rows[0]["embedding_dimensions"]) == embedding_dimensions
@@ -332,7 +330,9 @@ def _assert_index_provenance(
         return
     stored = ", ".join(
         f"{row['embedding_model']}/{int(row['embedding_dimensions'])}차원 {int(row['n'])}건"
-        for row in rows
+        for row in sorted(
+            rows, key=lambda row: (row["embedding_model"], row["embedding_dimensions"])
+        )
     )
     raise PolicyIndexProvenanceError(
         f"정책 인덱스의 임베딩 출처가 질의와 다르다 — 저장: {stored}, "
@@ -372,36 +372,88 @@ def search_policy_chunks(
     않고 거부한다(fail-closed) — 이 확인을 호출자에게 맡기면 새 호출자가 생길 때마다 다시
     빠뜨릴 수 있고, 빠뜨린 결과는 오류가 아니라 정상 판정처럼 보인다.
     """
-    if top_k <= 0:
+    return search_policy_rankings(
+        conn=conn,
+        query_vectors=(query_vector,),
+        top_k=top_k,
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+    )[0]
+
+
+def search_policy_rankings(
+    *,
+    conn: psycopg.Connection[DictRow],
+    query_vectors: Sequence[Sequence[float]],
+    top_k: int,
+    embedding_model: str,
+    embedding_dimensions: int,
+) -> list[list[PolicySearchHit]]:
+    """여러 질의의 출처 검사와 검색을 하나의 statement snapshot으로 묶는다.
+
+    모델 호출은 이미 끝난 뒤다. caller의 트랜잭션 isolation/commit은 바꾸지 않고,
+    원문과 재작성 사이 재색인이 commit돼도 한 정책 판에서만 결과를 만든다.
+    """
+    if not query_vectors:
         return []
+    if top_k <= 0:
+        return [[] for _ in query_vectors]
     register_vector(conn)
-    vector = Vector(list(query_vector))
+    parameters: list[object] = []
+    for index, vector in enumerate(query_vectors):
+        parameters.extend((index, Vector(list(vector))))
+    parameters.extend((embedding_model, embedding_dimensions, top_k))
     with conn.cursor() as cur:
-        _assert_index_provenance(
-            cur, embedding_model=embedding_model, embedding_dimensions=embedding_dimensions
-        )
         cur.execute(
-            """
-            SELECT evidence_id, document_slug, document_title, article, article_title,
-                   content, 1 - (embedding <=> %s) AS similarity
-            FROM policy_chunks
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> %s, evidence_id
-            LIMIT %s
-            """,
-            (vector, vector, top_k),
+            sql.SQL("""
+            WITH queries(query_index, query_vector) AS (VALUES {queries}),
+            provenance AS MATERIALIZED (
+                SELECT COALESCE(jsonb_agg(to_jsonb(spaces)), '[]'::jsonb) AS index_provenance,
+                       COALESCE(bool_and(embedding_model = %s AND embedding_dimensions = %s),
+                                true) AS compatible
+                FROM (
+                    SELECT embedding_model, embedding_dimensions, count(*) AS n
+                    FROM policy_chunks
+                    GROUP BY embedding_model, embedding_dimensions
+                ) spaces
+            ), compatible_candidates AS MATERIALIZED (
+                SELECT chunks.* FROM policy_chunks chunks CROSS JOIN provenance
+                WHERE provenance.compatible AND chunks.embedding IS NOT NULL
+            )
+            SELECT queries.query_index, provenance.index_provenance, hits.*,
+                   1 - hits.distance AS similarity
+            FROM queries CROSS JOIN provenance
+            LEFT JOIN LATERAL (
+                SELECT evidence_id, document_slug, document_title, article, article_title,
+                       content, embedding <=> queries.query_vector AS distance
+                FROM compatible_candidates
+                ORDER BY embedding <=> queries.query_vector, evidence_id
+                LIMIT %s
+            ) hits ON true
+            ORDER BY queries.query_index, hits.distance, hits.evidence_id
+            """).format(
+                queries=sql.SQL(", ").join(sql.SQL("(%s, %s::vector)") for _ in query_vectors)
+            ),
+            parameters,
         )
         rows = cur.fetchall()
-
-    return [
-        PolicySearchHit(
-            evidence_id=row["evidence_id"],
-            document_slug=row["document_slug"],
-            document_title=row["document_title"],
-            article=row["article"],
-            article_title=row["article_title"],
-            content=row["content"],
-            similarity=float(row["similarity"]),
-        )
-        for row in rows
-    ]
+    _assert_index_provenance(
+        rows[0]["index_provenance"],
+        embedding_model=embedding_model,
+        embedding_dimensions=embedding_dimensions,
+    )
+    rankings: list[list[PolicySearchHit]] = [[] for _ in query_vectors]
+    for row in rows:
+        if row["evidence_id"] is not None:
+            rankings[row["query_index"]].append(
+                PolicySearchHit(
+                    evidence_id=row["evidence_id"],
+                    document_slug=row["document_slug"],
+                    document_title=row["document_title"],
+                    article=row["article"],
+                    article_title=row["article_title"],
+                    content=row["content"],
+                    similarity=float(row["similarity"]),
+                )
+            )
+    return rankings

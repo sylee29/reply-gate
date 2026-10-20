@@ -21,7 +21,7 @@
 │   ├── standards.md               → 검증 게이트, 소유권, 하드 게이트, 재시도 상한
 │   ├── engineering-notes.md       → 실제로 뚫렸던 경로와 걸렸던 함정
 │   ├── operations.md              → 설치부터 실행·검증·지표 산출까지의 순서
-│   ├── contracts.md               → HTTP 표면 4개와 답변 계약
+│   ├── contracts.md               → HTTP 표면 5개와 답변 계약
 │   ├── demo.md                    → README 데모 절의 나머지 네 장면
 │   ├── gates.md                   → README L1·L2 절의 세부. 판정 규칙 정본은 business-rules.md
 │   ├── retrieval.md               → README 검색 절의 사다리 이후. 실측 정본은 tracking/status.md
@@ -97,7 +97,7 @@
 | 평가·지표 | `docs/tracking/status.md` 의 첫 실측값 + `scripts/AGENTS.md` 의 리포트 불변식 + `docs/tracking/decisions/`**`0025`**(구간 아홉·미측정은 0 이 아니다) |
 | 벡터 검색·임베딩 | `docs/engineering-notes.md` 의 pgvector 캐스트 + **"τ 는 임베딩 모델에 묶인다"** + 대역 수치 주의 + `docs/tracking/decisions/`**`0023`**(검증되지 않은 임베딩 조건은 조립에서 죽는다) |
 | 근거 채택 축·기권 게이트(τ) | `docs/architecture.md` 의 "근거 채택은 축이 둘이다" + `docs/tracking/decisions/0009`·`0012`·`0014`·**`0022`**(미정의 사유는 갈라 처분한다·검색 정렬 tie-break) |
-| 회귀 가드·승격 기준선 | `scripts/AGENTS.md` 불변식 16~18 + `src/reply_gate/AGENTS.md` 의 `regression_guard.py` 행 + `docs/tracking/decisions/`**`0026`**(지문 스물다섯 칸과 계보 단절의 대가)·**`0027`**(재등재) |
+| 회귀 가드·승격 기준선 | `scripts/AGENTS.md` 불변식 16~18 + `src/reply_gate/AGENTS.md` 의 `regression_guard.py` 행 + `docs/tracking/decisions/`**`0026`**(지문 스물다섯 칸과 계보 단절의 대가)·**`0027`**(재등재)·**`0028`**(L2 산출 해석 규칙 지문·과거 미상 보존) |
 | 테스트·구조 검사 | `tests/AGENTS.md` (음성 대조·검사 대상 유도·`declared_settings()` 규칙) |
 | 비용·토큰·달러 | `docs/tracking/pricing.md` (**기준일을 반드시 함께 인용한다**) + `docs/contracts.md` 의 "토큰 집계 경계" |
 

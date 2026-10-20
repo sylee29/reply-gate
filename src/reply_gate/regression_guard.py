@@ -90,6 +90,8 @@ LIVE_SERIES_PREFIX: Final = "evaluation-live"
 #: 허용 캐스트 타입·PII 유래 승인)의 판 · 검색 정렬의 tie-break · 기권 게이트의 미정의
 #: 처리 방식. **이 확장은 그 이전에 커밋된 라이브 전부를 그 항목 "미상"으로 만든다** —
 #: 대조 계보가 한 번 끊기는 대가를 재등재 시점에 치른 것이다.
+#: L2 산출 해석 규칙은 별도 판이다. 과거 프롬프트 지문으로 추정하지 않아 옛 값은 미상이고,
+#: 새 세트 편입에는 이 값까지 알려진 동일성을 요구한다. 기존 승격 참조는 소급 수정하지 않는다.
 FINGERPRINT_FIELDS: Final[tuple[str, ...]] = (
     "label_version",
     "retrieval_labels_version",
@@ -103,10 +105,17 @@ FINGERPRINT_FIELDS: Final[tuple[str, ...]] = (
     "embedding_dimensions",
     "top_k",
     "generation_model",
+    "intent_prompt_version",
+    "sql_prompt_version",
+    "draft_prompt_version",
+    "rewrite_prompt_version",
+    "policy_data_version",
+    "order_data_version",
     "judge_model",
     "judge_effort",
     "judge_thinking",
     "judge_prompt_version",
+    "judge_rule_version",
     "judge_fixture_version",
     "judge_prompt_caching",
     "draft_rule_version",
@@ -685,6 +694,14 @@ def load_promoted_baseline(
                 "한다. 승격은 사람이 이 파일을 채우는 것뿐이고 하네스가 대신 채우지 않는다."
             ),
         )
+    if any(Path(stem).name != stem or "\\" in stem or stem in {".", ".."} for stem in stems):
+        return BaselineNotRegistered(
+            path=display, reason="승격 참조의 stem은 경로가 아닌 단일 파일 이름이어야 한다"
+        )
+    if len(set(stems)) != len(stems):
+        return BaselineNotRegistered(
+            path=display, reason="승격 참조에 중복 회차가 있다 — 서로 다른 실측만 정족수를 채운다"
+        )
     missing = [key for key in ("promoted_at", "promoted_by", "reason") if not promotion.get(key)]
     if missing:
         return BaselineNotRegistered(
@@ -817,6 +834,7 @@ def compare_run_sets(
     losses: list[EvidenceLoss] = []
     unknown: list[str] = []
     unobserved: list[str] = []
+    incomplete_cases: list[str] = []
 
     baseline_runs = len(baseline.runs)
     candidate_runs = len(candidate.runs)
@@ -843,6 +861,8 @@ def compare_run_sets(
     for case_id in sorted(set(baseline.case_ids()) | set(candidate.case_ids())):
         baseline_seen = [run.cases[case_id] for run in baseline.runs if case_id in run.cases]
         candidate_seen = [run.cases[case_id] for run in candidate.runs if case_id in run.cases]
+        if len(baseline_seen) != baseline_runs or len(candidate_seen) != candidate_runs:
+            incomplete_cases.append(case_id)
         if not baseline_seen:
             unknown.append(f"`{case_id}` 은 기준선 산출물에 없다 — 대조하지 않는다")
             continue
@@ -868,7 +888,7 @@ def compare_run_sets(
         # ③ 감시 모집단은 "기준선 3/3" 으로 한정하지 않는다 — 붕괴는 미달, 감소는 경보.
         elif baseline_matched > 0 and candidate_matched == 0:
             collapses.append(finding)
-        elif candidate_matched < baseline_matched:
+        elif candidate_matched * len(baseline_seen) < baseline_matched * len(candidate_seen):
             decreases.append(finding)
 
         if baseline_evidence_known and candidate_evidence_known:
@@ -914,6 +934,8 @@ def compare_run_sets(
     # 헤드라인이 "통과"라고 적히면, 그것이 바로 하드 게이트가 금지하는 "미실행을 통과로
     # 채우기"다. 사유가 아래 미판정 줄에만 남아 있는 것으로는 부족하다 — 판정 문면이 말해야 한다.
     held: list[str] = []
+    if incomplete_cases:
+        held.append("일부 회차에 비교 케이스가 빠졌다: " + ", ".join(incomplete_cases))
     if candidate_runs < expected_run_count:
         shortage = f"조건이 확인된 실측 {candidate_runs}/{expected_run_count} — 세트가 아직 안 찼다"
         if candidate.exclusions:
@@ -978,6 +1000,7 @@ JUDGING_FINGERPRINT_FIELDS: Final[frozenset[str]] = frozenset(
         "judge_model",
         "judge_effort",
         "judge_prompt_version",
+        "judge_rule_version",
         "judge_fixture_version",
         "judge_prompt_caching",
     }
@@ -1171,8 +1194,13 @@ def _no_change(
     label: str, baseline: Iterable[float | None], candidate: Iterable[float | None]
 ) -> str | None:
     """무변경 검사 1건. 어느 쪽이든 미상이면 변경으로 적지 않는다."""
-    before = _common(baseline)
-    after = _common(candidate)
+    baseline_values, candidate_values = tuple(baseline), tuple(candidate)
+    for side, values in (("기준선", baseline_values), ("이번", candidate_values)):
+        known = {value for value in values if value is not None}
+        if len(known) > 1:
+            return f"{label}: {side} 세트 안의 결정론 값이 일치하지 않는다"
+    before = _common(baseline_values)
+    after = _common(candidate_values)
     if before is None or after is None or before == after:
         return None
     return f"{label}: 기준선 {_rate(before)} → 이번 {_rate(after)}"
@@ -1358,12 +1386,19 @@ def _binding_line(
             baseline_source=promotion.path,
         )
     runs: list[RunSummary] = []
+    files_seen: set[tuple[int, int]] = set()
     missing: list[str] = []
     for stem in promotion.report_stems:
         path = reports_dir / f"{stem}.json"
         try:
+            identity = path.stat()
+            file_id = (identity.st_dev, identity.st_ino)
+            if file_id in files_seen:
+                missing.append(f"{stem}: 다른 stem과 같은 실제 파일을 가리킨다")
+                continue
+            files_seen.add(file_id)
             runs.append(load_run_summary(path))
-        except RunSummaryError as exc:
+        except (OSError, RunSummaryError) as exc:
             missing.append(f"{stem}: {exc}")
     if missing or not runs:
         return BaselineLine(

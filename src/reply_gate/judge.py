@@ -3,8 +3,8 @@
 **이 모듈은 판정만 한다.** 파이프라인 제어·저장·재생성·L2 스위치 판단은 하지 않고,
 "초안 1개 + 근거"를 받아 **시도당 1회 배치 판정**하는 클래스만 제공한다 — 재생성 초안을
 다시 판정해 문의당 최대 2회가 되는 것은 호출 횟수를 통제하는 파이프라인의 몫이다.
-배치인 이유는 기능 근거다: 모순 감지가 claim·근거 교차 시야를 요구하므로 claim 별
-개별 호출로 쪼갤 수 없다 (docs/business-rules.md "L2 판정 규칙").
+전체 근거쌍과 초안을 한 번에 비교하는 현재 구현의 계약이다. 다른 분할 설계가 원리적으로
+불가능하다는 뜻은 아니다 (docs/business-rules.md "L2 판정 규칙").
 
 입력 조립은 두 절로 나뉜다 (docs/business-rules.md "뒷받침 판정 — claim 단위"·
 "모순 판정 — 근거쌍 단위"):
@@ -390,6 +390,15 @@ def _parse_judge_result(data: object, *, draft: Draft, evidence: Sequence[Eviden
         )
     if RejectReason.CONTRADICTORY_EVIDENCE in reject_reasons and not contradictions:
         raise _ParseError("contradictory_evidence 사유가 있는데 모순 근거쌍 기록이 없다")
+    if RejectReason.CONTRADICTORY_EVIDENCE in reject_reasons:
+        cited_ids = {citation_id for claim in draft.claims for citation_id in claim.citation_ids}
+        if not any(
+            pair.evidence_id_a in cited_ids or pair.evidence_id_b in cited_ids
+            for pair in contradictions
+        ):
+            raise _ParseError(
+                "contradictory_evidence 사유가 있지만 모순 근거쌍을 인용한 claim이 없다"
+            )
 
     return JudgeResult(
         verdict=verdict,

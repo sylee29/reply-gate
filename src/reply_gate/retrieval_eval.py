@@ -13,6 +13,7 @@ from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
 from statistics import fmean
+from tempfile import NamedTemporaryFile
 from typing import Any, Final, cast
 
 from pydantic import SecretStr
@@ -28,6 +29,7 @@ from reply_gate.llm import (
     OpenAIEmbeddingClient,
     OpenAIGenerationClient,
     OptionalEmbeddingDependencyError,
+    validate_embedding_vectors,
 )
 from reply_gate.policy_index import (
     DEFAULT_POLICY_DIR,
@@ -111,7 +113,6 @@ __all__ = [
     "RerankStats",
     "RetrievalConfigurationError",
     "RetrievalEvalConfig",
-    "RetrievalEvaluation",
     "RetrievalQuery",
     "RetrievalScore",
     "RetrievedCase",
@@ -140,7 +141,6 @@ __all__ = [
     "score_retrieval",
     "score_strategy_ladder",
     "write_chunking_report",
-    "write_report",
     "write_strategy_report",
 ]
 
@@ -148,7 +148,7 @@ DEFAULT_CUTOFF_SWEEP: Final = tuple(round(0.10 + index * 0.05, 2) for index in r
 _ROOT: Final = Path(__file__).resolve().parents[2]
 DEFAULT_RETRIEVAL_REPORT_DIR: Final = _ROOT / "reports"
 DEFAULT_EMBEDDING_CACHE_DIR: Final = _ROOT / ".retrieval-cache"
-STUB_EMBEDDING_MODEL: Final = "lexical-2gram-v1"
+STUB_EMBEDDING_MODEL: Final = LexicalEmbeddingClient.LEGACY_MODEL
 STUB_DEFAULT_CUTOFF: Final = 0.10
 DEFAULT_RRF_K: Final = 60
 #: RRF 점수는 순위 기반이라 절대 관련성을 표현하지 못한다. 기본값은 무필터(0.0)이고,
@@ -354,6 +354,11 @@ class _IdentityRerankClient:
         return JsonCompletion(data={"evidence_ids": evidence_ids}, input_tokens=0, output_tokens=0)
 
 
+def _require_positive_integer(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name}는 bool이 아닌 양의 정수여야 한다")
+
+
 @dataclass(frozen=True)
 class RetrievalEvalConfig:
     """벡터 단독 비교의 재현 가능한 실행 조건."""
@@ -368,10 +373,8 @@ class RetrievalEvalConfig:
     def __post_init__(self) -> None:
         if not self.model.strip():
             raise ValueError("model은 비어 있지 않아야 한다")
-        if self.dimensions <= 0:
-            raise ValueError("dimensions는 1 이상이어야 한다")
-        if self.top_k <= 0:
-            raise ValueError("top_k는 1 이상이어야 한다")
+        _require_positive_integer("dimensions", self.dimensions)
+        _require_positive_integer("top_k", self.top_k)
         if not 0.0 <= self.cutoff <= 1.0:
             raise ValueError("cutoff는 0.0 이상 1.0 이하여야 한다")
         if not self.cutoff_sweep:
@@ -430,12 +433,10 @@ class StrategyCutoffs:
     def __post_init__(self) -> None:
         if not 0.0 <= self.cosine_similarity <= 1.0:
             raise ValueError("cosine_similarity는 0.0 이상 1.0 이하여야 한다")
-        if self.rrf_score < 0.0:
+        if not math.isfinite(self.rrf_score) or self.rrf_score < 0.0:
             raise ValueError("rrf_score는 0.0 이상이어야 한다")
-        if self.rerank_top_n <= 0:
-            raise ValueError("rerank_top_n은 1 이상이어야 한다")
-        if self.fusion_pool_size <= 0:
-            raise ValueError("fusion_pool_size는 1 이상이어야 한다")
+        _require_positive_integer("rerank_top_n", self.rerank_top_n)
+        _require_positive_integer("fusion_pool_size", self.fusion_pool_size)
 
 
 @dataclass(frozen=True)
@@ -742,16 +743,6 @@ class CutoffSweepPoint:
 
 
 @dataclass(frozen=True)
-class RetrievalEvaluation:
-    """한 벡터 구성의 기본 컷 결과, 컷 스윕, 최적점."""
-
-    config: RetrievalEvalConfig
-    score: RetrievalScore
-    sweep: tuple[CutoffSweepPoint, ...]
-    best_cutoff: float | None
-
-
-@dataclass(frozen=True)
 class ReportPaths:
     """같은 stem을 공유하는 Markdown/JSON 보고서 경로."""
 
@@ -789,7 +780,7 @@ def _read_cached_vector(
 ) -> list[float] | None:
     try:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (OSError, ValueError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -803,6 +794,10 @@ def _read_cached_vector(
         or len(vector) != dimensions
         or any(not isinstance(value, int | float) for value in vector)
     ):
+        return None
+    try:
+        validate_embedding_vectors([vector], count=1, dimensions=dimensions)
+    except ValueError:
         return None
     return [float(value) for value in vector]
 
@@ -821,12 +816,22 @@ def _write_cached_vector(
         "text_hash": text_hash,
         "vector": list(vector),
     }
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 @dataclass
@@ -882,16 +887,10 @@ def _embed_with_cache(
         if stats is not None:
             stats.embedded_texts += len(missing_texts)
             stats.total_tokens += embedded.total_tokens
-        if len(embedded.vectors) != len(missing_texts):
-            raise ValueError(
-                "임베딩 개수가 대상 텍스트 수와 다르다: "
-                f"{len(embedded.vectors)} != {len(missing_texts)}"
-            )
+        validate_embedding_vectors(
+            embedded.vectors, count=len(missing_texts), dimensions=config.dimensions
+        )
         for target_text, vector in zip(missing_texts, embedded.vectors, strict=True):
-            if len(vector) != config.dimensions:
-                raise ValueError(
-                    f"임베딩 차원이 구성과 다르다: {len(vector)} != {config.dimensions}"
-                )
             text_hash = _text_hash(target_text)
             _write_cached_vector(
                 path=paths[target_text],
@@ -930,6 +929,8 @@ def retrieve_cases(
     `stats` 를 주면 캐시 적중·구매를 그 객체에 누적한다 — 과금 보고가 추정이 아니라
     관측이 되게 하는 계량기이고, 채점에는 영향을 주지 않는다.
     """
+    if embedder.model != config.model:
+        raise ValueError(f"임베더 모델이 구성과 다르다: {embedder.model} != {config.model}")
     if embedder.dimensions != config.dimensions:
         raise ValueError(
             f"임베더 차원이 구성과 다르다: {embedder.dimensions} != {config.dimensions}"
@@ -1060,6 +1061,9 @@ def retrieve_strategy_ladder(
     uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
     uses_hybrid = any(RetrievalStage.HYBRID in strategy.stages for strategy in strategy_tuple)
     uses_rerank = any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple)
+    if uses_hybrid:
+        _require_positive_integer("rrf_k", rrf_k)
+        _require_positive_integer("ngram_size", ngram_size)
     injected_rewrites = _validate_rewritten_queries(
         queries=queries,
         rewritten_queries=rewritten_queries,
@@ -1314,19 +1318,7 @@ def score_retrieval(
             )
         )
 
-    aggregate = AggregateMetrics(
-        recall_at_1=_mean([case.recall_at_1 for case in cases if case.recall_at_1 is not None]),
-        recall_at_3=_mean([case.recall_at_3 for case in cases if case.recall_at_3 is not None]),
-        recall_at_5=_mean([case.recall_at_5 for case in cases if case.recall_at_5 is not None]),
-        accepted_precision=_mean(
-            [case.accepted_precision for case in cases if case.accepted_precision is not None]
-        ),
-        accepted_recall=_mean(
-            [case.accepted_recall for case in cases if case.accepted_recall is not None]
-        ),
-        precision_case_count=sum(case.accepted_precision is not None for case in cases),
-        recall_case_count=sum(case.accepted_recall is not None for case in cases),
-    )
+    aggregate = _aggregate_cases(cases)
     return RetrievalScore(cutoff=cutoff, top_k=top_k, cases=tuple(cases), aggregate=aggregate)
 
 
@@ -1404,7 +1396,7 @@ def _score_cases(
     return tuple(cases)
 
 
-def _aggregate_cases(cases: Sequence[StrategyCaseScore]) -> AggregateMetrics:
+def _aggregate_cases(cases: Sequence[CaseScore | StrategyCaseScore]) -> AggregateMetrics:
     return AggregateMetrics(
         recall_at_1=_mean([case.recall_at_1 for case in cases if case.recall_at_1 is not None]),
         recall_at_3=_mean([case.recall_at_3 for case in cases if case.recall_at_3 is not None]),
@@ -1532,10 +1524,11 @@ def _boundary(
     rows: Sequence[GatedCaseRow], case_ids: Sequence[str], *, tightest: str
 ) -> BoundaryCase | None:
     """τ 경계에 가장 가까운 케이스. `tightest="min"` 은 채택 쪽, `"max"` 는 기권 쪽이다."""
+    selected_ids = set(case_ids)
     candidates = [
         row
         for row in rows
-        if row.case_id in set(case_ids) and row.statistic_value is not None
+        if row.case_id in selected_ids and row.statistic_value is not None
         if row.margin_to_tau is not None
     ]
     if not candidates:
@@ -1891,28 +1884,6 @@ def _score(value: float | None) -> str:
     return "미측정" if value is None else f"{value:.6f}"
 
 
-def _report_slug(config: RetrievalEvalConfig) -> str:
-    mode = "stub" if config.is_stub else "live"
-    model = re.sub(r"[^a-z0-9]+", "-", config.model.lower()).strip("-") or "model"
-    cutoff = f"{round(config.cutoff * 100):03d}"
-    return f"vector-{mode}-{model}-d{config.dimensions}-k{config.top_k}-c{cutoff}"
-
-
-def _report_paths(output_dir: Path, config: RetrievalEvalConfig, suffix: int | None) -> ReportPaths:
-    ending = "" if suffix is None else f"-{suffix}"
-    stem = f"retrieval-{_report_slug(config)}{ending}"
-    return ReportPaths(markdown=output_dir / f"{stem}.md", json=output_dir / f"{stem}.json")
-
-
-def _next_report_paths(output_dir: Path, config: RetrievalEvalConfig) -> ReportPaths:
-    suffix: int | None = None
-    while True:
-        paths = _report_paths(output_dir, config, suffix)
-        if not paths.markdown.exists() and not paths.json.exists():
-            return paths
-        suffix = 2 if suffix is None else suffix + 1
-
-
 def _metrics_json(metrics: AggregateMetrics) -> dict[str, float | int | None]:
     return {
         "recall_at_1": metrics.recall_at_1,
@@ -1923,183 +1894,6 @@ def _metrics_json(metrics: AggregateMetrics) -> dict[str, float | int | None]:
         "precision_case_count": metrics.precision_case_count,
         "recall_case_count": metrics.recall_case_count,
     }
-
-
-def _json_report(evaluation: RetrievalEvaluation) -> dict[str, object]:
-    config = evaluation.config
-    return {
-        "configuration": {
-            "strategy": "vector_only",
-            "model": config.model,
-            "dimensions": config.dimensions,
-            "top_k": config.top_k,
-            "cutoff": config.cutoff,
-            "cutoff_sweep": list(config.cutoff_sweep),
-            "stub": config.is_stub,
-        },
-        "run_conditions": {
-            "database_used": False,
-            "labels_used_for_retrieval": False,
-            "warning": (
-                "결정론 어휘 임베딩 대역 수치는 실제 검색 품질이 아니다. "
-                "외부 호출 없는 배관 검증용이다."
-                if config.is_stub
-                else None
-            ),
-        },
-        "aggregate": _metrics_json(evaluation.score.aggregate),
-        "sweep": [
-            {
-                "cutoff": point.cutoff,
-                "accepted_precision": point.accepted_precision,
-                "accepted_recall": point.accepted_recall,
-                "macro_f1": point.macro_f1,
-                "precision_case_count": point.precision_case_count,
-                "recall_case_count": point.recall_case_count,
-            }
-            for point in evaluation.sweep
-        ],
-        "best_cutoff": evaluation.best_cutoff,
-        "best_cutoff_selection": ("macro F1 최대, 동률이면 precision, recall, 높은 cutoff 순"),
-        "cases": [
-            {
-                "id": case.case_id,
-                "relevant_evidence_ids": sorted(case.relevant_evidence_ids),
-                "recall_at_1": case.recall_at_1,
-                "recall_at_3": case.recall_at_3,
-                "recall_at_5": case.recall_at_5,
-                "accepted_precision": case.accepted_precision,
-                "accepted_recall": case.accepted_recall,
-                "accepted_hits": [
-                    {
-                        "rank": hit.rank,
-                        "evidence_id": hit.evidence_id,
-                        "similarity": hit.similarity,
-                    }
-                    for hit in case.accepted_hits
-                ],
-                "ranked_hits": [
-                    {
-                        "rank": hit.rank,
-                        "evidence_id": hit.evidence_id,
-                        "similarity": hit.similarity,
-                    }
-                    for hit in case.ranked_hits
-                ],
-            }
-            for case in evaluation.score.cases
-        ],
-    }
-
-
-def _markdown_report(evaluation: RetrievalEvaluation) -> str:
-    config = evaluation.config
-    aggregate = evaluation.score.aggregate
-    # 조항 수는 실제 주입된 코퍼스에서 읽는다 — 하드코딩하면 축소 코퍼스 실행에서 거짓이 된다.
-    corpus_size = max((len(case.ranked_hits) for case in evaluation.score.cases), default=0)
-    lines = [
-        "# 정책 검색 비교 — 벡터 단독",
-        "",
-        "## 실행 조건",
-        "",
-        "- 전략: 벡터 단독 (DB 미사용, 메모리 코사인 유사도)",
-        f"- 임베딩: `{config.model}` ({config.dimensions}차원)",
-        f"- top_k: {config.top_k}",
-        f"- 채택 코사인 컷: {config.cutoff:.2f}",
-        "- 라벨 사용 경계: 검색 완료 뒤 채점 단계에서만 사용",
-    ]
-    if config.is_stub:
-        lines.extend(
-            [
-                "- **경고: 결정론 어휘 임베딩 대역 수치는 실제 검색 품질이 아니다. "
-                "외부 호출 없는 배관 검증용이다.**",
-                "- 대역 실행 조건: `testing.LexicalEmbeddingClient`, 과금 0회, DB 0회",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "## 기본 컷 집계",
-            "",
-            "| metric | macro value | denominator cases |",
-            "|---|---:|---:|",
-            f"| recall@1 | {_number(aggregate.recall_at_1)} | {aggregate.recall_case_count} |",
-            f"| recall@3 | {_number(aggregate.recall_at_3)} | {aggregate.recall_case_count} |",
-            f"| recall@5 | {_number(aggregate.recall_at_5)} | {aggregate.recall_case_count} |",
-            "| accepted precision | "
-            f"{_number(aggregate.accepted_precision)} | {aggregate.precision_case_count} |",
-            "| accepted recall | "
-            f"{_number(aggregate.accepted_recall)} | {aggregate.recall_case_count} |",
-            "",
-            "## 컷 스윕",
-            "",
-            "최적점은 macro F1 최대, 동률이면 precision, recall, 높은 cutoff 순이다.",
-            f"선택된 최적 컷: {_number(evaluation.best_cutoff)}",
-            "",
-            "| cutoff | precision | recall | macro F1 | precision n | recall n |",
-            "|---:|---:|---:|---:|---:|---:|",
-        ]
-    )
-    for point in evaluation.sweep:
-        lines.append(
-            f"| {point.cutoff:.2f} | {_number(point.accepted_precision)} | "
-            f"{_number(point.accepted_recall)} | {_number(point.macro_f1)} | "
-            f"{point.precision_case_count} | {point.recall_case_count} |"
-        )
-    lines.extend(
-        [
-            "",
-            "## 케이스별 결과",
-            "",
-            f"`전체 순위`는 임계값과 top_k를 적용하기 전 {corpus_size}개 조항의 순위다. "
-            "`컷 통과`는 top_k 안에서 구성 컷을 넘은 조항이다.",
-            "",
-            "| case | relevant | r@1/3/5 | cutoff precision/recall | 컷 통과 | 전체 순위 |",
-            "|---|---|---|---|---|---|",
-        ]
-    )
-    for case in evaluation.score.cases:
-        relevant = ", ".join(sorted(case.relevant_evidence_ids)) or "없음"
-        accepted = (
-            "<br>".join(
-                f"{hit.rank}. {hit.evidence_id} ({_score(hit.similarity)})"
-                for hit in case.accepted_hits
-            )
-            or "없음"
-        )
-        ranking = "<br>".join(
-            f"{hit.rank}. {hit.evidence_id} ({_score(hit.similarity)})" for hit in case.ranked_hits
-        )
-        lines.append(
-            f"| {case.case_id} | {relevant} | {_number(case.recall_at_1)} / "
-            f"{_number(case.recall_at_3)} / {_number(case.recall_at_5)} | "
-            f"{_number(case.accepted_precision)} / {_number(case.accepted_recall)} | "
-            f"{accepted} | {ranking} |"
-        )
-    return "\n".join(lines) + "\n"
-
-
-def write_report(evaluation: RetrievalEvaluation, *, output_dir: Path) -> ReportPaths:
-    """두 형식 보고서를 다음 사용 가능한 retrieval 이름에 써 기존 산출물을 보존한다."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    paths = _next_report_paths(output_dir, evaluation.config)
-    markdown = _markdown_report(evaluation)
-    json_text = json.dumps(_json_report(evaluation), ensure_ascii=False, indent=2) + "\n"
-    # 경로 선택 뒤에도 독점 생성 모드로 재확인해 스크립트 재실행/동시 실행의 덮어쓰기를 막는다.
-    created_markdown = False
-    try:
-        with paths.markdown.open("x", encoding="utf-8") as handle:
-            handle.write(markdown)
-        created_markdown = True
-        with paths.json.open("x", encoding="utf-8") as handle:
-            handle.write(json_text)
-    except FileExistsError:
-        # 동시 실행이 사이에 선점했다면 그 산출물은 건드리지 않고 다음 이름을 다시 찾는다.
-        # 이 실행이 먼저 만든 Markdown만 있는 경우에는 불완전한 쌍을 남기지 않는다.
-        if created_markdown:
-            paths.markdown.unlink(missing_ok=True)
-        return write_report(evaluation, output_dir=output_dir)
-    return paths
 
 
 def _strategy_hit_json(hit: RankedHit) -> dict[str, object]:
@@ -2838,6 +2632,7 @@ def run_retrieval_comparison(
     cases = load_golden_set(golden_set_path)
     queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
     uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
+    uses_hybrid = any(RetrievalStage.HYBRID in strategy.stages for strategy in strategy_tuple)
     if not uses_rewrite and rewrite_condition is RewriteCondition.ORACLE:
         raise RetrievalConfigurationError("oracle 재작성과 벡터 단독 전략을 함께 요청할 수 없다")
     rewrite_input = (
@@ -2848,6 +2643,9 @@ def run_retrieval_comparison(
         if uses_rewrite and rewritten_queries is None
         else rewritten_queries
     )
+    if uses_hybrid:
+        _require_positive_integer("rrf_k", rrf_k)
+        _require_positive_integer("ngram_size", ngram_size)
     injected_rewrites = _validate_rewritten_queries(
         queries=queries,
         rewritten_queries=rewrite_input,
@@ -2881,7 +2679,9 @@ def run_retrieval_comparison(
             raise RetrievalConfigurationError(
                 "OPENAI_API_KEY가 없다 — 실제 임베딩·리랭크 비교는 과금되므로 키를 선검사한다"
             )
-        model = embedding_model or settings.embedding_model
+        model = embedding_model or (
+            embedding_client.model if embedding_client is not None else settings.embedding_model
+        )
         resolved_cutoff = settings.vector_similarity_threshold if cutoff is None else cutoff
         embedder: EmbeddingClient = embedding_client or OpenAIEmbeddingClient(
             api_key=settings.openai_api_key, model=model, dimensions=resolved_dimensions
@@ -2901,7 +2701,7 @@ def run_retrieval_comparison(
             )
         model = STUB_EMBEDDING_MODEL
         resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
-        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)
+        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions, model=model)
         reranker = _IdentityRerankClient() if uses_rerank else None
 
     config = RetrievalEvalConfig(
@@ -3512,7 +3312,7 @@ class ChunkingRow:
 
 @dataclass(frozen=True)
 class ChunkingEmbeddingCost:
-    """관측된 캐시 적중·구매. 달러 환산은 단가표가 있을 때만 한다."""
+    """관측된 캐시 적중·구매. 달러는 환산하지 않고 토큰과 조건을 보고한다."""
 
     model: str
     dimensions: int
@@ -3654,6 +3454,7 @@ def run_chunking_grid(
     default_containment: float = DEFAULT_CHUNK_MIN_CONTAINMENT,
     strategies: Sequence[ChunkingStrategy] = DEFAULT_CHUNKING_STRATEGIES,
     rewritten_queries: Mapping[str, str] | None = None,
+    rewrite_condition: RewriteCondition = RewriteCondition.CALLER_INJECTED,
 ) -> ChunkingGrid:
     """청킹 축 격자를 돌린다. DB 도 제품 경로도 거치지 않는 인메모리 비교다.
 
@@ -3692,12 +3493,19 @@ def run_chunking_grid(
         )
     }
     if rewritten_queries is not None:
+        if rewrite_condition not in {RewriteCondition.BLIND, RewriteCondition.CALLER_INJECTED}:
+            raise RetrievalConfigurationError("청킹 재작성은 blind 또는 caller_injected만 허용한다")
         missing = sorted({case.id for case in cases} - set(rewritten_queries))
         if missing:
             raise RetrievalConfigurationError(
                 f"재작성 질의가 없는 문의가 있다: {', '.join(missing)}"
             )
-        query_sets[CHUNKING_QUERY_BLIND_REWRITE] = tuple(
+        condition = (
+            CHUNKING_QUERY_BLIND_REWRITE
+            if rewrite_condition is RewriteCondition.BLIND
+            else RewriteCondition.CALLER_INJECTED.value
+        )
+        query_sets[condition] = tuple(
             RetrievalQuery(case_id=case.id, text=rewritten_queries[case.id]) for case in cases
         )
 
@@ -3796,7 +3604,7 @@ def run_chunking_grid(
         strategies=strategy_tuple,
         query_conditions=tuple(query_sets),
         query_condition_note=(
-            "재작성 조건은 원문을 blind 재작성문으로 **치환**한 것이다. 제품 사다리의 "
+            "재작성 조건은 원문을 해당 조건의 재작성문으로 **치환**한 것이다. 제품 사다리의 "
             "원문·재작성 합집합(`merge_rewritten_rankings`)이 아니므로 이 열의 절대값을 "
             "전략 사다리 리포트의 `vector_rewrite` 행과 같은 것으로 읽으면 안 된다 — "
             "여기서 읽을 것은 조건이 바뀌어도 청킹 열 사이의 **순서**가 유지되는지다."
@@ -3814,8 +3622,9 @@ def run_chunking_grid(
             embedded_texts=stats.embedded_texts,
             total_tokens=stats.total_tokens,
             dollar_note=(
-                "저장소에 단가표가 없다 — 달러 환산은 미실행(사유: 근거 단가 부재)이고 "
-                "토큰만 보고한다. 환산이 필요하면 단가와 기준일을 함께 적어야 한다."
+                "달러 환산은 미실행(이 비교 리포트는 환산을 구현하지 않고 토큰만 보고한다). "
+                "저장소 단가표는 docs/tracking/pricing.md(기준일 2026-08-19)에 있다. "
+                "환산하려면 해당 모델의 단가와 기준일을 확인해야 한다."
             ),
         ),
     )
@@ -3844,6 +3653,7 @@ def _chunking_strategy(grid: ChunkingGrid, key: str) -> ChunkingStrategy:
 _CHUNKING_CONDITION_LABEL: Final = {
     CHUNKING_QUERY_ORIGINAL: "원문 질의",
     CHUNKING_QUERY_BLIND_REWRITE: "blind 재작성 질의(치환)",
+    RewriteCondition.CALLER_INJECTED.value: "호출자 주입 재작성 질의(출처 미검증·치환)",
 }
 
 
@@ -4305,6 +4115,15 @@ def run_chunking_comparison(
     `--live` 는 고정 크기 청크를 새로 임베딩하므로 과금된다. 조항 단위 열은 현행 인덱싱과
     같은 텍스트라 캐시가 그대로 산다.
     """
+    if rewritten_queries_path is not None:
+        condition = _resolved_rewrite_condition(
+            declared=None,
+            rewritten_queries_path=rewritten_queries_path,
+            caller_injected=False,
+            uses_rewrite=True,
+        )
+        if condition is not RewriteCondition.BLIND:
+            raise RetrievalConfigurationError("청킹 비교의 파일 입력은 blind 재작성만 허용한다")
     settings = get_settings()
     resolved_dimensions = (
         embedding_client.dimensions
@@ -4318,7 +4137,9 @@ def run_chunking_comparison(
             raise RetrievalConfigurationError(
                 "OPENAI_API_KEY가 없다 — 실제 임베딩 비교는 과금되므로 키를 선검사한다"
             )
-        model = embedding_model or settings.embedding_model
+        model = embedding_model or (
+            embedding_client.model if embedding_client is not None else settings.embedding_model
+        )
         resolved_cutoff = settings.vector_similarity_threshold if cutoff is None else cutoff
         embedder: EmbeddingClient = embedding_client or OpenAIEmbeddingClient(
             api_key=settings.openai_api_key, model=model, dimensions=resolved_dimensions
@@ -4330,7 +4151,7 @@ def run_chunking_comparison(
             )
         model = STUB_EMBEDDING_MODEL
         resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
-        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)
+        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions, model=model)
 
     documents = load_policy_documents(policy_dir)
     cases = load_golden_set(golden_set_path)
@@ -4357,5 +4178,6 @@ def run_chunking_comparison(
         default_containment=min_containment,
         strategies=strategies,
         rewritten_queries=rewritten,
+        rewrite_condition=RewriteCondition.BLIND,
     )
     return write_chunking_report(grid, output_dir=output_dir)
