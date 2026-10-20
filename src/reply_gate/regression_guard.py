@@ -105,6 +105,7 @@ FINGERPRINT_FIELDS: Final[tuple[str, ...]] = (
     "embedding_dimensions",
     "top_k",
     "generation_model",
+    "generation_rule_version",
     "intent_prompt_version",
     "sql_prompt_version",
     "draft_prompt_version",

@@ -522,6 +522,46 @@ def _refusal_text(response: Response) -> str | None:
     return None
 
 
+def _single_response_text(blocks: object, *, text_type: str) -> str:
+    """이 서비스의 JSON 산출은 텍스트 한 블록이다. 여러 블록을 선택·접합하지 않는다."""
+    if not isinstance(blocks, list):
+        raise ValueError("응답 content가 블록 목록이 아니다")
+    texts = [
+        getattr(block, "text", None)
+        for block in blocks
+        if getattr(block, "type", None) == text_type
+    ]
+    if len(texts) != 1 or not isinstance(texts[0], str):
+        raise ValueError("응답에는 문자열 텍스트 블록이 정확히 하나 있어야 한다")
+    return texts[0]
+
+
+def _openai_response_text(response: object) -> str:
+    """JSON 문법과 별개인 로컬 완료 계약. 제공자의 복수 블록 발생 빈도를 주장하지 않는다."""
+    if getattr(response, "status", None) != "completed":
+        raise ValueError("OpenAI 응답이 완료되지 않았다")
+    output = getattr(response, "output", None)
+    if not isinstance(output, list):
+        raise ValueError("OpenAI 응답 output이 목록이 아니다")
+    blocks: list[object] = []
+    for item in output:
+        content = getattr(item, "content", [])
+        if content is None:  # reasoning 항목은 content 없이 summary만 가질 수 있다.
+            continue
+        if not isinstance(content, list):
+            raise ValueError("OpenAI 응답 content가 블록 목록이 아니다")
+        blocks.extend(content)
+    return _single_response_text(blocks, text_type="output_text")
+
+
+def _anthropic_response_text(response: object) -> str:
+    # stop_sequences나 도구를 요청하지 않았고 중단 응답을 이어 받는 프로토콜도 없다.
+    # thinking 블록은 텍스트가 아니므로 허용하되 최종 JSON 텍스트는 하나만 받는다.
+    if getattr(response, "stop_reason", None) != "end_turn":
+        raise ValueError("Anthropic 응답이 자연 종료되지 않았다")
+    return _single_response_text(getattr(response, "content", None), text_type="text")
+
+
 class OpenAIGenerationClient:
     """생성 계열(의도 해석·초안 생성·SQL 생성) 공통 호출 래퍼."""
 
@@ -612,7 +652,21 @@ class OpenAIGenerationClient:
                 elapsed_ms=elapsed,
             )
 
-        text = response.output_text or ""
+        try:
+            text = _openai_response_text(response)
+        except ValueError as exc:
+            # 응답은 왔지만 완료된 단일 산출이 없다. 전송 재시도나 JSON 형식 재시도로
+            # 숨기지 않고 거절과 같은 호출 실패로 보낸다. 과금·시간·전송 수는 보존한다.
+            raise LLMCallError(
+                stage=stage,
+                reason="invalid_response",
+                attempts=sent,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+                elapsed_ms=elapsed,
+            ) from exc
         return _parse_json_completion(
             stage=stage,
             text=text,
@@ -763,16 +817,19 @@ class AnthropicGenerationClient:
                 elapsed_ms=elapsed,
             )
 
-        # adaptive thinking 이 켜져 있으면 text 블록 앞에 thinking 블록이 올 수 있다 —
-        # 위치가 아니라 블록 타입으로 골라낸다.
-        text = next(
-            (
-                str(getattr(block, "text", "") or "")
-                for block in getattr(response, "content", []) or []
-                if getattr(block, "type", None) == "text"
-            ),
-            "",
-        )
+        try:
+            text = _anthropic_response_text(response)
+        except ValueError as exc:
+            raise LLMCallError(
+                stage=stage,
+                reason="invalid_response",
+                attempts=sent,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+                elapsed_ms=elapsed,
+            ) from exc
         return _parse_json_completion(
             stage=stage,
             text=text,

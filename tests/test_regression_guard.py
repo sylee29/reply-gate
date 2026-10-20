@@ -58,6 +58,7 @@ _BASE_FINGERPRINT: Mapping[str, str] = {
     "embedding_dimensions": "1536",
     "top_k": "5",
     "generation_model": "gpt-5.6-terra",
+    "generation_rule_version": "generationrules-synthetic",
     "intent_prompt_version": "intent-prompt-synthetic",
     "sql_prompt_version": "sql-prompt-synthetic",
     "draft_prompt_version": "draft-prompt-synthetic",
@@ -370,6 +371,7 @@ def test_등재된_참조는_등록당시_칸을_보존하고_추가된_규칙�
         assert _missing_registered_fields(promotion, registered_fields) == set()
     unknown = {name for name, value in promotion.fingerprint.values.items() if value is None}
     assert unknown == {
+        "generation_rule_version",
         "judge_rule_version",
         "intent_prompt_version",
         "sql_prompt_version",
@@ -1494,6 +1496,7 @@ def test_세트_편입은_옛_산출물을_끌어오지_않는다() -> None:
         assert _fingerprint_conflicts(run.fingerprint, promoted.fingerprint) == [], stem
         unknown = [n for n, v in run.fingerprint.values.items() if v is None]
         assert set(unknown) == {
+            "generation_rule_version",
             "judge_rule_version",
             "intent_prompt_version",
             "sql_prompt_version",

@@ -13,19 +13,21 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import pathlib
 from collections.abc import Sequence
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, Final, cast
+from typing import Any, cast
 
 import anthropic
+import psycopg
 import pytest
+from psycopg.rows import DictRow
 from pydantic import SecretStr
 from scripts import evaluate
 
-import reply_gate.pipeline as pipeline_module
+from reply_gate.api import InquiryResponse
 from reply_gate.config import Settings
 from reply_gate.contracts import (
     Claim,
@@ -37,6 +39,7 @@ from reply_gate.contracts import (
     RejectReason,
     Verdict,
 )
+from reply_gate.draft import DRAFT_STAGE
 from reply_gate.evaluation import (
     JudgeAccuracy,
     RunConditions,
@@ -58,7 +61,20 @@ from reply_gate.llm import (
     accumulate_optional_tokens,
 )
 from reply_gate.pipeline import build_judge
+from reply_gate.records import load_inquiry, save_inquiry
 from tests.conftest import declared_settings
+from tests.test_api import TOKEN_KEYS
+from tests.test_pipeline import (
+    ScriptedJudge,
+    StubCollector,
+    citing_draft,
+    collection,
+    judge_pass,
+    judge_reject,
+    pipeline_with,
+    run,
+    scripted_client,
+)
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -143,6 +159,7 @@ def _anthropic_client(
 
 def _openai_response(text: str) -> SimpleNamespace:
     return SimpleNamespace(
+        status="completed",
         output=[SimpleNamespace(content=[SimpleNamespace(type="output_text", text=text)])],
         output_text=text,
         usage=SimpleNamespace(input_tokens=11, output_tokens=7),
@@ -618,100 +635,136 @@ def test_판정_실패한_픽스처의_캐시_계열도_버려지지_않는다()
     assert accuracy.cache_read_tokens_total == 0
 
 
-#: 런타임 **판정** 토큰이 캐시 계열로 갈라졌는지 판정하는 이름.
-#:
-#: **계열 이름을 붙여 묻는다.** 일반형 이름(`cache_read_input_tokens`)으로 물으면 안 된다 —
-#: 생성·검색 계열의 캐시 칸이 배선되면서 파이프라인이 초안 호출의 산출·예외에서 같은 이름을
-#: 읽게 됐고, 그 이름으로 물으면 이 가드가 "판정 런타임도 배선됐다"로 잘못 읽고 **스스로
-#: 꺼진다**(아래 두 검사의 통과 조건이 곧 자기 비활성화다).
-#:
-#: 이름 목록을 좁히는 것은 **가드를 조이는 쪽**이다: 판정 계열이 다른 이름으로 배선되면
-#: 가드는 "아직 없다"로 읽고 캐싱 기본값을 계속 막는다 — 틀리는 방향이 fail-closed 다.
-_CACHE_TOKEN_FIELDS: Final = frozenset(
-    {
-        "judge_cache_read_tokens",
-        "judge_cache_creation_tokens",
-        "judge_cache_read_input_tokens",
-        "judge_cache_creation_input_tokens",
-    }
-)
-
-#: 런타임 판정 토큰이 지나가는 자리. 파이프라인이 만들고 처리 기록이 저장한다.
-_RUNTIME_TOKEN_MODULES: Final = ("pipeline.py", "records.py")
+# ── 계약 G — 런타임도 성공·실패의 캐시 계열을 보존한다 ─────────────────────
 
 
-def _runtime_identifiers() -> set[str]:
-    """런타임 모듈이 **코드로** 쓰는 이름들.
-
-    문자열 스캔은 주석·docstring 에 이름이 스치기만 해도 "집계가 있다"로 읽고 가드를 통째로
-    꺼 버린다 — 이 검사는 통과 조건이 곧 자기 비활성화라 그 오탐이 특히 비싸다
-    (사이클 4 리뷰 advisory). AST 로 보면 주석은 애초에 없고, docstring 은 여기서 제외한다.
-    """
-    package_dir = pathlib.Path(str(pipeline_module.__file__)).parent
-    names: set[str] = set()
-    for filename in _RUNTIME_TOKEN_MODULES:
-        tree = ast.parse((package_dir / filename).read_text(encoding="utf-8"), filename=filename)
-        docstrings = {
-            node.body[0].value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
-            and node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)
-        }
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
-                names.add(node.attr)
-            elif isinstance(node, ast.Name):
-                names.add(node.id)
-            elif isinstance(node, ast.keyword | ast.arg) and node.arg:
-                names.add(node.arg)
-            elif (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and node not in docstrings
-            ):
-                names.add(node.value)
-    return names
-
-
-def test_캐싱_가드는_주석에_스친_이름으로_꺼지지_않는다() -> None:
-    """음성 대조 — 문자열 스캔이면 통과했을 소스가 AST 에서는 이름을 남기지 않는다."""
-    commented = ast.parse('# cache_read_input_tokens\n"""cache_creation_input_tokens."""\n')
-    literal = {
-        node.value
-        for node in ast.walk(commented)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
-    # docstring 하나만 남고 주석은 AST 에 없다 — 그 docstring 을 제외하는 것이 이 가드다.
-    assert literal == {"cache_creation_input_tokens."}
-    assert _CACHE_TOKEN_FIELDS & _runtime_identifiers() == set(), (
-        "런타임 집계가 실제로 배선되면 이 음성 대조는 전제를 잃는다 — 그때는 위 가드도 "
-        "함께 조용해진다."
+def _runtime_with_judge(judge: Any, *, l2_enabled: bool = True) -> Any:
+    return pipeline_with(
+        collector=StubCollector(collection(evidence=_EVIDENCE)),
+        client=scripted_client({DRAFT_STAGE: [citing_draft(text=_DRAFT.claims[0].text)] * 2}),
+        judge=judge,
+        l2_enabled=l2_enabled,
     )
 
 
-def test_런타임_집계가_없는_채로_캐싱을_기본으로_켤_수_없다() -> None:
-    """캐시 계열 집계는 지금 **측정 3 경로에만** 있다.
-
-    런타임(파이프라인 → 처리 기록)의 판정 토큰은 `judge_input_tokens` 하나뿐이라, 캐싱을
-    기본으로 켜면 그 값이 조용히 "비캐시 입력"으로 바뀌고 캐시 계열은 아무 데도 안 남는다.
-    측정 3 에서 막은 은폐가 런타임에서 그대로 재발한다는 뜻이다.
-
-    지금은 스위치가 꺼져 있어 잠재 상태다. 이 검사는 **기본값을 켜는 순간** 소리가 나게
-    한다 — 런타임 집계를 먼저 배선하지 않으면 실패한다. 런타임을 배선하면 이 검사는
-    저절로 조용해진다(전제가 사라진다).
-    """
-    런타임_집계가_있다 = bool(_CACHE_TOKEN_FIELDS & _runtime_identifiers())
-    if 런타임_집계가_있다:
-        return
-
-    # `Settings` 를 assert 식 안에 그대로 두면 실패 출력이 설정 객체를 통째로 repr 하고,
-    # 거기에 API 키가 평문으로 실린다. **bool 로 먼저 묶는다.**
-    캐싱이_기본으로_켜져_있다 = bool(declared_settings().judge_prompt_caching_enabled)
-    assert not 캐싱이_기본으로_켜져_있다, (
-        "런타임 경로에 캐시 계열 토큰 집계가 없는 채로 판정 프롬프트 캐싱을 기본으로 켤 수 "
-        "없다 — `judge_input_tokens` 가 캐시 적중분을 제외한 값으로 조용히 바뀐다. "
-        "켜려면 파이프라인·처리 기록의 판정 토큰 집계를 먼저 배선해라."
+@pytest.mark.parametrize("creation,read", [(100, 1000), (0, 0), (None, 7), (None, None)])
+def test_런타임_판정_캐시는_입출력과_분리하고_미측정을_보존한다(
+    creation: int | None, read: int | None
+) -> None:
+    """음성 대조 — 보고하지 않은 칸을 0으로 만들면 측정하지 않은 값을 신고한다."""
+    outcome = replace(
+        judge_pass(), cache_creation_input_tokens=creation, cache_read_input_tokens=read
     )
+    processed = run(_runtime_with_judge(ScriptedJudge([outcome])))
+
+    assert processed.judge_cache_creation_tokens == creation
+    assert processed.judge_cache_read_tokens == read
+    assert processed.judge_input_tokens == 40
+    assert processed.judge_output_tokens == 9
+    assert processed.generation_cache_creation_tokens is None
+    assert processed.generation_cache_read_tokens is None
+
+
+@pytest.mark.parametrize("failure_kind", ["format", "call"])
+def test_런타임_판정_실패도_캐시_토큰을_버리지_않는다(failure_kind: str) -> None:
+    """판정 실패 이전에 과금된 캐시도 일반 입력·출력과 같은 자격으로 남긴다."""
+    kwargs: dict[str, Any] = {
+        "stage": "judge",
+        "input_tokens": 15,
+        "output_tokens": 5,
+        "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 0,
+    }
+    failure = (
+        LLMFormatError(detail="bad", **kwargs)
+        if failure_kind == "format"
+        else LLMCallError(reason="transport", attempts=2, **kwargs)
+    )
+    processed = run(_runtime_with_judge(ScriptedJudge([failure])))
+
+    assert processed.escalation_reason.value == "llm_call_failed"
+    assert processed.judge_input_tokens == 15
+    assert processed.judge_output_tokens == 5
+    assert processed.judge_cache_creation_tokens == 100
+    assert processed.judge_cache_read_tokens == 0
+
+
+@pytest.mark.parametrize("second_fails", [False, True])
+def test_재생성_전후_판정의_캐시를_성공과_실패_모두_누적한다(second_fails: bool) -> None:
+    """최초 판정의 캐시 write를 최종 판정의 read가 덮어쓰면 실비용이 사라진다."""
+    first = replace(
+        judge_reject(claim_text=_DRAFT.claims[0].text),
+        cache_creation_input_tokens=100,
+        cache_read_input_tokens=None,
+    )
+    second = (
+        LLMCallError(
+            stage="judge",
+            reason="transport",
+            attempts=2,
+            input_tokens=20,
+            cache_read_input_tokens=70,
+        )
+        if second_fails
+        else replace(judge_pass(), cache_creation_input_tokens=0, cache_read_input_tokens=70)
+    )
+    processed = run(_runtime_with_judge(ScriptedJudge([first, second])))
+
+    assert len(processed.attempts) == 2
+    assert processed.judge_cache_creation_tokens == 100
+    assert processed.judge_cache_read_tokens == 70
+
+
+def test_실제_판정기의_형식_재시도_캐시도_런타임에_도달한다() -> None:
+    """래퍼 → 판정기 → 파이프라인에서 형식 실패 1회의 캐시 write를 잃지 않는다."""
+    client, messages = _anthropic_client(
+        [
+            _anthropic_response("bad", usage=_usage(cache_creation=100, cache_read=0)),
+            _anthropic_response(
+                _judge_payload(verdict="pass", reasons=[], claim_verdict="pass"),
+                usage=_usage(cache_creation=0, cache_read=70),
+            ),
+        ],
+        prompt_caching=True,
+    )
+    processed = run(_runtime_with_judge(Judge(client=client)))
+
+    assert len(messages.calls) == 2
+    assert processed.judge_cache_creation_tokens == 100
+    assert processed.judge_cache_read_tokens == 70
+
+
+def test_L2를_실행하지_않으면_캐시_칸도_미측정이다() -> None:
+    """실행하지 않은 판정의 캐시 적중을 0으로 신고하지 않는다."""
+    processed = run(_runtime_with_judge(ScriptedJudge([]), l2_enabled=False))
+
+    assert processed.judge_cache_creation_tokens is None
+    assert processed.judge_cache_read_tokens is None
+
+
+def test_런타임_판정_캐시는_HTTP_응답_계약을_넓히지_않는다() -> None:
+    """캐시 관측은 평가 경계 안에 있고 API 토큰 계열은 기존 넷을 유지한다."""
+    outcome = replace(judge_pass(), cache_creation_input_tokens=100, cache_read_input_tokens=70)
+    processed = run(_runtime_with_judge(ScriptedJudge([outcome])))
+    tokens = InquiryResponse.of(processed).model_dump()["metrics"]["tokens"]
+
+    assert set(tokens) == TOKEN_KEYS
+    assert tokens["judge_input"] == 40
+    assert tokens["judge_output"] == 9
+
+
+@pytest.mark.db
+def test_저장_기록에서_복원한_판정_캐시는_미측정이다(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """DB에 저장하지 않은 캐시를 과거 기록 복원에서 0으로 만들어 내지 않는다."""
+    outcome = replace(judge_pass(), cache_creation_input_tokens=100, cache_read_input_tokens=70)
+    processed = run(_runtime_with_judge(ScriptedJudge([outcome])))
+    save_inquiry(conn=app_conn, processed=processed)
+    loaded = load_inquiry(conn=app_conn, inquiry_id=processed.inquiry_id)
+
+    assert loaded is not None
+    assert loaded.judge_cache_creation_tokens is None
+    assert loaded.judge_cache_read_tokens is None
+    assert loaded.judge_input_tokens == processed.judge_input_tokens
+    assert loaded.judge_output_tokens == processed.judge_output_tokens

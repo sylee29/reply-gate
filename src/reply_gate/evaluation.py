@@ -39,6 +39,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import reduce
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Final, Protocol, cast
 
 import psycopg
@@ -581,6 +582,9 @@ class GoldenOutcome:
     #: 시도별 구간(초안 생성·게이트 판정·L2 판정). 재생성이 돌면 2건이 쌓이고, 합계는
     #: `stage_durations` 가 들고 있다 — **합계와 시도별 값을 함께** 알 수 있어야 한다.
     attempt_durations: tuple[AttemptDurations, ...] = ()
+    #: 런타임 판정 캐시 관측. 처리 기록에서 복원한 값은 저장하지 않았으므로 미측정이다.
+    judge_cache_creation_tokens: int | None = None
+    judge_cache_read_tokens: int | None = None
 
     @property
     def rejected_at_least_once(self) -> bool:
@@ -720,6 +724,8 @@ class PipelineAgreement:
     stage_durations: tuple[SpanAggregate, ...] = ()
     #: 측정 동안 잠근 실제 DB 입력의 지문. 파일 지문으로 추정하지 않는다.
     input_fingerprint: Mapping[str, str] = field(default_factory=dict)
+    judge_cache_creation_total: int | None = None
+    judge_cache_read_total: int | None = None
 
     @property
     def match_rate(self) -> float | None:
@@ -775,6 +781,12 @@ class PipelineAgreement:
         return (
             self.retrieval_cache_creation_total is not None
             or self.retrieval_cache_read_total is not None
+        )
+
+    @property
+    def judge_cache_measured(self) -> bool:
+        return (
+            self.judge_cache_creation_total is not None or self.judge_cache_read_total is not None
         )
 
     @property
@@ -995,6 +1007,8 @@ def evaluate_case(
         generation_cache_read_tokens=processed.generation_cache_read_tokens,
         retrieval_cache_creation_tokens=processed.retrieval_cache_creation_tokens,
         retrieval_cache_read_tokens=processed.retrieval_cache_read_tokens,
+        judge_cache_creation_tokens=processed.judge_cache_creation_tokens,
+        judge_cache_read_tokens=processed.judge_cache_read_tokens,
         retrieval_fallback_reason=processed.retrieval_fallback_reason,
         abstention_undefined_reason=(
             None
@@ -1097,6 +1111,12 @@ def measure_pipeline_agreement(
         ),
         retrieval_cache_read_total=_fold_optional(
             outcome.retrieval_cache_read_tokens for outcome in outcomes
+        ),
+        judge_cache_creation_total=_fold_optional(
+            outcome.judge_cache_creation_tokens for outcome in outcomes
+        ),
+        judge_cache_read_total=_fold_optional(
+            outcome.judge_cache_read_tokens for outcome in outcomes
         ),
         retrieval_fallback_total=sum(
             1 for outcome in outcomes if outcome.retrieval_fallback_reason is not None
@@ -1912,6 +1932,66 @@ def _retrieval_order_rule() -> str:
     return f"db=[{db_clause}] · merge=[{'>'.join(hit.evidence_id for hit in merged)}]"
 
 
+def _response_envelope_probe_outcomes(*, anthropic: bool) -> dict[str, str]:
+    """네트워크 없이 실제 응답 해석 helper를 실행한다. 진단 문면은 해시하지 않는다."""
+    text_type = "text" if anthropic else "output_text"
+    parser = llm._anthropic_response_text if anthropic else llm._openai_response_text
+    normal_text = SimpleNamespace(type=text_type, text='{"ok":true}')
+
+    def response(state: str | None, blocks: list[object]) -> object:
+        if anthropic:
+            return SimpleNamespace(stop_reason=state, content=blocks)
+        return SimpleNamespace(status=state, output=[SimpleNamespace(content=blocks)])
+
+    normal = "end_turn" if anthropic else "completed"
+    probes = {
+        "normal": response(normal, [normal_text]),
+        "unknown": response("unknown", [normal_text]),
+        "missing": response(None, [normal_text]),
+        "multiple": response(normal, [normal_text, normal_text]),
+        "empty": response(normal, []),
+        "not_string": response(normal, [SimpleNamespace(type=text_type, text=1)]),
+    }
+    states = (
+        (
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+            "pause_turn",
+            "refusal",
+            "model_context_window_exceeded",
+        )
+        if anthropic
+        else ("failed", "in_progress", "cancelled", "queued", "incomplete")
+    )
+    probes.update({state: response(state, [normal_text]) for state in states})
+    if anthropic:
+        probes["thinking"] = response(normal, [SimpleNamespace(type="thinking"), normal_text])
+    else:
+        # OpenAI reasoning은 메시지 content가 아니라 output의 독립 항목이다.
+        probes["reasoning"] = SimpleNamespace(
+            status=normal,
+            output=[
+                SimpleNamespace(type="reasoning", content=None),
+                SimpleNamespace(type="message", content=[normal_text]),
+            ],
+        )
+    outcomes: dict[str, str] = {}
+    for name, probe in probes.items():
+        try:
+            text = parser(probe)
+        except ValueError:
+            outcomes[name] = "rejected"
+        else:
+            outcomes[name] = "accepted:" + text
+    return outcomes
+
+
+def _generation_rule_version() -> str:
+    material = _response_envelope_probe_outcomes(anthropic=False)
+    return text_digest(json.dumps(material, sort_keys=True), prefix="generationrules-")
+
+
 def _judge_rule_probe_outcomes() -> dict[str, str]:
     """고정 입력의 실제 산출 해석 결과. 측정 3의 픽스처나 정확도 분모가 아니다.
 
@@ -2050,6 +2130,7 @@ def _judge_rule_version() -> str:
         "format_attempts": judge_module.JUDGE_MAX_ATTEMPTS,
         "reasons": [reason.value for reason in judge_module.L2_REJECT_REASONS],
         "probes": _judge_rule_probe_outcomes(),
+        "response_envelope": _response_envelope_probe_outcomes(anthropic=True),
     }
     return text_digest(
         json.dumps(material, ensure_ascii=False, sort_keys=True), prefix="judgerules-"
@@ -2185,6 +2266,7 @@ def code_condition_fingerprint(*, sql_max_rows: int = 50) -> dict[str, str]:
     """
     return {
         **_generation_prompt_versions(sql_max_rows=sql_max_rows),
+        "generation_rule_version": _generation_rule_version(),
         "judge_thinking": JUDGE_THINKING,
         "judge_rule_version": _judge_rule_version(),
         "draft_rule_version": _draft_rule_version(),
@@ -3245,6 +3327,16 @@ def _generation_cache_token_lines(pipeline: PipelineAgreement) -> list[str]:
             f"— 위 '{label} 입력'은 **캐시 적중분을 포함한 총 입력**이다(빼지도 더하지도 않는다)"
         )
 
+    judge_line = (
+        "- 판정 계열 프롬프트 캐시: **미측정** (캐시 계열 토큰을 보고하지 않은 실행 — 0 이 아니다)"
+        if not pipeline.judge_cache_measured
+        else (
+            "- 판정 계열 프롬프트 캐시(판정 입력 토큰 밖의 별도 칸): "
+            f"write {_int_or_unmeasured(pipeline.judge_cache_creation_total)} / "
+            f"read {_int_or_unmeasured(pipeline.judge_cache_read_total)} "
+            "— 보고된 값의 합이며 위 판정 소계·네 계열 합산에는 포함하지 않는다"
+        )
+    )
     return [
         line(
             "생성",
@@ -3258,6 +3350,7 @@ def _generation_cache_token_lines(pipeline: PipelineAgreement) -> list[str]:
             pipeline.retrieval_cache_creation_total,
             pipeline.retrieval_cache_read_total,
         ),
+        judge_line,
     ]
 
 
@@ -3628,6 +3721,8 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
             "generation_cache_read_total": pipeline.generation_cache_read_total,
             "retrieval_cache_creation_total": pipeline.retrieval_cache_creation_total,
             "retrieval_cache_read_total": pipeline.retrieval_cache_read_total,
+            "judge_cache_creation_total": pipeline.judge_cache_creation_total,
+            "judge_cache_read_total": pipeline.judge_cache_read_total,
             "generation_per_inquiry": pipeline.generation_tokens_per_inquiry,
             "embedding_per_inquiry": pipeline.embedding_tokens_per_inquiry,
             "judge_per_inquiry": pipeline.judge_tokens_per_inquiry,
@@ -3664,6 +3759,8 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "generation_cache_read_tokens": outcome.generation_cache_read_tokens,
                 "retrieval_cache_creation_tokens": outcome.retrieval_cache_creation_tokens,
                 "retrieval_cache_read_tokens": outcome.retrieval_cache_read_tokens,
+                "judge_cache_creation_tokens": outcome.judge_cache_creation_tokens,
+                "judge_cache_read_tokens": outcome.judge_cache_read_tokens,
                 "retrieval_fallback_reason": outcome.retrieval_fallback_reason,
                 #: 기권 게이트 통계량이 미정의였던 사유. `null` 은 게이트 꺼짐 · 정책 검색
                 #: 미실행 · 통계량 정의됨 셋을 함께 덮는다(처분이 아니라 **사유**다).

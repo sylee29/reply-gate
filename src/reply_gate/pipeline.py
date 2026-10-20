@@ -373,6 +373,10 @@ class ProcessedInquiry:
     stage_durations: StageDurations = field(default_factory=StageDurations)
     verification_method: str = "none"
     phone_last4_hmac: str | None = field(default=None, repr=False)
+    #: 판정 캐시도 평가 리포트까지만 전달한다. Anthropic 캐시 토큰은 판정 입력 밖에
+    #: 있으므로 입력에 접지 않는다. DB 복원·미실행·미보고는 기본값인 미측정으로 남긴다.
+    judge_cache_creation_tokens: int | None = None
+    judge_cache_read_tokens: int | None = None
 
 
 # ── 협력자 계약 (테스트가 대역으로 갈아 끼울 수 있게 Protocol 로) ───────────
@@ -425,6 +429,8 @@ class _Tally:
     #: 판정(L2) 토큰은 생성 합산과 **분리**해서 센다.
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
+    judge_cache_creation_tokens: int | None = None
+    judge_cache_read_tokens: int | None = None
     #: 생성 계열의 캐시 한 쌍. **0 에서 시작하지 않는다** — 시작값이 0 이면 한 번도 보고되지
     #: 않은 실행이 "적중 0" 으로 신고된다. 검색 계열의 쌍은 근거 묶음이 들고 온다.
     generation_cache_creation_tokens: int | None = None
@@ -838,6 +844,12 @@ class InquiryPipeline:
                     # 토큰도 실비용이므로 그대로 집계한다. 경과도 같은 자격이다.
                     tally.judge_input_tokens += exc.input_tokens
                     tally.judge_output_tokens += exc.output_tokens
+                    tally.judge_cache_creation_tokens = accumulate_optional_tokens(
+                        tally.judge_cache_creation_tokens, exc.cache_creation_input_tokens
+                    )
+                    tally.judge_cache_read_tokens = accumulate_optional_tokens(
+                        tally.judge_cache_read_tokens, exc.cache_read_input_tokens
+                    )
                     tally.l2_judge_ms = accumulate_optional_ms(tally.l2_judge_ms, exc.elapsed_ms)
                     return self._judge_failure(
                         tally=tally,
@@ -858,6 +870,12 @@ class InquiryPipeline:
                     # 실비용이 0 으로 굳는다.
                     tally.judge_input_tokens += exc.input_tokens
                     tally.judge_output_tokens += exc.output_tokens
+                    tally.judge_cache_creation_tokens = accumulate_optional_tokens(
+                        tally.judge_cache_creation_tokens, exc.cache_creation_input_tokens
+                    )
+                    tally.judge_cache_read_tokens = accumulate_optional_tokens(
+                        tally.judge_cache_read_tokens, exc.cache_read_input_tokens
+                    )
                     tally.l2_judge_ms = accumulate_optional_ms(tally.l2_judge_ms, exc.elapsed_ms)
                     return self._judge_failure(
                         tally=tally,
@@ -872,6 +890,12 @@ class InquiryPipeline:
                     )
                 tally.judge_input_tokens += outcome.input_tokens
                 tally.judge_output_tokens += outcome.output_tokens
+                tally.judge_cache_creation_tokens = accumulate_optional_tokens(
+                    tally.judge_cache_creation_tokens, outcome.cache_creation_input_tokens
+                )
+                tally.judge_cache_read_tokens = accumulate_optional_tokens(
+                    tally.judge_cache_read_tokens, outcome.cache_read_input_tokens
+                )
                 tally.l2_judge_ms = accumulate_optional_ms(tally.l2_judge_ms, outcome.elapsed_ms)
                 attempt_judge_ms = outcome.elapsed_ms
                 l2_result = outcome.result
@@ -994,6 +1018,8 @@ class InquiryPipeline:
             # (docs/contracts.md "토큰 집계 경계"). L2 미실행이면 0 이다.
             judge_input_tokens=tally.judge_input_tokens,
             judge_output_tokens=tally.judge_output_tokens,
+            judge_cache_creation_tokens=tally.judge_cache_creation_tokens,
+            judge_cache_read_tokens=tally.judge_cache_read_tokens,
             # 검색 단계 토큰도 같은 규칙의 세 번째 계열이다 — 수집기가 이미 분리해서
             # 들고 있으므로 원장을 거치지 않고 그대로 옮긴다(초안 루프가 만들지 않는다).
             retrieval_input_tokens=collection.retrieval_input_tokens,

@@ -134,10 +134,10 @@ uv run uvicorn reply_gate.api:app --reload
 
 ```bash
 uv run ruff check .            # 0
-uv run ruff format --check .   # 201 files
-uv run mypy                    # strict — 99 files, 0 errors
+uv run ruff format --check .   # 203 files
+uv run mypy                    # strict — 101 files, 0 errors
 uv run pytest                  # DB 를 띄운 실행에서만 건수 대조가 선다
-uv run pytest -m db            # 287 passed, 2,194 deselected · skip 0 이어야 한다
+uv run pytest -m db            # 288 passed, 2,237 deselected · skip 0 이어야 한다
 ```
 
 `pytest` 는 DB 기동을 전제한다. DB 가 없으면 `db` 마커 테스트가 사유를 담아 skip 되므로,
@@ -155,7 +155,7 @@ uv run python -m scripts.check_links        # 문서 53개 · 링크 450개 · �
 
 **그리고 테스트 건수 쪽은 DB 를 띄운 실행에서만 성립한다.** 문서가 인용하는 것은 `N passed`
 인데 세션이 아는 것은 수집 건수이고, 둘은 **skip 이 0 일 때만** 같다. DB 가 없으면 `db` 마커
-287건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
+288건이 skip 되므로 그 대조는 **사유를 담아 skip** 된다(도구 쪽 — `ruff format`·`mypy`·링크
 검사 — 은 skip 과 무관해서 계속 대조한다). 이 갈래가 없던 첫 판은 `1,310 passed · 178 skipped`
 인 실행에서도 `1,488 passed` 인용을 초록으로 통과시켰다([findings 37](tracking/findings.md)).
 

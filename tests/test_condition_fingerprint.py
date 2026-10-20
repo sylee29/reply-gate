@@ -783,6 +783,7 @@ def test_옛_산출물과의_대조는_미상을_관용한다() -> None:
         "rewrite_prompt_version",
         "policy_data_version",
         "order_data_version",
+        "generation_rule_version",
     }
 
 
@@ -1156,6 +1157,9 @@ def test_기존_실측의_L2_규칙은_미상이고_새_세트에는_편입되�
     values = dict(old.values)
     values["judge_rule_version"] = evaluation.code_condition_fingerprint()["judge_rule_version"]
     # 새 실행 대역은 추가된 입력도 실제로 안다는 조건을 명시한다. 옛 산출물은 그대로 미상이다.
+    values["generation_rule_version"] = evaluation.code_condition_fingerprint()[
+        "generation_rule_version"
+    ]
     values.update(evaluation._generation_prompt_versions())
     values.update(
         {"policy_data_version": "policy-db-synthetic", "order_data_version": "orders-db-synthetic"}
@@ -1165,6 +1169,7 @@ def test_기존_실측의_L2_규칙은_미상이고_새_세트에는_편입되�
     assert comparison.comparable is True
     assert set(comparison.unknown_fields) == {
         "judge_rule_version",
+        "generation_rule_version",
         "intent_prompt_version",
         "sql_prompt_version",
         "draft_prompt_version",

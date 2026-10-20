@@ -40,6 +40,7 @@ def _response(text: str, *, refusal: str | None = None) -> SimpleNamespace:
     if refusal is not None:
         parts = [SimpleNamespace(type="refusal", refusal=refusal)]
     return SimpleNamespace(
+        status="completed",
         output=[SimpleNamespace(content=parts)],
         output_text=text,
         usage=SimpleNamespace(input_tokens=11, output_tokens=7),
@@ -345,6 +346,107 @@ def _anthropic_client(outcomes: list[Any]) -> tuple[AnthropicGenerationClient, _
         api_key=SecretStr("test"), model="claude-sonnet-5", client=fake_sdk
     )
     return client, messages
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize(
+    "state", ["incomplete", "max_tokens", "stop_sequence", "unknown", None, "missing"]
+)
+def test_유효한_JSON도_완료_메타데이터가_없거나_미완료면_실패한다(
+    provider: str, state: str | None
+) -> None:
+    """JSON 문법은 제공자 완료를 증명하지 않는다. 이 래퍼는 중단 응답을 이어 받지 않는다."""
+    text = '{"intent":"policy"}'
+    response = _response(text) if provider == "openai" else _anthropic_response(text)
+    field = "status" if provider == "openai" else "stop_reason"
+    if state == "missing":
+        delattr(response, field)
+    else:
+        setattr(response, field, state)
+    client, calls = (
+        _generation_client([response]) if provider == "openai" else _anthropic_client([response])
+    )
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.reason == "invalid_response"
+    assert excinfo.value.attempts == len(calls.calls) == 1
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("shape", ["missing", "multiple", "nonstring"])
+def test_JSON_텍스트는_명시적인_한_블록이어야_한다(provider: str, shape: str) -> None:
+    """첫 JSON 뒤의 두 번째 산출을 버리거나 서로 다른 블록을 붙여 의미를 만들지 않는다."""
+    text = '{"intent":"policy"}'
+    response = _response(text) if provider == "openai" else _anthropic_response(text)
+    parts = response.output[0].content if provider == "openai" else response.content
+    block_type = "output_text" if provider == "openai" else "text"
+    if shape == "missing":
+        parts[:] = [part for part in parts if part.type != block_type]
+    elif shape == "multiple":
+        parts.append(SimpleNamespace(type=block_type, text='{"intent":"order"}'))
+    else:
+        next(part for part in parts if part.type == block_type).text = 42
+    client, calls = (
+        _generation_client([response]) if provider == "openai" else _anthropic_client([response])
+    )
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.reason == "invalid_response"
+    assert excinfo.value.attempts == len(calls.calls) == 1
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_미완료_응답의_캐시와_시간과_실제_전송수도_보존한다(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from reply_gate import llm
+
+    ticks = iter([1.0, 1.25])
+    monkeypatch.setattr(llm, "perf_counter", lambda: next(ticks))
+    text = '{"intent":"policy"}'
+    client: OpenAIGenerationClient | AnthropicGenerationClient
+    if provider == "openai":
+        response = _response(text)
+        response.status = "incomplete"
+        response.usage.input_tokens_details = SimpleNamespace(cache_write_tokens=3, cached_tokens=5)
+        client, calls = _generation_client([_connection_error(), response])
+    else:
+        response = _anthropic_response(text, stop_reason="max_tokens")
+        response.usage.cache_creation_input_tokens = 3
+        response.usage.cache_read_input_tokens = 5
+        client, calls = _anthropic_client([_anthropic_connection_error(), response])
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
+
+    error = excinfo.value
+    assert error.reason == "invalid_response"
+    assert error.attempts == len(calls.calls) == 2
+    assert (error.input_tokens, error.output_tokens) == (11, 7)
+    assert (error.cache_creation_input_tokens, error.cache_read_input_tokens) == (3, 5)
+    assert error.elapsed_ms == 250.0
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_완료된_추론과_단일_JSON_응답은_원문_의미를_보존한다(provider: str) -> None:
+    text = '{"intent":"한국어 😀"}'
+    client: OpenAIGenerationClient | AnthropicGenerationClient
+    if provider == "openai":
+        response = _response(text)
+        response.output.insert(0, SimpleNamespace(type="reasoning", content=None, summary=[]))
+        client, calls = _generation_client([response])
+    else:
+        client, calls = _anthropic_client([_anthropic_response(text)])
+
+    result = client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert result.data == {"intent": "한국어 😀"}
+    assert result.transport_attempts == len(calls.calls) == 1
 
 
 def _anthropic_connection_error() -> anthropic.APIConnectionError:

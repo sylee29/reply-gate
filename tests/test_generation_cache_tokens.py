@@ -133,7 +133,10 @@ def _openai_response(
     else:
         output = [SimpleNamespace(content=[SimpleNamespace(type="output_text", text=text)])]
     return SimpleNamespace(
-        output=output, output_text=text, usage=_usage() if usage is None else usage
+        status="completed",
+        output=output,
+        output_text=text,
+        usage=_usage() if usage is None else usage,
     )
 
 

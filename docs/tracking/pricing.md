@@ -165,6 +165,7 @@ OpenAI 생성 캐시 write 7,337토큰은 입력의 내역이며 별도 단가�
 | `embedding_total` | 문의·재작성 질의 임베딩 | `text-embedding-3-small` $0.02 |
 | `judge_input/output` | L2 판정 | 그 세트의 `judge_model` 지문 값 |
 | `cache_creation_total` / `cache_read_total` (측정 3) | L2 판정의 캐시 write/read — **`judge_input` 밖** | 그 세트 `judge_model` 의 캐시 단가 |
+| `judge_cache_creation_total` / `judge_cache_read_total` (측정 2, 2026-10-20 이후) | 런타임 L2 판정의 보고된 캐시 write/read 합 — **`judge_input` 밖** | 그 세트 `judge_model` 의 캐시 단가. 기존 소계·합산에는 미포함 |
 
 **캐시 칸이 계열을 늘리지 않는다.** 토큰 계열은 그대로 넷(생성·임베딩·판정·검색)이고,
 늘어난 것은 계열마다의 칸이다. 칸을 계열별로 둔 이유는 뾰족하다 — 생성과 검색은 **같은
