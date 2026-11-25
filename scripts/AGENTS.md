@@ -9,6 +9,7 @@
 | `seed_orders.py` | 스키마 적용 + 커밋된 주문 픽스처 500건 적재 | 불필요 |
 | `index_policies.py` | 정책 문서를 조항 단위로 임베딩해 `policy_chunks` 에 적재 | 필요 |
 | `evaluate.py` | 측정 1(L1 픽스처)·측정 2(골든셋 end-to-end)·**측정 3(L2 판정 단위 정확도)** 산출, 리포트 파일 생성, **회귀 가드 두 줄 보고** | `--live` 일 때만 (L2 켜짐이면 판정 키까지 **둘 다**) |
+| `check_evaluation_pilot.py` | 별도 24가족 파일럿의 원본·분할·정답 구조와 개발 묶음 L1/SQL 가드 대조. stdout JSON만 출력 | 불필요. DB·모델 호출과 라이브 출력 경로 없음 |
 | `compare_retrieval.py` | DB 없는 4단계 검색 전략 비교(blind 재작성 기본, 벡터 단독·oracle·모델 축은 명시 옵션) | 임베딩은 `--live`, 리랭크는 `--live`/`--rerank-with-openai` — **두 축이 따로다**. 캐시 miss 과금 가능 (기본 대역은 불필요) |
 | `generate_blind_rewrites.py` | blind 재작성 픽스처 생성 — 골든셋 문의 원문만 모델에 준다 | `--live` 일 때만. 1회 제작용이고 상시 실행 경로가 아니다 |
 | `handcalc_adoption_axis.py` | 커밋된 검색 산출물로 채택 축 후보 공간을 전수 계산 — 반증된 축과 기권 게이트 통계량의 조건별 분리 여유 | 불필요 (무과금·오프라인) |

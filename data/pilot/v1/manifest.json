@@ -1,0 +1,27 @@
+{
+  "suite": "evaluation-pilot-v1",
+  "created_on": "2026-10-21",
+  "author": "assistant",
+  "review_status": "pending_independent_review",
+  "families": 24,
+  "cases": 48,
+  "development_families": 16,
+  "reserved_families": 8,
+  "reserved_is_blind": false,
+  "reserved_execution": "not_run",
+  "order_fixture_sha256": "69f3539cf13cbded409c7e086b089e9d684b61c341f2146e5fdeefcfac948f39",
+  "cases_sha256": "82e30210e098214febd0ff40b28574bd6ee8615268aedde6d15dfe21d777059f",
+  "policy_sources": {
+    "data/policies/exchange.md": "81e6193314839534fae5d87addaf4c77c6bff9fc13320982ee4bae60b5c09bd2",
+    "data/policies/refund.md": "27d4782bff4e0c5ff9ba7f27427ecff2587b9e1b6c695f7deaa114833ef3eb6d",
+    "data/policies/shipping.md": "52d6da9c00b9fead5e2dd878633f4a1bffcb0350400679678cefccf4ab1bdb49",
+    "data/policies/support.md": "a3414f6858a6bd7da7b256dea4634df88ee41ad9c5cd52a9ffe94eeb61a7dc3c"
+  },
+  "boundaries": [
+    "기존 측정 1·2·3과 합산하지 않음",
+    "보류는 같은 작성자가 만든 공개 자료이며 blind 아님",
+    "실제 모델 미호출",
+    "사람의 독립 검토 전 의미 라벨 미확정"
+  ],
+  "j11_sha256": "1b6e086d179beb23e24b158c993075a3bf5e4d3ada79f14e613db0ea31b62b3b"
+}

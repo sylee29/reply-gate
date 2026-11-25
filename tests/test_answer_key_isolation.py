@@ -46,6 +46,7 @@ _SCORER_MODULES = frozenset(
         "__init__.py",
         "adoption_axis.py",
         "evaluation.py",
+        "evaluation_pilot.py",
         "retrieval_eval.py",
         "retrieval_labels.py",
     }
@@ -62,10 +63,14 @@ _ANSWER_SYMBOLS = frozenset(
         "RetrievalLabel",
         "load_golden_set",
         "load_retrieval_labels",
+        "load_pilot",
+        "PILOT_DIR",
     }
 )
-_ANSWER_MODULES = frozenset({"reply_gate.evaluation", "reply_gate.retrieval_labels"})
-_ANSWER_PATHS = ("golden_set.jsonl", "retrieval_labels.jsonl")
+_ANSWER_MODULES = frozenset(
+    {"reply_gate.evaluation", "reply_gate.retrieval_labels", "reply_gate.evaluation_pilot"}
+)
+_ANSWER_PATHS = ("golden_set.jsonl", "retrieval_labels.jsonl", "data/pilot")
 
 #: 심은 장치 — 주석 그 자체가 정답이다. 파서만 면제된다.
 _PLANTED_SYMBOLS = frozenset(
@@ -298,6 +303,9 @@ def test_import_가드는_두_번째_alias_도_본다() -> None:
         source="import reply_gate.contracts, reply_gate.evaluation\n", filename="mutant.py"
     ) == ["mutant.py -> reply_gate.evaluation"]
     assert not _imported_scorers(source="import reply_gate.contracts\n", filename="mutant.py")
+    assert _imported_scorers(
+        source="import reply_gate.contracts, reply_gate.evaluation_pilot\n", filename="mutant.py"
+    ) == ["mutant.py -> reply_gate.evaluation_pilot"]
 
 
 def test_심은_상충_주석이_짝의_조항_번호를_그대로_들고_있다() -> None:
@@ -325,6 +333,11 @@ def test_심은_상충_주석이_짝의_조항_번호를_그대로_들고_있다
         "fixture = Path('data/golden_set.jsonl')\n",
         'fixture = Path(f"data/{prefix}golden_set.jsonl")\n',
         'module = importlib.import_module("reply_gate.evaluation")\n',
+        # 새 파일럿 역시 채점 자료다. 채점자 등록이 런타임의 정답 접근을 허용하지 않는다.
+        "from reply_gate.evaluation_pilot import load_pilot\nload_pilot()\n",
+        "from reply_gate import evaluation_pilot\n",
+        'module = importlib.import_module("reply_gate.evaluation_pilot")\n',
+        "fixture = Path('data') / 'pilot' / 'v1' / 'cases.jsonl'\n",
         # 검색 정답 라벨.
         "from reply_gate.retrieval_labels import load_retrieval_labels\nload_retrieval_labels()\n",
         "fixture = Path('data') / 'retrieval_labels.jsonl'\n",
