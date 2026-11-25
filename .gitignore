@@ -46,3 +46,7 @@ reports/*
 .DS_Store
 .idea/
 .vscode/
+
+# 로컬 도구 잔재
+.playwright-mcp/
+.claude/settings.json.bak-*

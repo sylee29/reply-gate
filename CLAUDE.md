@@ -12,7 +12,8 @@
 ```
 .
 ├── CLAUDE.md / AGENTS.md          → 이 파일 (두 파일 내용 동일)
-├── README.md                      → 외부 공개용 전시 문서
+├── README.md                      → 외부 공개용 전시 문서. 날짜 붙은 현황 공지는 여기 얹지 않고
+│                                     tracking/status.md 에 쓴다
 ├── docs/
 │   ├── problem.md                 → 문제정의: 무엇을 왜 만드는가, 성공 판정 기준, 범위
 │   ├── architecture.md            → 구성요소와 데이터 흐름
@@ -91,7 +92,7 @@
 | SQL 검증기(`sql_guard.py`) | `docs/engineering-notes.md` 의 "실제로 뚫렸던 경로" 3건 + `docs/tracking/decisions/0005`·**`0024`**(PII 유래를 안쪽 스코프까지·캐스트 허용 타입) |
 | L1 게이트(`gate.py`) | `docs/business-rules.md` 의 PII 규칙 + `docs/engineering-notes.md` 의 오탐 사례 + `docs/tracking/decisions/`**`0021`**(접기는 패턴별이고 개인정보 정의는 게이트가 단독 소유한다) |
 | L2 판정(`judge.py`) | `docs/business-rules.md` 의 "L2 판정 규칙" + `docs/tracking/decisions/0007` |
-| 인계 사유·상태 전이 | `docs/business-rules.md` 의 사유 6종 표와 `both` 우선순위 규칙 |
+| 인계 사유·상태 전이 | `docs/business-rules.md` 의 사유 7종 표와 `both` 우선순위 규칙 |
 | 응답 스키마·API | `docs/contracts.md` 의 "공통 규약"(키 존재 규칙)·"층별 판정 키"·"토큰 집계 경계" |
 | 스키마 변경 | `docs/engineering-notes.md` 의 "볼륨째 지워야 한다" + `docs/operations.md` 4단계 |
 | 평가·지표 | `docs/tracking/status.md` 의 첫 실측값 + `scripts/AGENTS.md` 의 리포트 불변식 + `docs/tracking/decisions/`**`0025`**(구간 아홉·미측정은 0 이 아니다) |
