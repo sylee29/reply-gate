@@ -630,19 +630,75 @@ LLM 을 호출하지 않으므로 **100% 재현**된다. 이것이 **신뢰성 �
 
 ## 실행 방법
 
-정본은 [`docs/operations.md`](docs/operations.md) 다 — 환경 변수부터 DB 기동 · 시딩 · 정책
-인덱싱 · 서버 기동 · 검증 · 평가 산출 · 검색 비교 · 시연까지 순서대로 있다. 최단 경로만:
+아래 순서대로 하면 된다. 1~3단계는 API 키도 Docker 도 필요 없다.
+단계별 상세와 평가·시연 명령은 [`docs/operations.md`](docs/operations.md)에 있다.
+
+**준비물**: [uv](https://docs.astral.sh/uv/), 그리고 4단계부터는 Docker(Compose v2)와
+API 키 2개(OpenAI — 생성·임베딩, Anthropic — L2 판정).
+
+**1. 받아서 의존성을 설치한다**
 
 ```bash
-docker compose up -d --wait                  # Postgres + pgvector
-uv run python -m scripts.seed_orders         # 주문 500건 — API 키 불필요
-uv run python -m scripts.index_policies      # 정책 26조항 색인 — API 키 필요
-uv run uvicorn reply_gate.api:app --reload   # http://127.0.0.1:8000
+git clone https://github.com/sylee29/reply-gate.git
+cd reply-gate
+uv sync
 ```
 
-**API 키 없이 확인되는 것**: L1 게이트 전체(위 [4) 장면](#4-l1-게이트-그-자체--서버도-db-도-api-키도-없이-재현된다)),
-측정 1(`uv run python -m scripts.evaluate`), 그리고 검증 스위트(`uv run pytest`).
-검증 명령과 그 실행값은 [`CLAUDE.md` 의 검증 절](CLAUDE.md)과 `docs/operations.md` 에 있다.
+**2. L1 게이트를 잰다 — 키·DB 불필요**
+
+```bash
+uv run python -m scripts.evaluate
+```
+
+`측정 1 결과 — 검출률 100.0% (28/28), 오탐률 0.0% (0/9)` 가 나온다. 모델을 부르는
+측정 2·3 은 `--live` 를 주지 않으면 돌지 않는다(과금되지 않는다).
+
+**3. 테스트를 돌린다 — 키·DB 불필요**
+
+```bash
+uv run pytest
+```
+
+DB 가 없으면 DB 통합 테스트는 사유와 함께 skip 된다. 6단계까지 마친 뒤
+`uv run pytest -m db` 로 따로 돌릴 수 있다.
+
+**4. 환경 변수를 채운다**
+
+```bash
+cp .env.example .env
+```
+
+`.env` 에 API 키 2개와 Postgres 비밀번호 3개를 적는다. 이 파일은 커밋되지 않는다.
+
+**5. DB 를 띄운다**
+
+```bash
+docker compose up -d --wait
+```
+
+**6. 데이터를 넣는다**
+
+```bash
+uv run python -m scripts.seed_orders       # 주문 500건 — 키 불필요
+uv run python -m scripts.index_policies    # 정책 26조항 색인 — OpenAI 키 필요(임베딩 소액 과금)
+```
+
+**7. 서버를 띄우고 문의를 넣는다**
+
+```bash
+uv run uvicorn reply_gate.api:app
+```
+
+브라우저에서 `http://127.0.0.1:8000/` 을 열어 문의를 입력한다. 문의 1건마다 모델을
+호출하므로 소액이 과금된다. 판정 과정(시도별 통과·기각, 사유, 채택된 근거)이 답변과 함께 보인다.
+어떤 문의가 어떤 장면을 만드는지는 [데모 시나리오](#데모-시나리오)에 있다.
+
+**8. 정리한다**
+
+```bash
+docker compose down        # 컨테이너만 내린다(데이터 유지)
+docker compose down -v     # 데이터까지 지운다
+```
 
 ## 한 것과 하지 않은 것
 
